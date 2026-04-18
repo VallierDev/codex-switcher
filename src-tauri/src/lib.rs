@@ -18,6 +18,7 @@ mod usage;
 use account::{Account, AccountStore};
 use chrono::Utc;
 use refresh_lock::RefreshLockManager;
+use std::process::Command;
 use tauri::{Emitter, Manager, State};
 use usage::{UsageDisplay, UsageFetcher};
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
@@ -175,6 +176,33 @@ fn detect_lan_ipv4() -> Option<Ipv4Addr> {
     }
 }
 
+fn detect_zerotier_ipv4() -> Option<Ipv4Addr> {
+    let output = Command::new("ifconfig").output().ok()?;
+    let stdout = String::from_utf8(output.stdout).ok()?;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("inet ") {
+            continue;
+        }
+
+        let ip = trimmed.split_whitespace().nth(1)?;
+        let parsed = ip.parse::<Ipv4Addr>().ok()?;
+
+        // 优先 ZeroTier 常见的 172.16.0.0/12 网段
+        let octets = parsed.octets();
+        if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+            return Some(parsed);
+        }
+    }
+
+    None
+}
+
+fn detect_client_ipv4() -> Option<Ipv4Addr> {
+    detect_zerotier_ipv4().or_else(detect_lan_ipv4)
+}
+
 /// 获取代理状态
 #[tauri::command]
 fn get_proxy_status(state: State<AppState>) -> Result<ProxyStatus, String> {
@@ -191,7 +219,7 @@ fn get_proxy_status(state: State<AppState>) -> Result<ProxyStatus, String> {
         base_url: format!("http://localhost:{}/v1", store.settings.proxy_port),
         allow_lan: store.settings.proxy_allow_lan,
         lan_base_url: if store.settings.proxy_allow_lan {
-            detect_lan_ipv4().map(|ip| format!("http://{}:{}/v1", ip, store.settings.proxy_port))
+            detect_client_ipv4().map(|ip| format!("http://{}:{}/v1", ip, store.settings.proxy_port))
         } else {
             None
         },

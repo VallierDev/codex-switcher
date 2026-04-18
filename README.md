@@ -47,6 +47,18 @@ npm run tauri build
 
 MIT License - see [LICENSE](LICENSE) file.
 
+### Remote Runtime Rules
+
+- Desktop launchers and helper scripts created on Windows or Mini Mac are machine-local runtime files.
+- These files are not part of this repository and must not be committed or synced to GitHub.
+- Example machine-local files:
+  - `C:\Users\Administrator\.codex\start-codex-auto-proxy.ps1`
+  - `C:\Users\Administrator\Desktop\Start Codex Auto Proxy.bat`
+  - `C:\Users\Administrator\Desktop\Start Codex Auto Proxy.lnk`
+  - `~/.codex/start-codex-auto-proxy.sh`
+  - `~/Desktop/Start Codex Auto Proxy.command`
+- Repository changes should only contain reusable app code, docs, and build configuration.
+
 ---
 
 ## 中文
@@ -91,6 +103,18 @@ npm run tauri build
 ### 开源协议
 
 MIT License - 详见 [LICENSE](LICENSE) 文件。
+
+### 远端运行规则
+
+- Windows 和 Mini Mac 上生成的桌面启动器、辅助脚本，属于机器本地运行文件。
+- 这些文件不属于本仓库，不提交，也不同步到 GitHub。
+- 典型本地文件包括：
+  - `C:\Users\Administrator\.codex\start-codex-auto-proxy.ps1`
+  - `C:\Users\Administrator\Desktop\Start Codex Auto Proxy.bat`
+  - `C:\Users\Administrator\Desktop\Start Codex Auto Proxy.lnk`
+  - `~/.codex/start-codex-auto-proxy.sh`
+  - `~/Desktop/Start Codex Auto Proxy.command`
+- 仓库里只保留可复用的应用代码、文档和构建配置。
 
 ---
 
