@@ -2691,26 +2691,29 @@ async fn bridge_websockets<S1, S2>(
         while let Some(msg) = upstream_read.next().await {
             match msg {
                 Ok(msg) => {
-                    // 检测限额错误（仅解析 response.failed 类型）
+                    // 检测限额错误：**不要把错误消息转发给 client**（之前的 bug），
+                    // 直接丢弃 + 切号 + 关 WS，让 Codex App 看到干净的连接断开然后重连，
+                    // 而不是看到"Upgrade to Plus"那种刺眼的错误提示。
                     if detect_ws_rate_limit(&msg) {
                         println!(
-                            "[Proxy] WebSocket 检测到限额错误（response.failed），触发切号..."
+                            "[Proxy] WebSocket 检测到限额，静默切号 + 关 WS（不透回 codex）..."
                         );
                         mark_current_quota_depleted(&state_clone);
-                        let _ = client_write.send(msg).await;
                         if let PickResult::Found { id, .. } = pick_next_account(&state_clone) {
                             let _ = do_switch(&state_clone, &id, SwitchReason::WebSocketRateLimit);
                         }
+                        // 主动关 client 侧 WS，让 Codex App 知道这个连接结束了 → 自动重连
+                        let _ = client_write.send(tungstenite::Message::Close(None)).await;
                         break;
                     }
                     // 检测封号
                     if detect_ws_banned(&msg) {
-                        println!("[Proxy] WebSocket 检测到封号（response.failed），触发切号...");
+                        println!("[Proxy] WebSocket 检测到封号，静默切号 + 关 WS（不透回 codex）...");
                         mark_current_banned(&state_clone);
-                        let _ = client_write.send(msg).await;
                         if let PickResult::Found { id, .. } = pick_next_account(&state_clone) {
                             let _ = do_switch(&state_clone, &id, SwitchReason::BannedDetected);
                         }
+                        let _ = client_write.send(tungstenite::Message::Close(None)).await;
                         break;
                     }
 
