@@ -73,6 +73,140 @@ fn remote_token_cache_put(id: &str, token: &str, is_chatgpt: bool) {
     }
 }
 
+/// 401 静默刷新的统一返回。
+enum SilentRefreshOutcome {
+    /// 拿到新 access_token，调用方应用它重试上游
+    Refreshed(String),
+    /// auth0 拒绝（RT 已轮换 / 用户登出 / 切号到别处）→ 调用方应该切号
+    LoggedOut,
+    /// 其他错误（网络抖动等），调用方按原路径返回 401
+    OtherError(String),
+    /// 当前账号根本没 refresh_token，没法刷
+    NoRefreshToken,
+}
+
+/// 按 remote_mode 决定刷新路径：
+/// - **client / solo**：先尝试问 Server 拿 fresh token（Server 是 RT 轮换的权威），
+///   Server 不可达再降级本地 oauth refresh
+/// - **off / server**：直接本地 oauth refresh
+///
+/// 成功后：apply 到 store + 写盘 + 写 ~/.codex/auth.json，把 RT 竞态窗口压到几毫秒。
+async fn silent_refresh_current(state: &ProxyState) -> SilentRefreshOutcome {
+    let (current_id, remote_mode, primary, fallback, secret) = {
+        let store = match state.store.lock() {
+            Ok(s) => s,
+            Err(_) => return SilentRefreshOutcome::OtherError("store lock 失败".into()),
+        };
+        let Some(cid) = store.current.clone() else {
+            return SilentRefreshOutcome::NoRefreshToken;
+        };
+        (
+            cid,
+            store.settings.remote_mode.clone(),
+            store.settings.remote_server_url.clone(),
+            store.settings.remote_server_url_fallback.clone(),
+            store.settings.remote_shared_secret.clone(),
+        )
+    };
+
+    // 1) 优先走 Server（client/solo 模式）
+    if matches!(remote_mode.as_str(), "client" | "solo") && !secret.is_empty() {
+        match crate::remote_client::resolve_base_url(&primary, &fallback).await {
+            Ok(base) => {
+                match crate::remote_client::fetch_token(&base, &secret, &current_id).await {
+                    Ok(t) => {
+                        // 把 Server 的 auth_json 应用到本机 store + 写盘 auth.json
+                        let token_str = AccountStore::extract_access_token(&t.auth_json);
+                        if let Ok(mut store) = state.store.lock() {
+                            store.sync_account_from_auth_json(&current_id, t.auth_json.clone());
+                            let _ = store.save();
+                        }
+                        if let Err(e) = AccountStore::write_codex_auth_extended_expiry(&t.auth_json) {
+                            eprintln!("[Proxy] Server 拉到 token 后写 auth.json 失败: {}", e);
+                        }
+                        invalidate_remote_token_cache();
+                        if let Some(tok) = token_str {
+                            println!("[Proxy] 通过 Server 刷新成功（{}），重试请求", remote_mode);
+                            return SilentRefreshOutcome::Refreshed(tok);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[Proxy] Server fetch_token 失败 ({})：{}，降级本地 refresh",
+                            remote_mode, e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[Proxy] Server 不可达 ({})：{}，降级本地 refresh",
+                    remote_mode, e
+                );
+            }
+        }
+    }
+
+    // 2) 本地 oauth refresh（off/server 模式 或 上面 Server 路径失败的降级）
+    let rt = {
+        let store = match state.store.lock() {
+            Ok(s) => s,
+            Err(_) => return SilentRefreshOutcome::OtherError("store lock 失败".into()),
+        };
+        match store
+            .accounts
+            .get(&current_id)
+            .and_then(|a| a.refresh_token.clone())
+        {
+            Some(rt) => rt,
+            None => return SilentRefreshOutcome::NoRefreshToken,
+        }
+    };
+
+    match crate::oauth::refresh_access_token(&rt).await {
+        Ok(new_tokens) => {
+            // apply 到 store
+            let updated_auth = if let Ok(mut store) = state.store.lock() {
+                if let Some(acc) = store.accounts.get_mut(&current_id) {
+                    AccountStore::apply_refreshed_tokens(
+                        acc,
+                        new_tokens.access_token.clone(),
+                        new_tokens.refresh_token.clone(),
+                        new_tokens.id_token.clone(),
+                        new_tokens.expires_in,
+                    );
+                    let auth = acc.auth_json.clone();
+                    let _ = store.save();
+                    Some(auth)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(auth) = updated_auth {
+                if let Err(e) = AccountStore::write_codex_auth(&auth) {
+                    eprintln!("[Proxy] 本地刷新后写 auth.json 失败: {}", e);
+                } else {
+                    println!("[Proxy] 本地 refresh 成功，已同步 auth.json");
+                }
+            }
+            SilentRefreshOutcome::Refreshed(new_tokens.access_token)
+        }
+        Err(e) => {
+            let lower = e.to_lowercase();
+            if lower.contains("logged out")
+                || lower.contains("invalid_grant")
+                || lower.contains("signed in to another account")
+            {
+                SilentRefreshOutcome::LoggedOut
+            } else {
+                SilentRefreshOutcome::OtherError(e)
+            }
+        }
+    }
+}
+
 /// 切号或账号变化时手动失效（被 perform_switch 调用）
 pub fn invalidate_remote_token_cache() {
     if let Ok(mut g) = REMOTE_TOKEN_CACHE.lock() {
@@ -240,7 +374,8 @@ async fn get_current_token(state: &ProxyState) -> Result<(String, bool), String>
                         // 用 Server 的新鲜 auth_json 强制覆写本机 ~/.codex/auth.json
                         // 目的：让本机 Codex CLI 永远读到新鲜 access_token，避免它自己触发 oauth refresh
                         // 使 refresh_token 在两端分叉。
-                        if let Err(e) = AccountStore::write_codex_auth(&t.auth_json) {
+                        // 用 extended_expiry 版本：把 expires_at 顶到 +24h，codex 永远不会主动 refresh。
+                        if let Err(e) = AccountStore::write_codex_auth_extended_expiry(&t.auth_json) {
                             eprintln!("[Proxy] 写 ~/.codex/auth.json 失败: {}", e);
                         }
                         if let Some(tok) = AccountStore::extract_access_token(&t.auth_json) {
@@ -819,83 +954,60 @@ async fn handle_request(
             }
         } else {
             // 401 且未封号，可能是正常过期或被登出。
-            println!("[Proxy] 拦截到 401，尝试静默刷新 Token...");
-            let rt_opt = {
-                let store = state.store.lock().unwrap();
-                store
-                    .current
-                    .as_ref()
-                    .and_then(|id| store.accounts.get(id))
-                    .and_then(|a| a.refresh_token.clone())
-            };
+            // 按设计：client / solo 模式下 Server 是 RT 轮换的唯一权威，本机不独自 refresh
+            // —— 优先问 Server 拿 fresh token，避免和 Server 撞轮换；Server 不可达再降级本地。
+            // off / server 模式下本地直接 refresh。
+            println!("[Proxy] 拦截到 401，尝试刷新 Token...");
 
-            if let Some(rt) = rt_opt {
-                match crate::oauth::refresh_access_token(&rt).await {
-                    Ok(new_tokens) => {
-                        println!("[Proxy] 静默刷新 Token 成功，重试请求");
-                        if let Ok(mut store) = state.store.lock() {
-                            if let Some(current_id) = store.current.clone() {
-                                if let Some(acc) = store.accounts.get_mut(&current_id) {
-                                    AccountStore::apply_refreshed_tokens(
-                                        acc,
-                                        new_tokens.access_token.clone(),
-                                        new_tokens.refresh_token.clone(),
-                                        new_tokens.id_token,
-                                        new_tokens.expires_in,
-                                    );
-                                    let _ = store.save();
-                                }
+            let outcome = silent_refresh_current(&state).await;
+            match outcome {
+                SilentRefreshOutcome::Refreshed(new_token) => {
+                    if let Ok(retry_resp) = forward_with_token(
+                        &state,
+                        &method,
+                        &upstream_url,
+                        &base_headers,
+                        &body_bytes,
+                        &new_token,
+                    )
+                    .await
+                    {
+                        return Ok(build_stream_response(
+                            retry_resp,
+                            Some(state.tracker.clone()),
+                            session_affinity_ctx.clone(),
+                        ));
+                    }
+                }
+                SilentRefreshOutcome::LoggedOut => {
+                    println!("[Proxy] 刷新失败：账号已登出/RT 被轮换，标记 + 切号");
+                    if let Ok(mut store) = state.store.lock() {
+                        if let Some(current_id) = store.current.clone() {
+                            if let Some(acc) = store.accounts.get_mut(&current_id) {
+                                acc.is_logged_out = true;
+                                let _ = store.save();
                             }
-                        }
-                        if let Ok(retry_resp) = forward_with_token(
-                            &state,
-                            &method,
-                            &upstream_url,
-                            &base_headers,
-                            &body_bytes,
-                            &new_tokens.access_token,
-                        )
-                        .await
-                        {
-                            return Ok(build_stream_response(
-                                retry_resp,
-                                Some(state.tracker.clone()),
-                                session_affinity_ctx.clone(),
-                            ));
                         }
                     }
-                    Err(e) => {
-                        let lower = e.to_lowercase();
-                        if lower.contains("logged out")
-                            || lower.contains("invalid_grant")
-                            || lower.contains("signed in to another account")
-                        {
-                            println!("[Proxy] 静默刷新失败 (疑似全网登出/登录冲突)，标记为登出并切号: {}", e);
-                            if let Ok(mut store) = state.store.lock() {
-                                if let Some(current_id) = store.current.clone() {
-                                    if let Some(acc) = store.accounts.get_mut(&current_id) {
-                                        acc.is_logged_out = true;
-                                        let _ = store.save();
-                                    }
-                                }
-                            }
-                            if let Some(resp) = try_switch_and_retry(
-                                &state,
-                                &method,
-                                &upstream_url,
-                                &base_headers,
-                                &body_bytes,
-                                session_key.as_deref(),
-                                SwitchReason::Http429,
-                            )
-                            .await
-                            {
-                                return Ok(resp);
-                            }
-                        } else {
-                            println!("[Proxy] 静默刷新失败 (其他原因): {}", e);
-                        }
+                    if let Some(resp) = try_switch_and_retry(
+                        &state,
+                        &method,
+                        &upstream_url,
+                        &base_headers,
+                        &body_bytes,
+                        session_key.as_deref(),
+                        SwitchReason::Http429,
+                    )
+                    .await
+                    {
+                        return Ok(resp);
                     }
+                }
+                SilentRefreshOutcome::OtherError(e) => {
+                    println!("[Proxy] 刷新失败 (其他原因): {}", e);
+                }
+                SilentRefreshOutcome::NoRefreshToken => {
+                    println!("[Proxy] 当前账号缺 refresh_token，无法刷新");
                 }
             }
         }
@@ -1122,7 +1234,8 @@ async fn adopt_remote_current(
         store.sync_account_from_auth_json(new_id, t.auth_json.clone());
         if let Some(acc) = store.accounts.get(new_id) {
             let auth = acc.auth_json.clone();
-            crate::account::AccountStore::write_codex_auth(&auth)
+            // adopt_remote_current 是 client 模式的换号路径，扩展 expires_at 防 codex 自刷
+            crate::account::AccountStore::write_codex_auth_extended_expiry(&auth)
                 .map_err(|e| format!("写 auth.json 失败: {}", e))?;
         }
         store.current = Some(new_id.to_string());

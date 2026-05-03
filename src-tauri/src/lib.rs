@@ -1302,6 +1302,69 @@ async fn solo_try_align_current(
 /// 共享评分选号算法：基于 CachedQuota 的 reset_at 时间戳和剩余额度评分
 /// 返回 (account_id, account_name, score) 按得分从高到低排序
 /// 启动定时额度刷新调度器
+/// 拉一次 Server 上 current 账号的 token，写本机 store + ~/.codex/auth.json。
+/// 同时顺带做"store/disk 不一致"的自愈：磁盘上的 sub 和 store.current 的 sub 不匹配时，
+/// 用 Server 拉到的覆写。
+/// 仅在 client 模式 + 配置了 secret 时生效。返回 true 表示真的写盘了，false 表示跳过/失败。
+pub async fn do_one_fast_auth_sync(
+    store: &std::sync::Arc<std::sync::Mutex<AccountStore>>,
+) -> bool {
+    let (mode, primary, fallback, secret, current_id) = {
+        let s = match store.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        (
+            s.settings.remote_mode.clone(),
+            s.settings.remote_server_url.clone(),
+            s.settings.remote_server_url_fallback.clone(),
+            s.settings.remote_shared_secret.clone(),
+            s.current.clone(),
+        )
+    };
+    if mode != "client" || secret.is_empty() {
+        return false;
+    }
+    let Some(cid) = current_id else { return false; };
+
+    let base = match remote_client::resolve_base_url(&primary, &fallback).await {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    match remote_client::fetch_token(&base, &secret, &cid).await {
+        Ok(t) => {
+            if let Ok(mut s) = store.lock() {
+                s.sync_account_from_auth_json(&cid, t.auth_json.clone());
+                let _ = s.save();
+            }
+            // 扩展 expires_at 到 +24h，codex CLI 看到"很新鲜"就不会自己 refresh，
+            // 真过期时 proxy 这边接管处理
+            if let Err(e) = AccountStore::write_codex_auth_extended_expiry(&t.auth_json) {
+                eprintln!("[FastAuthSync] 写 ~/.codex/auth.json 失败: {}", e);
+                return false;
+            }
+            crate::proxy::invalidate_remote_token_cache();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 快速 auth.json 同步循环（仅 client 模式）：每 30s 拉一次 Server 上 current 的最新 token
+/// 并写盘到 ~/.codex/auth.json。把"Server 已轮换 RT vs 本机 auth.json 滞后"的窗口压到 30s。
+/// 与 start_quota_refresh 解耦：quota 5 分钟级，token 30 秒级，互不阻塞。
+pub fn start_fast_auth_sync(
+    store: std::sync::Arc<std::sync::Mutex<AccountStore>>,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        println!("[FastAuthSync] 快速同步循环已启动（30s，仅 client 模式生效）");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            do_one_fast_auth_sync(&store).await;
+        }
+    })
+}
+
 pub fn start_quota_refresh(
     store: std::sync::Arc<std::sync::Mutex<AccountStore>>,
     app_handle: tauri::AppHandle,
@@ -1413,8 +1476,9 @@ pub fn start_quota_refresh(
                                                             );
                                                         }
                                                     }
+                                                    // client 模式：用 extended_expiry 防 codex 自刷
                                                     if let Err(e) =
-                                                        account::AccountStore::write_codex_auth(
+                                                        account::AccountStore::write_codex_auth_extended_expiry(
                                                             &t.auth_json,
                                                         )
                                                     {
@@ -2189,6 +2253,13 @@ fn reset_token_stats(state: State<AppState>) -> Result<(), String> {
 #[tauri::command]
 fn get_token_history(days: u32) -> Result<Vec<token_tracker::TokenHistoryEntry>, String> {
     Ok(token_tracker::TokenTracker::get_history(days))
+}
+
+/// 手动触发一次 client 模式快速 auth.json 同步（拉 Server current → 写盘）。
+/// 用于"我看到 store/disk 不一致"或"想立即把磁盘对齐到 Server"的场景。
+#[tauri::command]
+async fn force_auth_resync(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(do_one_fast_auth_sync(&state.store).await)
 }
 
 /// 当前 SessionAffinity 表里所有活跃绑定（session_key → account 映射）
@@ -3225,6 +3296,16 @@ pub fn run() {
                 println!("[QuotaRefresh] 启动中（setup 阶段）");
             }
 
+            // 启动时立刻跑一次同步，把 store/disk 不一致 + 落后的 RT 立即对齐
+            let store_for_init = state.store.clone();
+            tauri::async_runtime::spawn(async move {
+                if do_one_fast_auth_sync(&store_for_init).await {
+                    println!("[FastAuthSync] 启动时同步完成");
+                }
+            });
+            // 快速 auth.json 同步循环（client 模式专用，但循环内自检模式，可以无脑启动）
+            let _fast_auth_handle = start_fast_auth_sync(state.store.clone());
+
             // solo 模式心跳循环（向 Server 声明"本机接管保活"）
             if remote_mode == "solo" {
                 let handle =
@@ -3297,6 +3378,7 @@ pub fn run() {
             get_codex_features_goals,
             get_token_history,
             get_session_bindings,
+            force_auth_resync,
             get_switch_history,
             get_switch_stats,
             get_installed_skills,

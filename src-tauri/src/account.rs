@@ -472,6 +472,23 @@ impl AccountStore {
     }
 
     /// 写入 Codex auth.json
+    /// 写 auth.json，但把 tokens.expires_at 字段顶到 24 小时后，让 codex CLI 永远看到"还很新鲜"，
+    /// 不主动触发本地 refresh —— 真正的 token 过期由 proxy 接管处理。
+    /// 适合 client 模式（Server 是 RT 轮换的唯一权威，本机 codex 自己 refresh 必撞）。
+    pub fn write_codex_auth_extended_expiry(auth: &serde_json::Value) -> Result<(), String> {
+        let mut patched = auth.clone();
+        let new_exp = chrono::Utc::now() + chrono::Duration::hours(24);
+        if let Some(tokens) = patched.get_mut("tokens") {
+            if let Some(obj) = tokens.as_object_mut() {
+                obj.insert(
+                    "expires_at".to_string(),
+                    serde_json::Value::String(new_exp.to_rfc3339()),
+                );
+            }
+        }
+        Self::write_codex_auth(&patched)
+    }
+
     pub fn write_codex_auth(auth: &serde_json::Value) -> Result<(), String> {
         let path = Self::codex_auth_path();
         println!("写入 auth.json 到路径: {:?}", path);
