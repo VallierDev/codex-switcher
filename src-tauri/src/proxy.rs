@@ -1039,6 +1039,100 @@ async fn handle_request(
             .unwrap_or_else(|_| error_response(StatusCode::TOO_MANY_REQUESTS, "429")));
     }
 
+    // 7.5 上游 5xx + 全局容量满 → 同号 backoff retry，不切号
+    // 典型场景：OpenAI 模型池过载，返回 503 + body "Selected model is at capacity..."
+    // 这种**不是单号问题**，切号也撞同样错；同号等几秒重试就能继续。
+    if status_code.as_u16() >= 500 && status_code.as_u16() < 600 {
+        let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
+        let body_lower = String::from_utf8_lossy(&resp_bytes).to_lowercase();
+        let is_capacity = matches_global_capacity(&body_lower)
+            || status_code == reqwest::StatusCode::SERVICE_UNAVAILABLE;
+        if is_capacity {
+            println!("[Proxy] 上游 {} + 容量满，同号 backoff retry...", status_code);
+            for attempt in 1..=3u64 {
+                let backoff = std::time::Duration::from_secs(2 * attempt);
+                tokio::time::sleep(backoff).await;
+                let (retry_token, _) = match resolve_token_with_affinity(&state, session_key.as_deref()).await {
+                    Ok((t, c, _)) => (t, c),
+                    Err(_) => continue,
+                };
+                if let Ok(retry_resp) = forward_with_token(
+                    &state,
+                    &method,
+                    &upstream_url,
+                    &base_headers,
+                    &body_bytes,
+                    &retry_token,
+                )
+                .await
+                {
+                    let s = retry_resp.status();
+                    if s == reqwest::StatusCode::OK {
+                        println!("[Proxy] 容量满同号 retry 第 {} 次成功", attempt);
+                        // 200 + SSE 走 bootstrap，否则透传
+                        if is_sse_response(&retry_resp) {
+                            let h = retry_resp.headers().clone();
+                            let stream = retry_resp.bytes_stream().boxed();
+                            let resp = build_streaming_response_with_bootstrap(
+                                state.clone(),
+                                s,
+                                h,
+                                stream,
+                                method.clone(),
+                                upstream_url.clone(),
+                                base_headers.clone(),
+                                body_bytes.clone(),
+                                session_affinity_ctx.clone(),
+                            );
+                            return Ok(resp);
+                        }
+                        return Ok(build_stream_response(
+                            retry_resp,
+                            Some(state.tracker.clone()),
+                            session_affinity_ctx.clone(),
+                        ));
+                    }
+                    if s.as_u16() >= 500 && s.as_u16() < 600 {
+                        // 还是 5xx，下一轮 backoff
+                        continue;
+                    }
+                    // 其他 status：当作正常响应退出 retry 透传
+                    return Ok(build_stream_response(
+                        retry_resp,
+                        Some(state.tracker.clone()),
+                        session_affinity_ctx.clone(),
+                    ));
+                }
+            }
+            println!("[Proxy] 容量满同号 retry 三次都失败，降级走切号兜底");
+            // 撑不住 → 当 quota 路径处理（切号），最后兜底也失败再返 502
+            if let Some(resp) = dispatch_quota_switch_retry(
+                &state,
+                &method,
+                &upstream_url,
+                &base_headers,
+                &body_bytes,
+                session_key.as_deref(),
+                SwitchReason::Http429,
+            )
+            .await
+            {
+                return Ok(resp);
+            }
+            // 全部失败 → 把缓冲下来的原始 5xx body 转一个 generic 502，**不带原文**
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                "上游容量满且重试无果",
+            ));
+        }
+        // 不是容量满的 5xx → 缓冲下来的 body 透传给 codex
+        return Ok(Response::builder()
+            .status(status_code.as_u16())
+            .header("content-type", "application/json")
+            .body(full_body(resp_bytes))
+            .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "5xx 透传")));
+    }
+
     // 8. 成功响应（200 + SSE）→ 立刻返回 Response，body 流内部跑 bootstrap+心跳+切号
     if status_code == reqwest::StatusCode::OK && is_sse_response(&upstream_resp) {
         let resp_status = upstream_resp.status();
@@ -2520,33 +2614,106 @@ async fn handle_websocket(
                 || err_lower.contains("403")
                 || err_lower.contains("unauthorized")
                 || err_lower.contains("forbidden");
-            // 上游 WS 握手就被拒：大多数情况都该走切号重连而不是把错误透回 codex。
-            // - 401/403：当前号 token / 权限问题，换号
-            // - 429 / 限额关键词：当前号配额满，换号
-            // - 503 / "at capacity" / "model overloaded"：模型池满载，**换号也可能换池**
+            // 区分两类拒绝：
+            //   - per-account 限额（429 / rate_limit 关键词 / 401/403）→ 切号
+            //   - global 容量满（503 / "at capacity" / "model overloaded"）→ **同号 backoff retry**
+            //     不是单号问题，切号也是撞同样错；同号等几秒再试通常能继续
             // 真正网络层错误（DNS / TLS / connect refused 等）才报给 client。
-            let is_capacity_err = err_lower.contains("429")
-                || err_lower.contains("503")
-                || err_lower.contains("502")
-                || err_lower.contains("504")
-                || RATE_LIMIT_KEYWORDS.iter().any(|kw| err_lower.contains(kw));
+            let is_global_capacity = err_lower.contains("503")
+                || matches_global_capacity(&err_lower);
+            let is_per_account_limit = err_lower.contains("429")
+                || PER_ACCOUNT_LIMIT_KEYWORDS.iter().any(|kw| err_lower.contains(kw));
 
-            if !is_auth_err && !is_capacity_err {
+            if !is_auth_err && !is_global_capacity && !is_per_account_limit
+                && !err_lower.contains("502") && !err_lower.contains("504")
+            {
                 eprintln!("[Proxy] WebSocket 上游连接失败（网络层）: {}", e);
                 return Ok(error_response(
                     StatusCode::BAD_GATEWAY,
-                    &format!("WebSocket 上游连接失败: {}", e),
+                    "WebSocket 上游连接失败",
                 ));
             }
 
-            println!(
-                "[Proxy] WebSocket 握手被上游拒绝 ({})，尝试切号重连...",
-                if is_auth_err { "auth" } else { "capacity/限额" }
-            );
-            mark_current_quota_depleted(&state);
+            // global 容量满：先尝试同号 backoff retry，3 次失败再降级走切号
+            if is_global_capacity && !is_auth_err && !is_per_account_limit {
+                println!(
+                    "[Proxy] WebSocket 握手被上游拒绝（容量满），同号 backoff retry..."
+                );
+                let mut same_account_retry = None;
+                for attempt in 1..=3u64 {
+                    let backoff = std::time::Duration::from_secs(2 * attempt);
+                    tokio::time::sleep(backoff).await;
+                    let cur_token = match get_current_token(&state).await {
+                        Ok((t, _)) => t,
+                        Err(_) => continue,
+                    };
+                    let cur_chatgpt = cur_token.starts_with("eyJ");
+                    let (cur_url, _) = get_upstream(cur_chatgpt, &path);
+                    let ws = cur_url.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
+                    if let Ok(mut r) = ws.as_str().into_client_request() {
+                        for (n, v) in req.headers() {
+                            let l = n.as_str().to_lowercase();
+                            if matches!(l.as_str(), "authorization"|"host"|"upgrade"|"connection"|"sec-websocket-key"|"sec-websocket-version"|"sec-websocket-extensions") { continue; }
+                            r.headers_mut().insert(n.clone(), v.clone());
+                        }
+                        if let Ok(av) = HeaderValue::from_str(&format!("Bearer {}", cur_token)) {
+                            r.headers_mut().insert(hyper::header::AUTHORIZATION, av);
+                        }
+                        if let Ok(c) = tokio_tungstenite::connect_async(r).await {
+                            println!("[Proxy] 容量满同号 retry 第 {} 次成功", attempt);
+                            same_account_retry = Some(c);
+                            break;
+                        }
+                    }
+                }
+                if let Some(conn) = same_account_retry {
+                    conn
+                } else {
+                    println!("[Proxy] 容量满同号 retry 三次都失败，降级走切号兜底");
+                    // 落到切号逻辑（fall through 不行，得显式调）
+                    let mut retry_conn = None;
+                    for _attempt in 0..3 {
+                        if let PickResult::Found { id, token: new_tok } = pick_next_account(&state) {
+                            if do_switch(&state, &id, SwitchReason::WebSocketPrecheck).is_err() { continue; }
+                            let new_chatgpt = new_tok.starts_with("eyJ");
+                            let (new_url, _) = get_upstream(new_chatgpt, &path);
+                            let ws = new_url.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
+                            if let Ok(mut r) = ws.as_str().into_client_request() {
+                                for (n, v) in req.headers() {
+                                    let l = n.as_str().to_lowercase();
+                                    if matches!(l.as_str(), "authorization"|"host"|"upgrade"|"connection"|"sec-websocket-key"|"sec-websocket-version"|"sec-websocket-extensions") { continue; }
+                                    r.headers_mut().insert(n.clone(), v.clone());
+                                }
+                                if let Ok(av) = HeaderValue::from_str(&format!("Bearer {}", new_tok)) {
+                                    r.headers_mut().insert(hyper::header::AUTHORIZATION, av);
+                                }
+                                if let Ok(c) = tokio_tungstenite::connect_async(r).await {
+                                    retry_conn = Some(c);
+                                    break;
+                                }
+                            }
+                        } else { break; }
+                    }
+                    match retry_conn {
+                        Some(conn) => conn,
+                        None => {
+                            return Ok(error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "上游容量满且重试无果",
+                            ));
+                        }
+                    }
+                }
+            } else {
+                // per-account 限额 / auth：直接走切号
+                println!(
+                    "[Proxy] WebSocket 握手被上游拒绝 ({})，切号重连...",
+                    if is_auth_err { "auth" } else { "per-account 限额" }
+                );
+                mark_current_quota_depleted(&state);
 
-            // 切号重连，最多试 3 个号；连不上也算这个号当前不可用，标 depleted 避免重复挑
-            let mut retry_conn = None;
+                // 切号重连，最多试 3 个号；连不上也算这个号当前不可用，标 depleted 避免重复挑
+                let mut retry_conn = None;
             for _attempt in 0..3 {
                 if let PickResult::Found { id, token: new_tok } = pick_next_account(&state) {
                     if do_switch(&state, &id, SwitchReason::WebSocketPrecheck).is_err() {
@@ -2595,6 +2762,7 @@ async fn handle_websocket(
                     ));
                 }
             }
+            }  // 关闭 is_global_capacity 的 else 分支
         }
     };
 
