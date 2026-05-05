@@ -2539,7 +2539,9 @@ async fn handle_websocket(
 
 /// 检测 WebSocket 消息是否为限额错误
 /// 只匹配 response.failed 类型的错误消息，避免误判正常消息中的 rate_limit 字段
-/// 限额关键词（快速文本匹配用）
+/// 限额 / 容量满 / 模型挑选错误关键词（快速文本匹配用）。
+/// "at capacity" / "try a different model" 是 OpenAI 模型池满载时的典型措辞，
+/// 对 codex 来说和限额一样需要切号重试，不能透回给用户看见。
 const RATE_LIMIT_KEYWORDS: &[&str] = &[
     "rate_limit",
     "rate limit",
@@ -2550,6 +2552,12 @@ const RATE_LIMIT_KEYWORDS: &[&str] = &[
     "billing_hard_limit",
     "tokens per min",
     "requests per min",
+    "at capacity",
+    "selected model is at capacity",
+    "try a different model",
+    "model_overloaded",
+    "model overloaded",
+    "service unavailable",
 ];
 
 fn detect_ws_rate_limit(msg: &tungstenite::Message) -> bool {
@@ -2582,12 +2590,15 @@ fn detect_ws_rate_limit(msg: &tungstenite::Message) -> bool {
             }
         }
 
-        // JSON 解析失败或没有 error 字段，但文本明确包含限额消息
+        // JSON 解析失败或没有 error 字段，但文本明确包含限额/容量满消息
         if lower.contains("hit your usage limit")
             || lower.contains("rate limit reached")
             || lower.contains("too many requests")
+            || lower.contains("at capacity")
+            || lower.contains("try a different model")
+            || lower.contains("model overloaded")
         {
-            println!("[Proxy] WS 限额: 文本兜底匹配");
+            println!("[Proxy] WS 限额/容量满: 文本兜底匹配");
             return true;
         }
     }
