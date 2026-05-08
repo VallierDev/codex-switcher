@@ -10,6 +10,7 @@ pub mod mailbox;
 pub mod oauth;
 mod oauth_server;
 pub mod otp_login;
+pub mod output_compress;
 pub mod sentinel;
 mod proxy;
 mod refresh_lock;
@@ -32,6 +33,60 @@ use usage::{UsageDisplay, UsageFetcher};
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 
 const QUARANTINE_FIX_TICKET_TTL_SECS: i64 = 120;
+
+// ─── 全局：shell tool 输出压缩统计 ─────────────────────────────────
+// 跨请求累计，UI 可通过 get_compression_stats / reset_compression_stats 拉取/清零
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompressStats {
+    pub frames_seen: u64,
+    pub frames_compressed: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+static COMPRESS_STATS: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<CompressStats>>> =
+    std::sync::OnceLock::new();
+
+pub fn compress_stats() -> std::sync::Arc<std::sync::Mutex<CompressStats>> {
+    COMPRESS_STATS
+        .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(CompressStats::default())))
+        .clone()
+}
+
+/// 给 proxy 调用：每次看到一个 shell tool 输出帧（无论是否真截断）就更新统计。
+pub fn record_compress_frame(was_compressed: bool, bytes_in: u64, bytes_out: u64) {
+    let stats = compress_stats();
+    let mut guard = match stats.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    guard.frames_seen += 1;
+    if was_compressed {
+        guard.frames_compressed += 1;
+    }
+    guard.bytes_in = guard.bytes_in.saturating_add(bytes_in);
+    guard.bytes_out = guard.bytes_out.saturating_add(bytes_out);
+}
+
+#[tauri::command]
+fn get_compression_stats() -> CompressStats {
+    let stats = compress_stats();
+    let guard = match stats.lock() {
+        Ok(g) => g,
+        Err(_) => return CompressStats::default(),
+    };
+    guard.clone()
+}
+
+#[tauri::command]
+fn reset_compression_stats() {
+    let stats = compress_stats();
+    let mut guard = match stats.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    *guard = CompressStats::default();
+}
 
 #[derive(Clone, Debug)]
 struct QuarantineFixTicket {
@@ -3908,6 +3963,8 @@ pub fn run() {
             remote_refresh_account_quota,
             remote_sync_skills,
             remote_restart_server,
+            get_compression_stats,
+            reset_compression_stats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

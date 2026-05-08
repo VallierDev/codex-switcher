@@ -145,10 +145,23 @@ pub struct AppSettings {
     /// 默认 false —— 用订阅号时不会偷偷把请求路由到 Relay 扣余额
     #[serde(default = "default_false")]
     pub relay_auto_switch_in: bool,
+
+    /// 是否压缩 shell tool（exec_command / Bash / write_stdin 等）的输出，
+    /// 在 proxy 把上游响应转发回客户端前做截断，省 token。
+    #[serde(default = "default_true")]
+    pub output_compression_enabled: bool,
+
+    /// 输出压缩触发阈值（字节）。低于该值的 tool 输出原样透传。
+    #[serde(default = "default_compress_threshold")]
+    pub output_compression_threshold_bytes: usize,
 }
 
 fn default_bootstrap_byte_cap() -> usize {
     32 * 1024
+}
+
+fn default_compress_threshold() -> usize {
+    8192
 }
 
 fn default_bootstrap_time_cap_ms() -> u64 {
@@ -272,6 +285,8 @@ impl Default for AppSettings {
             proxy_bootstrap_time_cap_ms: default_bootstrap_time_cap_ms(),
             relay_auto_switch_out: true,
             relay_auto_switch_in: false,
+            output_compression_enabled: true,
+            output_compression_threshold_bytes: default_compress_threshold(),
         }
     }
 }

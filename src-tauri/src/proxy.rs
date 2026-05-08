@@ -37,6 +37,23 @@ use crate::token_tracker::TokenTracker;
 static PENDING_INJECT_MSG: std::sync::LazyLock<Mutex<Option<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
+/// 全局 store 引用 —— 让 SSE 流转换器（无 ProxyState 入参）也能读 settings.
+/// 由 `proxy::start` 初始化；其它入口点（test 等）允许 None。
+static GLOBAL_STORE: std::sync::OnceLock<Arc<Mutex<AccountStore>>> = std::sync::OnceLock::new();
+
+/// 读取压缩开关 + 阈值；store 未初始化时按"开 + 8KB"兜底
+fn compress_settings_snapshot() -> (bool, usize) {
+    if let Some(store) = GLOBAL_STORE.get() {
+        if let Ok(s) = store.lock() {
+            return (
+                s.settings.output_compression_enabled,
+                s.settings.output_compression_threshold_bytes,
+            );
+        }
+    }
+    (true, 8192)
+}
+
 /// client 模式下，per-account 的 token 短期缓存（避免每次请求都 round-trip Server）
 struct RemoteTokenCacheEntry {
     token: String,
@@ -269,6 +286,8 @@ pub fn start(
     switch_logger: Arc<SwitchLogger>,
     session_affinity: Arc<SessionAffinity>,
 ) -> tauri::async_runtime::JoinHandle<()> {
+    // 把 store 注册到全局，供 SSE 压缩流转换器等无 ProxyState 入参的工具函数读取。
+    let _ = GLOBAL_STORE.set(store.clone());
     tauri::async_runtime::spawn(async move {
         let addr = if allow_lan {
             SocketAddr::from(([0, 0, 0, 0], port))
@@ -2819,6 +2838,24 @@ fn build_stream_response_from_parts(
     );
     let raw_stream = prefix_stream.chain(rest_with_heartbeat);
 
+    // ── shell tool 输出压缩（SSE 路径）──
+    // 若 settings.output_compression_enabled=true：对 SSE event 边界做切分，
+    // 在每个 `data: ...\n\n` 单元内尝试解析 + 重写 tool_result / function_call_output 的 output。
+    // SSE 流最终保留事件结构，下游解析照常工作。
+    // 默认就开（settings 默认 true）；false 时直接走 raw_stream 不再绕一道。
+    let (compress_enabled, compress_threshold) = {
+        // 同 read_compress_settings 但这里没有 ProxyState，直接读 store 的全局——
+        // 不过 store 不在 affinity_ctx 里。简单起见：用 OnceLock fallback (默认开 + 8KB)。
+        // build_stream_response_from_parts 是个工具函数；调用方已通过 ProxyState 持有 store；
+        // 我们这里不增加额外参数，转而通过 lib::compress_stats 同源的全局 settings 做轻量缓存。
+        compress_settings_snapshot()
+    };
+    let raw_stream: ByteStream = if compress_enabled {
+        sse_compress_stream(raw_stream.boxed(), compress_threshold).boxed()
+    } else {
+        raw_stream.boxed()
+    };
+
     let stream = raw_stream.map(move |result| match result {
         Ok(bytes) => {
             if let Ok(mut buf) = buf_clone.lock() {
@@ -3707,6 +3744,12 @@ async fn bridge_websockets<S1, S2>(
                         let _ = client_write.send(msg).await;
                         break;
                     }
+
+                    // ── shell tool 输出压缩（codex WS 协议）──
+                    // 仅对 Text 帧、且 settings.output_compression_enabled=true 时尝试。
+                    // 不能压缩的帧（非 JSON / 非 function_call_output / 已小于阈值）原样下发。
+                    let msg = maybe_compress_ws_text(&state_clone, msg);
+
                     if client_write.send(msg).await.is_err() {
                         break;
                     }
@@ -3722,6 +3765,411 @@ async fn bridge_websockets<S1, S2>(
         _ = disconnect.notified() => {
             println!("[Proxy] 账号已切换，断开 WebSocket 连接（Codex App 将自动重连）");
         },
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Shell tool 输出压缩（Phase 1）
+// ────────────────────────────────────────────────────────────────
+// 命中策略：按 JSON 形状（type=function_call_output / tool_result + output|content
+// 是 string 字段）判定，不靠白名单 tool name；这样新加 shell 类工具不需要改代码。
+
+/// 取当前 settings 的压缩开关 + 阈值
+fn read_compress_settings(state: &ProxyState) -> (bool, usize) {
+    state
+        .store
+        .lock()
+        .ok()
+        .map(|s| {
+            (
+                s.settings.output_compression_enabled,
+                s.settings.output_compression_threshold_bytes,
+            )
+        })
+        .unwrap_or((true, 8192))
+}
+
+/// 把 codex 的 WS Text 帧里 `function_call_output` 的 `output` 字段做截断。
+/// 不影响其它类型的帧；解析失败 / 非 JSON / 字段不存在 → 原样返回。
+fn maybe_compress_ws_text(
+    state: &ProxyState,
+    msg: tungstenite::Message,
+) -> tungstenite::Message {
+    let (enabled, threshold) = read_compress_settings(state);
+    if !enabled {
+        return msg;
+    }
+    let text = match &msg {
+        tungstenite::Message::Text(t) => t.as_str(),
+        _ => return msg, // Binary / Ping / Pong / Close 透传
+    };
+    // 廉价快路径：连关键词都没有 → 不解析
+    if !text.contains("function_call_output") && !text.contains("\"output\"") {
+        return msg;
+    }
+    let mut val: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return msg,
+    };
+    let mut hit_tool: Option<String> = None;
+    let mut total_in: u64 = 0;
+    let mut total_out: u64 = 0;
+    let mut any_compressed = false;
+    rewrite_function_call_output(&mut val, threshold, &mut hit_tool, &mut total_in, &mut total_out, &mut any_compressed);
+    if total_in == 0 {
+        return msg; // 没找到 output 字段
+    }
+    crate::record_compress_frame(any_compressed, total_in, total_out);
+    if any_compressed {
+        let savings = if total_in == 0 { 0.0 } else {
+            (1.0 - (total_out as f64 / total_in as f64)) * 100.0
+        };
+        println!(
+            "[Compress] {}→{} bytes (-{:.0}%) tool={}",
+            total_in,
+            total_out,
+            savings,
+            hit_tool.as_deref().unwrap_or("?")
+        );
+    }
+    if !any_compressed {
+        return msg; // 没真的截断 → 复用原 Message，省一次 reserialize
+    }
+    match serde_json::to_string(&val) {
+        Ok(s) => tungstenite::Message::Text(s.into()),
+        Err(_) => msg,
+    }
+}
+
+/// 递归扫 JSON：发现形如 `{"type":"function_call_output", "output": "..."}` 或
+/// `{"type":"function_call_output", "content":"..."}` 的对象，对 output/content 做压缩。
+/// 也覆盖 codex 5.5 的 `response.output_item.added` 嵌套形态。
+fn rewrite_function_call_output(
+    val: &mut serde_json::Value,
+    threshold: usize,
+    hit_tool: &mut Option<String>,
+    total_in: &mut u64,
+    total_out: &mut u64,
+    any_compressed: &mut bool,
+) {
+    match val {
+        serde_json::Value::Object(map) => {
+            let is_fco = map
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|t| t == "function_call_output" || t == "tool_result")
+                .unwrap_or(false);
+            if is_fco {
+                // 先把 tool 名快照出来（避开同时 borrow_mut + borrow 同一个 map）
+                let tool_name_snapshot = map
+                    .get("name")
+                    .or_else(|| map.get("tool_name"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "shell".to_string());
+                // 优先 output，其次 content
+                for key in ["output", "content"] {
+                    if let Some(field) = map.get_mut(key) {
+                        if let Some(s) = field.as_str() {
+                            let r = crate::output_compress::compress(s, threshold);
+                            *total_in += r.original_bytes as u64;
+                            *total_out += r.output_bytes as u64;
+                            if r.was_compressed {
+                                *any_compressed = true;
+                                if hit_tool.is_none() {
+                                    *hit_tool = Some(tool_name_snapshot.clone());
+                                }
+                                let new_text = r.compressed.into_owned();
+                                *field = serde_json::Value::String(new_text);
+                            }
+                        }
+                    }
+                }
+            }
+            // 继续递归（function_call_output 可能嵌套在 response.output_item.added 等结构里）
+            for (_, v) in map.iter_mut() {
+                rewrite_function_call_output(v, threshold, hit_tool, total_in, total_out, any_compressed);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                rewrite_function_call_output(v, threshold, hit_tool, total_in, total_out, any_compressed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 把 SSE byte stream 切到事件边界（`\n\n`），逐事件尝试压缩 tool 输出。
+/// 不命中的事件原样回吐；命中且真截断的事件用新 bytes 替换。
+/// flush 时把残留 buffer 一并送出（兼容上游不带尾部 `\n\n` 的实现）。
+fn sse_compress_stream(
+    inner: ByteStream,
+    threshold: usize,
+) -> impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send {
+    use futures_util::stream;
+    enum State {
+        Active {
+            inner: ByteStream,
+            buf: Vec<u8>,
+            pending: std::collections::VecDeque<Bytes>,
+        },
+        Flushing {
+            tail: Option<Bytes>,
+        },
+        Done,
+    }
+
+    let init = State::Active {
+        inner,
+        buf: Vec::with_capacity(16 * 1024),
+        pending: std::collections::VecDeque::new(),
+    };
+
+    stream::unfold(init, move |state| async move {
+        match state {
+            State::Active { mut inner, mut buf, mut pending } => {
+                // 已有缓存的待发事件先吐
+                if let Some(b) = pending.pop_front() {
+                    return Some((Ok(b), State::Active { inner, buf, pending }));
+                }
+                loop {
+                    let next = inner.next().await;
+                    match next {
+                        None => {
+                            // 上游 EOF：把残留 buffer 作为最后一块发出
+                            let tail = if buf.is_empty() {
+                                None
+                            } else {
+                                Some(Bytes::from(std::mem::take(&mut buf)))
+                            };
+                            return Some((
+                                Ok(Bytes::new()),
+                                State::Flushing { tail },
+                            ));
+                        }
+                        Some(Err(e)) => {
+                            // 错误时不再尝试压缩；把错误透传，结束
+                            return Some((Err(e), State::Done));
+                        }
+                        Some(Ok(chunk)) => {
+                            buf.extend_from_slice(&chunk);
+                            // 切到 \n\n 边界：找最后一个 \n\n，前面的全部按事件处理
+                            let mut emit = Vec::<u8>::with_capacity(chunk.len());
+                            let mut search_from = 0usize;
+                            while let Some(rel) = find_double_newline(&buf[search_from..]) {
+                                let end = search_from + rel + 2; // 含 \n\n
+                                let event_bytes = &buf[search_from..end];
+                                let rewritten = maybe_rewrite_sse_event(event_bytes, threshold);
+                                emit.extend_from_slice(&rewritten);
+                                search_from = end;
+                            }
+                            // 把已处理掉的部分从 buf 头部清除
+                            if search_from > 0 {
+                                buf.drain(..search_from);
+                            }
+                            if !emit.is_empty() {
+                                let head = Bytes::from(emit);
+                                return Some((Ok(head), State::Active { inner, buf, pending }));
+                            }
+                            // 此 chunk 还没出现完整事件 → 继续 await 下一块
+                            // （不空转：上面 inner.next().await 是真正的 await 点）
+                        }
+                    }
+                }
+            }
+            State::Flushing { tail } => {
+                if let Some(b) = tail {
+                    // 残留：尽力按"一个不完整事件"去压缩
+                    let rewritten = maybe_rewrite_sse_event(&b, threshold);
+                    Some((Ok(Bytes::from(rewritten)), State::Done))
+                } else {
+                    None
+                }
+            }
+            State::Done => None,
+        }
+    })
+    // 第一个元素是占位 Bytes::new()（EOF 触发的伪 yield），过滤掉
+    .filter(|res| {
+        let keep = match res {
+            Ok(b) => !b.is_empty(),
+            Err(_) => true,
+        };
+        futures_util::future::ready(keep)
+    })
+}
+
+fn find_double_newline(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 2 {
+        return None;
+    }
+    for i in 0..buf.len() - 1 {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 给一个完整 SSE 事件（含 `data:` 行 + 终结的 `\n\n`），尝试压缩里面的 tool 输出。
+/// 不是 JSON / 不是 tool_result / 字段不命中 → 返回原 bytes（拷贝；调用方已 `&[u8]` 视图）。
+fn maybe_rewrite_sse_event(event: &[u8], threshold: usize) -> Vec<u8> {
+    // 协议：data:<json>\n\n  或  event:xxx\ndata:<json>\n\n
+    // 我们只动 data: 行的 JSON。
+    let text = match std::str::from_utf8(event) {
+        Ok(s) => s,
+        Err(_) => return event.to_vec(),
+    };
+    // 只对包含相关关键词的事件做 JSON 解析（廉价 prefilter）
+    if !(text.contains("function_call_output")
+        || text.contains("tool_result")
+        || text.contains("\"output\""))
+    {
+        return event.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(event.len());
+    let mut any_changed = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+        if let Some(payload) = trimmed.strip_prefix("data:") {
+            let payload = payload.strip_prefix(' ').unwrap_or(payload);
+            // 空 data 或 [DONE] 透传
+            if payload.is_empty() || payload == "[DONE]" {
+                out.extend_from_slice(line.as_bytes());
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(payload) {
+                Ok(mut val) => {
+                    let mut hit_tool: Option<String> = None;
+                    let mut total_in: u64 = 0;
+                    let mut total_out: u64 = 0;
+                    let mut any_compressed = false;
+                    rewrite_function_call_output(
+                        &mut val,
+                        threshold,
+                        &mut hit_tool,
+                        &mut total_in,
+                        &mut total_out,
+                        &mut any_compressed,
+                    );
+                    // 也覆盖 claude code SSE 的 content_block_delta.delta 形态
+                    rewrite_claude_tool_result(
+                        &mut val,
+                        threshold,
+                        &mut hit_tool,
+                        &mut total_in,
+                        &mut total_out,
+                        &mut any_compressed,
+                    );
+                    if total_in > 0 {
+                        crate::record_compress_frame(any_compressed, total_in, total_out);
+                        if any_compressed {
+                            let savings = if total_in == 0 { 0.0 } else {
+                                (1.0 - (total_out as f64 / total_in as f64)) * 100.0
+                            };
+                            println!(
+                                "[Compress] {}→{} bytes (-{:.0}%) tool={}",
+                                total_in,
+                                total_out,
+                                savings,
+                                hit_tool.as_deref().unwrap_or("?")
+                            );
+                        }
+                    }
+                    if any_compressed {
+                        any_changed = true;
+                        // 重新序列化为单行 data
+                        let serialized = serde_json::to_string(&val).unwrap_or_else(|_| payload.to_string());
+                        out.extend_from_slice(b"data: ");
+                        out.extend_from_slice(serialized.as_bytes());
+                        out.push(b'\n');
+                    } else {
+                        out.extend_from_slice(line.as_bytes());
+                    }
+                }
+                Err(_) => out.extend_from_slice(line.as_bytes()),
+            }
+        } else {
+            out.extend_from_slice(line.as_bytes());
+        }
+    }
+
+    if any_changed {
+        out
+    } else {
+        event.to_vec()
+    }
+}
+
+/// 处理 claude code 的 SSE 形态：
+/// - 完整 tool_result block：`{"type":"tool_result","content": "..." | [{"type":"text","text":"..."}]}`
+/// - content_block_delta：`{"type":"content_block_delta", "delta":{"type":"tool_result_delta", "text":"..."}}`
+fn rewrite_claude_tool_result(
+    val: &mut serde_json::Value,
+    threshold: usize,
+    hit_tool: &mut Option<String>,
+    total_in: &mut u64,
+    total_out: &mut u64,
+    any_compressed: &mut bool,
+) {
+    match val {
+        serde_json::Value::Object(map) => {
+            let block_type = map.get("type").and_then(|v| v.as_str()).map(String::from);
+            if matches!(block_type.as_deref(), Some("tool_result")) {
+                // content 可能是 string 或 array of blocks
+                if let Some(field) = map.get_mut("content") {
+                    match field {
+                        serde_json::Value::String(s) => {
+                            let r = crate::output_compress::compress(s, threshold);
+                            *total_in += r.original_bytes as u64;
+                            *total_out += r.output_bytes as u64;
+                            if r.was_compressed {
+                                *any_compressed = true;
+                                if hit_tool.is_none() {
+                                    *hit_tool = Some("Bash".to_string());
+                                }
+                                *field = serde_json::Value::String(r.compressed.into_owned());
+                            }
+                        }
+                        serde_json::Value::Array(arr) => {
+                            for blk in arr.iter_mut() {
+                                if let Some(blk_obj) = blk.as_object_mut() {
+                                    if blk_obj.get("type").and_then(|v| v.as_str()) == Some("text") {
+                                        if let Some(text_field) = blk_obj.get_mut("text") {
+                                            if let Some(s) = text_field.as_str() {
+                                                let r = crate::output_compress::compress(s, threshold);
+                                                *total_in += r.original_bytes as u64;
+                                                *total_out += r.output_bytes as u64;
+                                                if r.was_compressed {
+                                                    *any_compressed = true;
+                                                    if hit_tool.is_none() {
+                                                        *hit_tool = Some("Bash".to_string());
+                                                    }
+                                                    *text_field = serde_json::Value::String(r.compressed.into_owned());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // 递归找嵌套的 tool_result
+            for (_, v) in map.iter_mut() {
+                rewrite_claude_tool_result(v, threshold, hit_tool, total_in, total_out, any_compressed);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                rewrite_claude_tool_result(v, threshold, hit_tool, total_in, total_out, any_compressed);
+            }
+        }
+        _ => {}
     }
 }
 
