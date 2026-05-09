@@ -919,6 +919,35 @@ async fn handle_request(
 
     // ── WebSocket 升级检测 ──
     if is_websocket_upgrade(&req) {
+        // Relay + chat_completions（GLM 这类）上游只有 HTTP /chat/completions，
+        // 没有 WS 端点。原 handle_websocket 会盲目把 wss://upstream/v1/responses
+        // 桥接出去 → 上游立刻关 → codex.app 看 "websocket closed by server before
+        // response.completed" 重连 5 次才 fallback 到 HTTP。
+        // 这里直接拒绝升级（返回 400），让 codex.app 一次失败后立即走 HTTP 路径。
+        let chat_completions_relay = state
+            .store
+            .lock()
+            .ok()
+            .and_then(|s| {
+                let id = s.current.as_ref()?.clone();
+                let acc = s.accounts.get(&id)?;
+                if acc.is_relay() && acc.relay_protocol.as_deref() == Some("chat_completions") {
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .is_some();
+        if chat_completions_relay {
+            println!(
+                "[Proxy] WebSocket upgrade 拒绝（chat_completions Relay 上游无 WS）：{}",
+                req.uri()
+            );
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "chat_completions Relay (GLM) 不支持 WebSocket，请用 HTTP/SSE",
+            ));
+        }
         println!("[Proxy] WebSocket upgrade 请求: {}", req.uri());
         return handle_websocket(state, req).await;
     }
