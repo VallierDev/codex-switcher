@@ -3736,10 +3736,16 @@ fn detect_ws_rate_limit(msg: &tungstenite::Message) -> bool {
                 return true;
             }
 
-            // 有 error 字段也判定
-            if val.get("response").and_then(|r| r.get("error")).is_some()
-                || val.get("error").is_some()
-            {
+            // 有 error 字段且非 null 才判定（response.created 等 in_progress 事件
+            // 协议规定带 "error":null，serde_json 的 get() 对 null 也返回 Some(&Null)，
+            // 必须显式排除 null，否则会把正常 in_progress 误判成限额、无限切号）
+            let response_error_real = val
+                .get("response")
+                .and_then(|r| r.get("error"))
+                .map(|e| !e.is_null())
+                .unwrap_or(false);
+            let outer_error_real = val.get("error").map(|e| !e.is_null()).unwrap_or(false);
+            if response_error_real || outer_error_real {
                 println!("[Proxy] WS 限额: 有 error 字段");
                 return true;
             }
@@ -3798,10 +3804,14 @@ fn detect_ws_banned(msg: &tungstenite::Message) -> bool {
                 return true;
             }
 
-            // error 字段里包含封号关键词
-            if val.get("response").and_then(|r| r.get("error")).is_some()
-                || val.get("error").is_some()
-            {
+            // error 字段里包含封号关键词（同样要排除 null，避免 in_progress 误判）
+            let response_error_real = val
+                .get("response")
+                .and_then(|r| r.get("error"))
+                .map(|e| !e.is_null())
+                .unwrap_or(false);
+            let outer_error_real = val.get("error").map(|e| !e.is_null()).unwrap_or(false);
+            if response_error_real || outer_error_real {
                 return true;
             }
         }
