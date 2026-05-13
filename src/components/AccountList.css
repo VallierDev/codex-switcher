@@ -127,6 +127,30 @@
     line-height: 1.4;
 }
 
+/* Sub filter — ChatGPT 订阅号聚合（所有 PRO/PLUS/TEAM/FREE） */
+.filter-btn--sub {
+    color: #10a37f;
+    background: rgba(16, 163, 127, 0.12);
+    padding: 5px 10px;
+}
+.filter-btn--sub:hover {
+    color: #10a37f;
+    background: rgba(16, 163, 127, 0.20);
+}
+.filter-btn--sub.active {
+    color: #fff;
+    background: #10a37f;
+    box-shadow: 0 0 0 1px rgba(16, 163, 127, 0.5);
+}
+.filter-btn--sub .filter-count {
+    background: rgba(16, 163, 127, 0.30);
+    color: #10a37f;
+}
+.filter-btn--sub.active .filter-count {
+    background: rgba(255, 255, 255, 0.25);
+    color: #fff;
+}
+
 /* RELAY filter — emphasised because relay accounts are first-class now */
 .filter-btn--relay {
     color: #c4b5fd;

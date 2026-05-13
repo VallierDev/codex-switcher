@@ -40,7 +40,7 @@ interface UsageData {
     is_valid_for_cli: boolean;
 }
 
-type FilterType = 'all' | 'plus' | 'pro' | 'team' | 'free' | 'relay' | 'coding_plan' | 'third_party';
+type FilterType = 'all' | 'sub' | 'plus' | 'pro' | 'team' | 'free' | 'relay' | 'coding_plan' | 'third_party';
 
 interface AccountListProps {
     accounts: Account[];
@@ -151,6 +151,8 @@ export function AccountList({
                 if (filter === 'coding_plan') return isRelay && a.relay_category === 'coding_plan';
                 if (filter === 'third_party') return isRelay && a.relay_category === 'third_party';
                 if (isRelay) return false; // 其它 plan 过滤胶囊只看订阅类
+                // Sub = 所有 ChatGPT 订阅号（不含 Relay / OpenAI Key）
+                if (filter === 'sub') return effectiveKind(a) === 'chatgpt_oauth';
                 const type = usageMap[a.id]?.plan_type?.toLowerCase() || '';
                 if (filter === 'pro') return type.includes('pro');
                 if (filter === 'plus') return type.includes('plus');
@@ -163,15 +165,18 @@ export function AccountList({
     }, [accounts, searchQuery, filter, usageMap]);
 
     const filterCounts = useMemo(() => {
-        const counts = { all: accounts.length, pro: 0, plus: 0, team: 0, free: 0, relay: 0, coding_plan: 0, third_party: 0 };
+        const counts = { all: accounts.length, sub: 0, pro: 0, plus: 0, team: 0, free: 0, relay: 0, coding_plan: 0, third_party: 0 };
         accounts.forEach(a => {
-            if (effectiveKind(a) === 'relay') {
+            const kind = effectiveKind(a);
+            if (kind === 'relay') {
                 const cat = a.relay_category ?? 'aggregator';
                 if (cat === 'coding_plan') counts.coding_plan++;
                 else if (cat === 'third_party') counts.third_party++;
                 else counts.relay++;
                 return;
             }
+            // Sub = ChatGPT 订阅类（所有 plan tier 合在一起）
+            if (kind === 'chatgpt_oauth') counts.sub++;
             const type = usageMap[a.id]?.plan_type?.toLowerCase() || '';
             if (type.includes('pro')) counts.pro++;
             else if (type.includes('plus')) counts.plus++;
@@ -396,9 +401,11 @@ export function AccountList({
                     <input type="text" placeholder="搜索邮箱..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
                 </div>
                 <div className="filter-group">
-                    {(['all', 'pro', 'plus', 'team', 'free', 'relay', 'coding_plan', 'third_party'] as const).map(t => {
+                    {(['all', 'sub', 'pro', 'plus', 'team', 'free', 'relay', 'coding_plan', 'third_party'] as const).map(t => {
                         const isRelayLike = t === 'relay' || t === 'coding_plan' || t === 'third_party';
+                        const isSubGroup = t === 'sub';
                         const label = t === 'all' ? 'ALL'
+                            : t === 'sub' ? 'Sub'
                             : t === 'coding_plan' ? 'Plan'
                             : t === 'third_party' ? '三方'
                             : t === 'relay' ? '中转'
@@ -406,7 +413,7 @@ export function AccountList({
                         return (
                             <button
                                 key={t}
-                                className={`filter-btn filter-btn-compact ${isRelayLike ? 'filter-btn--relay' : ''} ${filter === t ? 'active' : ''}`}
+                                className={`filter-btn filter-btn-compact ${isRelayLike ? 'filter-btn--relay' : ''} ${isSubGroup ? 'filter-btn--sub' : ''} ${filter === t ? 'active' : ''}`}
                                 onClick={() => setFilter(t)}
                             >
                                 {label}<span className="filter-count">{filterCounts[t]}</span>
