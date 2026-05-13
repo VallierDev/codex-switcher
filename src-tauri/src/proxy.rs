@@ -644,6 +644,94 @@ fn current_relay_route(state: &ProxyState) -> Option<RelayRoute> {
     })
 }
 
+/// 按 account_id 直接构造 RelayRoute（hard route 用，跳过 store.current 检查）。
+fn relay_route_for_account(state: &ProxyState, account_id: &str) -> Option<RelayRoute> {
+    let store = state.store.lock().ok()?;
+    let acc = store.accounts.get(account_id)?;
+    if !acc.is_relay() {
+        return None;
+    }
+    Some(RelayRoute {
+        account_id: account_id.to_string(),
+        model_map: acc.relay_model_map.clone(),
+        model_fallback: acc.relay_model_fallback.clone(),
+        protocol: acc.relay_protocol_or_default().to_string(),
+        api_key: AccountStore::extract_access_token(&acc.auth_json),
+        base_url: acc.relay_base_url.clone(),
+    })
+}
+
+/// 从请求 headers + body 提取 session_key，并查 enabled hard route。
+/// 命中即记录 hit 并返回 (session_key, account_id)。
+///
+/// hyper::HeaderMap 跟 reqwest::header::HeaderMap 都是 http::HeaderMap 的别名，
+/// 同类型直接传，不需要拷贝转换（之前转换可能因 HeaderName::from_bytes 验证规则
+/// 把 codex 的 `session_id`（带 underscore）丢掉，导致路由命中失败）。
+fn resolve_hard_route(
+    state: &ProxyState,
+    body: &[u8],
+    headers: &hyper::HeaderMap,
+) -> Option<(String, String)> {
+    // 显式 fallback：先按 codex 实际发的 session_id / thread_id header 直接抠，
+    // 跟 session_affinity 模块兼容（`hdr:` 前缀）。
+    let sk: Option<String> = (|| -> Option<String> {
+        for name in &["session_id", "session-id", "x-session-id", "thread_id"] {
+            if let Some(v) = headers.get(*name).and_then(|v| v.to_str().ok()) {
+                if !v.is_empty() {
+                    return Some(format!("hdr:{v}"));
+                }
+            }
+        }
+        // fallback：还看 body（JSON prompt_cache_key / previous_response_id），
+        // 走 session_affinity 已有逻辑
+        crate::session_affinity::extract_session_key(body, headers)
+    })();
+    let sk = sk?;
+    // 路由表里存的是 bare session UUID（不带 hdr: / pck: 前缀），lookup 要剥掉前缀
+    let raw_session = sk
+        .strip_prefix("hdr:")
+        .or_else(|| sk.strip_prefix("pck:"))
+        .or_else(|| sk.strip_prefix("prev:"))
+        .unwrap_or(&sk)
+        .to_string();
+    let account_id = {
+        let mut routes = state.session_routes.lock().ok()?;
+        match routes.find_enabled_by_session(&raw_session) {
+            Some(r) => {
+                let aid = r.account_id.clone();
+                let rid = r.id.clone();
+                routes.record_hit(&rid);
+                let _ = routes.save();
+                aid
+            }
+            None => {
+                let known: Vec<String> = routes
+                    .routes
+                    .values()
+                    .filter(|r| r.enabled)
+                    .map(|r| r.session_id.clone())
+                    .collect();
+                println!(
+                    "[Proxy] Hard route MISS: incoming session_key={:?} raw={:?} known_routes={:?}",
+                    sk, raw_session, known
+                );
+                return None;
+            }
+        }
+    };
+    let acc_name = state
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.accounts.get(&account_id).map(|a| a.name.clone()))
+        .unwrap_or_else(|| account_id.clone());
+    println!(
+        "[Proxy] Hard route hit: session={} → {} ({})",
+        raw_session, account_id, acc_name
+    );
+    Some((sk, account_id))
+}
+
 /// 若 body 是 JSON 且含 `model` 字段，按 `map` / `fallback` 重写。
 ///
 /// 优先级：map 命中 > fallback；都不命中或值跟原值相等 → 原样返回。
@@ -1113,6 +1201,48 @@ async fn handle_request(
 
     // ── WebSocket 升级检测 ──
     if is_websocket_upgrade(&req) {
+        // DEBUG: dump 所有 upgrade headers，找 session_id 藏在哪
+        {
+            println!("[Proxy DEBUG] WS upgrade headers:");
+            for (name, value) in req.headers() {
+                let v = value.to_str().unwrap_or("(non-ascii)");
+                let lower = name.as_str().to_lowercase();
+                // 只 print session 相关的，避免日志爆
+                if lower.contains("session")
+                    || lower.contains("codex")
+                    || lower.contains("turn")
+                    || lower.contains("originator")
+                    || lower.contains("thread")
+                    || lower.contains("conversation")
+                    || lower.contains("trace")
+                    || lower.contains("agent")
+                {
+                    println!("[Proxy DEBUG]   {}: {}", name, v);
+                }
+            }
+        }
+        // Hard route 优先：WS upgrade body 是空的，只查 headers（codex 用
+        // session_id / x-session-id / Session_id header 透 session_key 出来）。
+        if let Some((_sk, account_id)) = resolve_hard_route(&state, &[], req.headers()) {
+            if let Some(hard_relay) = relay_route_for_account(&state, &account_id) {
+                if hard_relay.protocol == "chat_completions" {
+                    println!(
+                        "[Proxy] Hard route WS → chat_completions Relay 适配器（{}）",
+                        hard_relay.account_id
+                    );
+                    return handle_chat_completions_relay_websocket(state, hard_relay, req).await;
+                }
+                // 绑定的 Relay 是 responses 协议 —— 当成普通 WS 直接进 handle_websocket，
+                // 但需要把 store.current 临时改成绑定账号。WS 路径目前不支持 per-request
+                // 账号覆盖，暂不实现该分支（用户应该选 chat_completions 协议的 Relay 才 ok）。
+                println!(
+                    "[Proxy] Hard route 绑定的 Relay 是 responses 协议，WS 路径暂不支持 per-request 覆盖，落回 current"
+                );
+            }
+            // 绑定的不是 Relay（订阅号），WS 路径要做 per-request 账号覆盖很复杂。
+            // 当前限制：hard route 在 WS 路径只对 chat_completions Relay 生效。
+        }
+
         if let Some(relay) = current_relay_route(&state) {
             if relay.protocol == "chat_completions" {
                 println!(
@@ -1156,10 +1286,19 @@ async fn handle_request(
         body_bytes
     };
 
+    // ── Hard route 检查（HTTP 路径）──
+    // 如果该 session 有 enabled 路由 → 用绑定账号的 RelayRoute 覆盖 current。
+    // 注意：必须在 chat_completions 翻译分支之前，否则 current 是普通号会跳过翻译。
+    let hard_route_relay: Option<RelayRoute> =
+        resolve_hard_route(&state, &body_bytes, &req_headers)
+            .and_then(|(_sk, aid)| relay_route_for_account(&state, &aid));
+
     // ── chat_completions Relay 翻译分支 ──
-    // Relay 上游只懂 /chat/completions（GLM Coding Plan 等）→ 用 relay_translate 把
+    // Relay 上游只懂 /chat/completions（GLM Coding Plan / MiMo 等）→ 用 relay_translate 把
     // codex 的 /v1/responses 翻译成 chat 协议，调好上游再把响应（SSE 或 sync）反翻译回来。
-    if let Some(ref r) = relay_route {
+    // 优先用 hard_route_relay（用户显式指定的路由）；否则用 current_relay_route。
+    let effective_relay = hard_route_relay.as_ref().or(relay_route.as_ref());
+    if let Some(r) = effective_relay {
         if r.protocol == "chat_completions" {
             return Ok(handle_chat_completions_relay(
                 state.clone(),
@@ -2241,6 +2380,30 @@ fn build_upstream_headers(
             }
         }
     }
+    if let Ok(host_val) = reqwest::header::HeaderValue::from_str(upstream_host) {
+        h.insert(reqwest::header::HOST, host_val);
+    }
+    h
+}
+
+/// chat_completions Relay 专用 header 构造：只透传 Accept / User-Agent 等无害的，
+/// 不带 codex 私有 header（x-codex-*、session_id、thread_id、OpenAI-Beta、
+/// traceparent 等）。
+///
+/// 历史背景：在 GLM Coding Plan 边缘 WAF 上观测到，只要带 codex 那堆 `x-codex-*`
+/// header POST `/api/coding/paas/v4/chat/completions`，请求就会被路由到一个
+/// 不接 POST 的 handler，返回 `405 METHOD_NOT_ALLOWED`。curl 同样的 URL + body
+/// 但不带 codex header，照样 200。chat_completions 协议本身只需要 Auth + JSON。
+fn build_chat_relay_upstream_headers(upstream_host: &str) -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("application/json, text/event-stream"),
+    );
+    h.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static("codex-switcher-relay/1.0"),
+    );
     if let Ok(host_val) = reqwest::header::HeaderValue::from_str(upstream_host) {
         h.insert(reqwest::header::HOST, host_val);
     }
@@ -4787,6 +4950,7 @@ async fn handle_chat_completions_relay_websocket(
         .body(full_body(Bytes::new()))
         .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "101 构建失败"));
 
+    let disconnect = state.ws_disconnect.clone();
     tokio::spawn(async move {
         let upgraded = match on_upgrade.await {
             Ok(u) => u,
@@ -4806,7 +4970,19 @@ async fn handle_chat_completions_relay_websocket(
     { let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
         .and_then(|mut f| std::io::Write::write_all(&mut f, b"[ENTRY] WS adapter connected\n")); }
 
-        while let Some(msg) = client_ws.next().await {
+        loop {
+            // 同时监听：client 下一个消息 / 切号或路由变更触发的 ws_disconnect
+            let next_msg = tokio::select! {
+                m = client_ws.next() => m,
+                _ = disconnect.notified() => {
+                    println!("[Proxy] chat_completions Relay WS 收到 ws_disconnect，主动关闭让 codex 重连");
+                    let _ = client_ws
+                        .send(tungstenite::Message::Close(None))
+                        .await;
+                    break;
+                }
+            };
+            let Some(msg) = next_msg else { break; };
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => {
@@ -4814,8 +4990,19 @@ async fn handle_chat_completions_relay_websocket(
                     break;
                 }
             };
+            // DEBUG: print every message type received
+            let kind = match &msg {
+                tungstenite::Message::Text(t) => format!("Text({}B)", t.len()),
+                tungstenite::Message::Binary(b) => format!("Binary({}B)", b.len()),
+                tungstenite::Message::Ping(_) => "Ping".to_string(),
+                tungstenite::Message::Pong(_) => "Pong".to_string(),
+                tungstenite::Message::Close(c) => format!("Close({:?})", c),
+                tungstenite::Message::Frame(_) => "Frame".to_string(),
+            };
+            println!("[Proxy] chat relay WS 收到 client msg: {}", kind);
             match msg {
                 tungstenite::Message::Text(text) => {
+                    println!("[Proxy] chat relay WS Text preview: {}", &text[..text.len().min(180)]);
                     if let Err(e) = handle_chat_relay_ws_text(
                         &state,
                         &relay,
@@ -4825,6 +5012,7 @@ async fn handle_chat_completions_relay_websocket(
                     )
                     .await
                     {
+                        eprintln!("[Proxy] chat relay WS handler 返错: {}", e);
                         let err_evt = serde_json::json!({
                             "type": "error",
                             "error": {
@@ -4872,10 +5060,20 @@ where
         return Ok(());
     }
 
-    let mut response_body = event
-        .get("response")
-        .cloned()
-        .ok_or_else(|| "response.create missing response".to_string())?;
+    // codex 0.x WS 协议有两种 response.create 形态：
+    //   旧（≤0.129）：{ type: "response.create", response: { model, input, ... } }
+    //   新（≥0.130 Desktop）：{ type: "response.create", model, input, instructions, ... } 平铺
+    // 兼容两种：优先 nested `response`，否则把整个 event 去掉 type 字段当 body。
+    let mut response_body = if let Some(nested) = event.get("response").cloned() {
+        nested
+    } else {
+        // 平铺：clone 整个 event，去掉 type 字段
+        let mut v = event.clone();
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("type");
+        }
+        v
+    };
     if let Some(obj) = response_body.as_object_mut() {
         obj.insert("stream".to_string(), serde_json::Value::Bool(true));
     }
@@ -4905,7 +5103,7 @@ where
     let (upstream_url, upstream_host) =
         build_chat_completions_url(base).ok_or_else(|| "Relay base_url 解析失败".to_string())?;
 
-    let mut headers = build_upstream_headers(req_headers, &upstream_host);
+    let mut headers = build_chat_relay_upstream_headers(&upstream_host);
     let api_key = relay.api_key.clone().unwrap_or_default();
     if !api_key.is_empty() {
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", api_key)) {
@@ -5201,8 +5399,9 @@ async fn handle_chat_completions_relay(
         force_mimo_web_search_flag(&mut chat_body);
     }
 
-    // 透传必要 header（剔除 Authorization/Host），强制注入 Relay api_key
-    let mut headers = build_upstream_headers(&req_headers, &upstream_host);
+    // chat_completions 专用：tight whitelist，不带 codex 私有 header（GLM 等 WAF
+    // 看到 codex 私有 header 会 405），强制注入 Relay api_key
+    let mut headers = build_chat_relay_upstream_headers(&upstream_host);
     let api_key = relay.api_key.clone().unwrap_or_default();
     if !api_key.is_empty() {
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", api_key)) {

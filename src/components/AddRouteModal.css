@@ -77,6 +77,50 @@
     color: #fff;
 }
 
+/* "当前活跃会话" 一键使用 banner —— 出现在 toggle 行下方、recent/manual 主区上方 */
+.cs-route-active-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    margin: 10px 0;
+    padding: 10px 14px;
+    background: linear-gradient(90deg, rgba(34,197,94,.10), rgba(34,197,94,.02));
+    border: 1px solid rgba(34,197,94,.35);
+    border-radius: 8px;
+    color: var(--r-text, #e5e7eb);
+    cursor: pointer;
+    font-size: 13px;
+    transition: background .12s, border-color .12s;
+}
+.cs-route-active-banner:hover {
+    background: linear-gradient(90deg, rgba(34,197,94,.18), rgba(34,197,94,.04));
+    border-color: rgba(34,197,94,.55);
+}
+.cs-route-active-banner__icon {
+    color: #22c55e;
+    font-size: 10px;
+    line-height: 1;
+    animation: cs-route-pulse 2s ease-in-out infinite;
+}
+@keyframes cs-route-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: .35; }
+}
+.cs-route-active-banner__label {
+    font-weight: 500;
+}
+.cs-route-active-banner__sid {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--r-text-muted, #9ca3af);
+    font-size: 12px;
+}
+.cs-route-active-banner__cta {
+    margin-left: auto;
+    color: #22c55e;
+    font-weight: 600;
+}
+
 /* Search + filter row */
 .cs-route-filter-row {
     display: flex;

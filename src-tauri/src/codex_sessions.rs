@@ -91,6 +91,42 @@ fn sessions_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".codex/sessions"))
 }
 
+/// 检测"当前活跃的 codex 会话"：
+/// 扫 `~/.codex/sessions` 下所有 rollout-*.jsonl，按文件 mtime 选最新一条；
+/// 若该文件在 `window_secs` 秒内被更新过则返回该 session 的元信息，否则返回 None。
+///
+/// 用于 UI "绑定到当前活跃会话" 按钮：用户在 codex 里刚发完 / 正在发消息时，
+/// 对应的 rollout 文件刚被写过，mtime 在窗口内 → 自动定位到那个 session_id。
+pub fn detect_active_session(window_secs: u64) -> Option<CodexSession> {
+    use std::time::SystemTime;
+    let root = sessions_root();
+    if !root.exists() {
+        return None;
+    }
+    let files = walk_jsonl(&root);
+    // 找 mtime 最新的一条
+    let now = SystemTime::now();
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for p in files {
+        let mtime = match fs::metadata(&p).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        // 窗口外的直接跳
+        if let Ok(age) = now.duration_since(mtime) {
+            if age.as_secs() > window_secs {
+                continue;
+            }
+        }
+        match &best {
+            Some((b, _)) if &mtime <= b => {}
+            _ => best = Some((mtime, p)),
+        }
+    }
+    let (_, path) = best?;
+    parse_session_head(&path).ok().flatten()
+}
+
 /// 递归收集 root 下所有 `rollout-*.jsonl`（YYYY/MM/DD 三层目录结构）。
 /// 用标准库 read_dir 实现，避免引入 walkdir 依赖。
 fn walk_jsonl(root: &Path) -> Vec<PathBuf> {

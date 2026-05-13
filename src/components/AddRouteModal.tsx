@@ -77,6 +77,9 @@ export function AddRouteModal({ isOpen, accounts, onClose, onSuccess }: AddRoute
     const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
     const [manualSessionId, setManualSessionId] = useState('');
 
+    // 5 分钟内被写过的最新 rollout —— 也就是用户"当前正在跟 codex 聊"的那个会话
+    const [activeSession, setActiveSession] = useState<CodexSession | null>(null);
+
     // Account picker
     const [accountSearch, setAccountSearch] = useState('');
     const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
@@ -97,12 +100,30 @@ export function AddRouteModal({ isOpen, accounts, onClose, onSuccess }: AddRoute
             setCwdFilter('');
             setSelectedSessionId(null);
             setManualSessionId('');
+            setActiveSession(null);
             setAccountSearch('');
             setSelectedAccountId(null);
             setLabel('');
             setSubmitting(false);
             setError(null);
         }
+    }, [isOpen]);
+
+    // Modal 打开时，检测"当前活跃 codex 会话"（5 分钟内被写过的最新 rollout）
+    // 用户点 "🎯 使用当前会话" 一键填入，免去手动复制 session_id 的麻烦。
+    useEffect(() => {
+        if (!isOpen) return;
+        let cancelled = false;
+        invoke<CodexSession | null>('detect_active_codex_session', { windowSecs: 300 })
+            .then((s) => {
+                if (!cancelled) setActiveSession(s);
+            })
+            .catch(() => {
+                /* 没检测到当前活跃会话不是错误，安静地忽略 */
+            });
+        return () => {
+            cancelled = true;
+        };
     }, [isOpen]);
 
     // Load recent sessions when modal opens / mode switches to recent.
@@ -224,6 +245,29 @@ export function AddRouteModal({ isOpen, accounts, onClose, onSuccess }: AddRoute
                                     </button>
                                 </div>
                             </div>
+
+                            {activeSession && (
+                                <button
+                                    type="button"
+                                    className="cs-route-active-banner"
+                                    onClick={() => {
+                                        setSourceMode('recent');
+                                        setSelectedSessionId(activeSession.session_id);
+                                    }}
+                                    title={activeSession.cwd ?? ''}
+                                >
+                                    <span className="cs-route-active-banner__icon">●</span>
+                                    <span className="cs-route-active-banner__label">
+                                        当前活跃会话{activeSession.cwd ? `（${basename(activeSession.cwd) || activeSession.cwd}）` : ''}
+                                    </span>
+                                    <span className="cs-route-active-banner__sid">
+                                        {shortSessionId(activeSession.session_id)}
+                                    </span>
+                                    <span className="cs-route-active-banner__cta">
+                                        {selectedSessionId === activeSession.session_id ? '✓ 已选' : '一键使用 →'}
+                                    </span>
+                                </button>
+                            )}
 
                             {sourceMode === 'recent' ? (
                                 <>

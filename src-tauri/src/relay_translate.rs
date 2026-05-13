@@ -21,7 +21,6 @@ use serde_json::{json, Map, Value};
 #[derive(Debug)]
 pub enum TranslateError {
     InvalidJson(String),
-    ChainingUnsupported,
     Serialize(String),
 }
 
@@ -29,10 +28,6 @@ impl std::fmt::Display for TranslateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidJson(e) => write!(f, "invalid JSON in request body: {}", e),
-            Self::ChainingUnsupported => write!(
-                f,
-                "`previous_response_id` chaining is not supported when translating to /chat/completions"
-            ),
             Self::Serialize(e) => write!(f, "serialization failed: {}", e),
         }
     }
@@ -125,14 +120,10 @@ pub fn translate_request(
     let mut data: Value = serde_json::from_slice(codex_body)
         .map_err(|e| TranslateError::InvalidJson(e.to_string()))?;
 
-    // Reject `previous_response_id`-based chaining outright. Codex CLI with the
-    // default `store: false` config never sends this, but if some caller does
-    // we'd silently lose history mapping → fail loud.
-    if let Some(prev) = data.get("previous_response_id") {
-        if !prev.is_null() {
-            return Err(TranslateError::ChainingUnsupported);
-        }
-    }
+    // `previous_response_id` 在 chat_completions stateless 上游(MiMo/GLM/DeepSeek)
+    // 下没有意义；我们靠 `emit_completed` 里 response.id="" 让 codex 自动回退
+    // 到"每轮发完整 input"，所以即便 codex 带了这个字段也只需丢弃，不需要再 chain。
+    // 见 emit_completed 内的详细说明。
 
     // Extract metadata we need to surface in the synthesized streaming
     // `response.created` event later.
@@ -1184,6 +1175,12 @@ pub fn emit_completed(state: &mut TranslatorState) -> Vec<u8> {
                 "total_tokens": 0,
             }),
         );
+        // 故意把 response.id 设成空串：codex 0.130 WS 客户端
+        // (codex-rs/core/src/client.rs:1053) 看到 last_response.response_id.is_empty()
+        // 会放弃 `previous_response_id + 增量 input` 优化，下一轮自动回退发
+        // 完整 input。chat_completions 上游(MiMo/GLM/DeepSeek)本来就 stateless，
+        // 没有 prev-response 状态可以 chain，于是这个降级是免费的胜利。
+        o.insert("id".to_string(), Value::String(String::new()));
     }
     out.extend(encode_event(
         state,
@@ -1652,14 +1649,21 @@ mod tests {
     }
 
     #[test]
-    fn previous_response_id_rejected() {
+    fn previous_response_id_now_tolerated() {
+        // codex 0.130 多轮会话总是会带 previous_response_id；之前硬拒，
+        // 让 chat_completions 上游（MiMo/GLM/DeepSeek）多轮直接断。
+        // 现在改成软忽略 —— 翻译照常完成（消息历史本来就在 input 里）。
         let codex = json!({
             "model": "gpt-5",
             "input": "hi",
             "previous_response_id": "resp_abc",
         });
-        let err = translate_request(&serde_json::to_vec(&codex).unwrap(), "glm-5.1").unwrap_err();
-        assert!(matches!(err, TranslateError::ChainingUnsupported));
+        let (body, _state) =
+            translate_request(&serde_json::to_vec(&codex).unwrap(), "glm-5.1").unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        // body 里不该再带 previous_response_id（chat_completions 协议里不存在）
+        assert!(v.get("previous_response_id").map_or(true, |p| p.is_null()),
+            "previous_response_id 应当被忽略，不出现在翻译后 chat 请求里");
     }
 
     #[test]

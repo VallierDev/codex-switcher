@@ -117,7 +117,8 @@ jobs:
             all-artifacts/**/*
           tag_name: ${{ github.ref_name }}
           name: "Release ${{ github.ref_name }}"
-          body: "New release for ${{ github.ref_name }}. See assets below."
+          # 自动从 commits / merged PRs 生成 release notes，比手写 "New release for tag" 信息量大很多
+          generate_release_notes: true
           draft: false
           prerelease: false
         env:

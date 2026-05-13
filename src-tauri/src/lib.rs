@@ -3441,6 +3441,10 @@ async fn list_session_routes(
 }
 
 /// 新增 / upsert 一条 session 硬路由（按 session_id 去重，hit_count 在 upsert 时保留）
+///
+/// 写完会广播 `ws_disconnect`，让所有正在 ChatGPT 上挂着的 WS 客户端被踢，codex
+/// 自动重连后会经过 hard route 检查、命中新路由。这样用户在 UI 点"绑定"后
+/// 下一条消息就立刻走到新上游，不需要重启 codex 或 codex-switcher。
 #[tauri::command]
 async fn add_session_route(
     state: State<'_, AppState>,
@@ -3448,12 +3452,16 @@ async fn add_session_route(
     account_id: String,
     label: Option<String>,
 ) -> Result<session_routes::SessionRoute, String> {
-    let mut store = state
-        .session_routes
-        .lock()
-        .map_err(|e| format!("session_routes lock: {}", e))?;
-    let route = store.add(session_id, account_id, label);
-    store.save()?;
+    let route = {
+        let mut store = state
+            .session_routes
+            .lock()
+            .map_err(|e| format!("session_routes lock: {}", e))?;
+        let route = store.add(session_id, account_id, label);
+        store.save()?;
+        route
+    };
+    state.ws_disconnect.notify_waiters();
     Ok(route)
 }
 
@@ -3463,14 +3471,17 @@ async fn delete_session_route(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let mut store = state
-        .session_routes
-        .lock()
-        .map_err(|e| format!("session_routes lock: {}", e))?;
-    if !store.delete(&id) {
-        return Err(format!("session route 不存在: {}", id));
+    {
+        let mut store = state
+            .session_routes
+            .lock()
+            .map_err(|e| format!("session_routes lock: {}", e))?;
+        if !store.delete(&id) {
+            return Err(format!("session route 不存在: {}", id));
+        }
+        store.save()?;
     }
-    store.save()?;
+    state.ws_disconnect.notify_waiters();
     Ok(())
 }
 
@@ -3481,14 +3492,17 @@ async fn toggle_session_route(
     id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    let mut store = state
-        .session_routes
-        .lock()
-        .map_err(|e| format!("session_routes lock: {}", e))?;
-    if !store.toggle(&id, enabled) {
-        return Err(format!("session route 不存在: {}", id));
+    {
+        let mut store = state
+            .session_routes
+            .lock()
+            .map_err(|e| format!("session_routes lock: {}", e))?;
+        if !store.toggle(&id, enabled) {
+            return Err(format!("session route 不存在: {}", id));
+        }
+        store.save()?;
     }
-    store.save()?;
+    state.ws_disconnect.notify_waiters();
     Ok(())
 }
 
@@ -3507,6 +3521,7 @@ async fn update_session_route_label(
         return Err(format!("session route 不存在: {}", id));
     }
     store.save()?;
+    // label 改名不影响路由匹配，不需要踢 WS
     Ok(())
 }
 
@@ -3518,6 +3533,18 @@ async fn list_codex_sessions(
     days_back: Option<u32>,
 ) -> Result<Vec<codex_sessions::CodexSession>, String> {
     codex_sessions::list_codex_sessions(limit, project_filter, days_back)
+}
+
+/// 检测"当前活跃的 codex 会话"：返回 mtime 最新且在 `window_secs` 秒内被写过的
+/// rollout 对应的 session 元信息；没有则 None（用户没在跟 codex 聊或停了很久）。
+/// 前端 AddRouteModal 的"绑定当前活跃会话"按钮调这个。
+#[tauri::command]
+async fn detect_active_codex_session(
+    window_secs: Option<u64>,
+) -> Result<Option<codex_sessions::CodexSession>, String> {
+    Ok(codex_sessions::detect_active_session(
+        window_secs.unwrap_or(300),
+    ))
 }
 
 // ── Skills 管理命令 ──
@@ -4823,6 +4850,7 @@ pub fn run() {
             toggle_session_route,
             update_session_route_label,
             list_codex_sessions,
+            detect_active_codex_session,
             force_auth_resync,
             get_switch_history,
             get_switch_stats,
