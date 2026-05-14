@@ -243,8 +243,11 @@ pub async fn upsert_account(
 ) -> Result<UpsertOutcome, String> {
     let url = format!("{}/accounts", trim_url(base_url));
     let payload = serde_json::json!({ "account": account });
-    // 上传 + 服务端刷额度 可能 10+ 秒，临时给 45s 超时
+    // 上传 + 服务端刷额度 可能 10+ 秒，临时给 45s 超时；
+    // `.no_proxy()` 极重要：Server 是 LAN/ZeroTier 私有 IP，不绕过 macOS 系统代理（Clash）
+    // 会被截走 → 502 Bad Gateway。同 client() 设置。
     let c = Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(45))
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
@@ -416,6 +419,7 @@ pub async fn upload_skill(
         url_encode(name)
     );
     let resp = Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| format!("构建 HTTP client 失败: {}", e))?
@@ -459,7 +463,9 @@ pub async fn refresh_account_quota(
 ) -> Result<crate::usage::UsageDisplay, String> {
     let url = format!("{}/accounts/{}/refresh", trim_url(base_url), id);
     // oauth refresh + /usage 可能 15s+，给 45s 超时
+    // `.no_proxy()` 同 upsert_account：Server 是 LAN/ZeroTier 私有 IP
     let c = Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(45))
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
