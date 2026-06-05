@@ -26,6 +26,7 @@ export interface AppSettings {
     remote_mode?: string;
     relay_auto_switch_out?: boolean;
     relay_auto_switch_in?: boolean;
+    client_direct_upstream?: boolean;
 }
 
 export interface KeepaliveState {

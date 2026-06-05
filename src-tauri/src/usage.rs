@@ -69,18 +69,16 @@ impl UsageFetcher {
         let mut new_tokens: Option<crate::oauth::TokenResponse> = None;
 
         let client = usage_client();
-        let user_agent = format!(
-            "codex_cli_rs/{} (Mac OS; x86_64) codex-cli",
-            env!("CARGO_PKG_VERSION")
-        );
+        // 与官方 codex CLI 完全同形态的 UA / originator（codex_ua 模块统一构造）。
+        let user_agent = crate::codex_ua::codex_user_agent();
         let build_request = |at: &str, aid: &Option<String>| {
             // 12s 是经验值：正常 < 2s，5s+ 已经是慢路径，>12s 基本可以判定为节流/超时。
             // 之前 30s 让 "刷新全部" 的尾延迟被个别慢账号拖很久。
             let mut req = client
                 .get("https://chatgpt.com/backend-api/wham/usage")
                 .header("Authorization", format!("Bearer {}", at))
-                .header("User-Agent", &user_agent)
-                .header("originator", "codex_cli_rs")
+                .header("User-Agent", user_agent)
+                .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
                 .header("Accept", "application/json")
                 .timeout(Duration::from_secs(12));
             if let Some(id) = aid {
@@ -97,9 +95,15 @@ impl UsageFetcher {
         let mut status = response.status();
 
         // 如果允许本地刷新，且 401/403 且有 refresh_token，尝试刷新
+        // 注意：rt 旋转走 _locked 串行化，同账号并发自动排队不撞 race
         if allow_local_refresh && (status == 401 || status == 403) && refresh_token.is_some() {
             if let Some(ref rt) = refresh_token {
-                match crate::oauth::refresh_access_token(rt).await {
+                // 锁 key 优先 account_id（最稳定 = OpenAI workspace id），缺时退到 rt
+                // 前缀（rt 跟 OpenAI account 1:1 绑定，唯一性够用，只是切号轮换后失效）
+                let lock_key = account_id.clone().unwrap_or_else(|| {
+                    format!("rt:{}", &rt[..rt.len().min(16)])
+                });
+                match crate::oauth::refresh_access_token_locked(&lock_key, rt).await {
                     Ok(token_res) => {
                         current_token = token_res.access_token.clone();
                         new_tokens = Some(token_res);

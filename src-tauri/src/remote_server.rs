@@ -417,7 +417,7 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
             Some(t) => Some(t),
             None => {
                 if let Some(ref rt) = refresh_token {
-                    match crate::oauth::refresh_access_token(rt).await {
+                    match crate::oauth::refresh_access_token_locked(&id, rt).await {
                         Ok(tok) => {
                             let mutated = if let Ok(mut s) = state.store.lock() {
                                 if let Some(acc) = s.accounts.get_mut(&id) {
@@ -599,7 +599,7 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
                     json!({"error": "TOKEN_INVALID:无 access_token 且无 refresh_token"}),
                 );
             };
-            match crate::oauth::refresh_access_token(&rt).await {
+            match crate::oauth::refresh_access_token_locked(&id, &rt).await {
                 Ok(tok) => {
                     let mutated = if let Ok(mut s) = state.store.lock() {
                         if let Some(acc) = s.accounts.get_mut(&id) {

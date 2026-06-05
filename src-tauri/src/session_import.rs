@@ -85,26 +85,92 @@ pub fn import_chatgpt_session(
 
     {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
-        // 已存在的 email 跳过（同 bulk_import 行为，避免覆盖已有 token）
-        let existing_emails: std::collections::HashSet<String> =
-            store.accounts.values().map(|a| a.name.clone()).collect();
         for (path, value) in sessions {
             match convert_one(&value) {
                 Ok((auth_json, info, name)) => {
-                    if existing_emails.contains(&name) {
-                        errors.push(ImportError {
-                            source_path: path,
-                            reason: format!("已存在同名账号 {}（跳过，不覆盖）", name),
-                        });
-                        continue;
+                    // 找同邮箱 + 同 chatgpt_account_id 的已有账号（同 workspace 才能覆盖；
+                    // 不同 workspace 哪怕同邮箱也算独立账号）。account_id 双方都为 None
+                    // 时也算匹配，留兜底。
+                    let incoming_aid = info.account_id.clone();
+                    let now_ts = chrono::Utc::now().timestamp();
+                    let same_workspace: Vec<(String, bool)> = store
+                        .accounts
+                        .values()
+                        .filter(|a| a.name == name)
+                        .filter(|a| {
+                            let existing_aid = AccountStore::extract_account_id(&a.auth_json);
+                            existing_aid == incoming_aid
+                        })
+                        .map(|a| {
+                            // "可覆盖"的判定（任一为真即覆盖）：
+                            //   1. flag 已标 invalid / logged_out / banned；
+                            //   2. AT JWT exp 已过（codex 视角 token 死了，flag 没标只是因为
+                            //      没人触发 refresh 或没 rt 没法试）；
+                            //   3. **无 refresh_token**：典型 web session 导入账号，本来就
+                            //      靠重导续命。强 rt OAuth 账号才走"活号不覆盖"路径。
+                            let at_exp = extract_at_jwt_exp(&a.auth_json);
+                            let jwt_expired = at_exp.map(|e| e <= now_ts).unwrap_or(false);
+                            let no_rt = a.refresh_token.is_none();
+                            let dead = a.is_token_invalid
+                                || a.is_logged_out
+                                || a.is_banned
+                                || jwt_expired
+                                || no_rt;
+                            (a.id.clone(), dead)
+                        })
+                        .collect();
+
+                    let dead_match = same_workspace.iter().find(|(_, dead)| *dead);
+                    let alive_match = same_workspace.iter().find(|(_, dead)| !*dead);
+
+                    match (dead_match, alive_match) {
+                        // 同 workspace 死号 → 直接覆盖
+                        (Some((existing_id, _)), _) => {
+                            let existing_id = existing_id.clone();
+                            let new_rt = AccountStore::extract_refresh_token(&auth_json);
+                            if let Some(acc) = store.accounts.get_mut(&existing_id) {
+                                acc.auth_json = auth_json;
+                                acc.refresh_token = new_rt;
+                                acc.is_token_invalid = false;
+                                acc.is_logged_out = false;
+                                acc.cached_quota = None; // plan 可能变了
+                                acc.notes = Some(format!(
+                                    "re-imported from ChatGPT session at {}",
+                                    chrono::Utc::now().to_rfc3339()
+                                ));
+                                let acc_clone = acc.clone();
+                                newly_added_ids.push(existing_id.clone());
+                                ok.push(ImportedAccount {
+                                    account: acc_clone,
+                                    info,
+                                });
+                                println!(
+                                    "[SessionImport] 覆盖死号 {} (id={})",
+                                    name, existing_id
+                                );
+                            }
+                        }
+                        // 同 workspace 但活号 → 不覆盖
+                        (None, Some(_)) => {
+                            errors.push(ImportError {
+                                source_path: path,
+                                reason: format!(
+                                    "已存在同 workspace 的活号 {}（跳过，活号不覆盖）",
+                                    name
+                                ),
+                            });
+                        }
+                        // 不同 workspace 或全新 → add 新账号
+                        (None, None) => {
+                            let account = store.add_account(
+                                name,
+                                auth_json,
+                                Some("imported from ChatGPT session".to_string()),
+                            );
+                            newly_added_ids.push(account.id.clone());
+                            ok.push(ImportedAccount { account, info });
+                        }
                     }
-                    let account = store.add_account(
-                        name,
-                        auth_json,
-                        Some("imported from ChatGPT session".to_string()),
-                    );
-                    newly_added_ids.push(account.id.clone());
-                    ok.push(ImportedAccount { account, info });
                 }
                 Err(e) => {
                     errors.push(ImportError {
@@ -493,6 +559,22 @@ fn first_non_empty_str(obj: &Value, keys: &[&str]) -> Option<String> {
 
 fn nested_str(obj: &Value, parent: &str, keys: &[&str]) -> Option<String> {
     obj.get(parent).and_then(|p| first_non_empty_str(p, keys))
+}
+
+/// 从账号 auth_json 里解 access_token JWT 的 `exp` claim（unix 秒）。
+/// 失败/无 token 返回 None — 调用方按"无信息"处理（保守地继续视为活号）。
+fn extract_at_jwt_exp(auth_json: &Value) -> Option<i64> {
+    use base64::Engine;
+    let at = auth_json
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(|v| v.as_str())?;
+    let payload = at.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("exp").and_then(|v| v.as_i64())
 }
 
 fn parse_to_iso(s: &str) -> Option<String> {

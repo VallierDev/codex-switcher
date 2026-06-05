@@ -5,6 +5,7 @@
 pub mod account;
 mod bulk_import;
 mod codex_sessions;
+mod codex_ua;
 mod deep_link;
 mod ide_control;
 pub mod mailbox;
@@ -1396,6 +1397,17 @@ async fn switch_account(
     };
 
     // 1.5. 检查 JWT 是否过期，如果过期则尝试刷新
+    // client/solo 模式：rt 是 Server 的权威，本机不刷。AT 即使过期也照样把请求交出去，
+    // 让 proxy.silent_refresh_current 走 Server 路径换 token。
+    let is_client_or_solo = matches!(
+        state
+            .store
+            .lock()
+            .map(|s| s.settings.remote_mode.clone())
+            .unwrap_or_default()
+            .as_str(),
+        "client" | "solo"
+    );
     let (access_token, refresh_token) = {
         let mut needs_refresh = false;
         if let Ok(claims) = AccountStore::extract_jwt_claims_from_token(&access_token) {
@@ -1412,9 +1424,13 @@ async fn switch_account(
             needs_refresh = true;
         }
 
-        if needs_refresh && refresh_token.is_some() {
+        if needs_refresh && is_client_or_solo {
+            println!("[Switch] client/solo 模式：跳过本机 rt 刷新，由 proxy 走 Server 路径");
+        }
+
+        if needs_refresh && !is_client_or_solo && refresh_token.is_some() {
             if let Some(ref rt) = refresh_token {
-                match oauth::refresh_access_token(rt).await {
+                match oauth::refresh_access_token_locked(&target_id, rt).await {
                     Ok(token_res) => {
                         println!("[Switch] 自动刷新 Token 成功");
                         let mut store = state.store.lock().map_err(|e| e.to_string())?;
@@ -1864,7 +1880,7 @@ pub fn start_quota_refresh(
         println!("[QuotaRefresh] 定时额度刷新已启动");
 
         loop {
-            let (enabled, interval_minutes, batch_size, remote_mode, primary, fallback, secret) = {
+            let (enabled, interval_minutes, batch_size, remote_mode, primary, fallback, secret, client_owns_current) = {
                 let s = store.lock().unwrap();
                 (
                     s.settings.quota_refresh_enabled,
@@ -1874,14 +1890,22 @@ pub fn start_quota_refresh(
                     s.settings.remote_server_url.clone(),
                     s.settings.remote_server_url_fallback.clone(),
                     s.settings.remote_shared_secret.clone(),
+                    s.settings.client_owns_current,
                 )
             };
 
-            // client 模式：强制从 Server 拉 /quotas，忽略 enabled 开关（开关对 client 无意义）
-            // server/off 模式：遵循 enabled 开关
-            if remote_mode == "client" {
+            // client / solo 模式：强制从 Server 拉 /quotas，忽略 enabled 开关；
+            // 下方 fall-through 的本地 batch refresh（含 oauth::refresh_access_token）
+            // 在这两种模式下都不能跑（rt 是 Server 的权威）。solo 同样进这条 Server-sync
+            // 路径，但**不跟随 Server 的 current 指针**（solo 本机自己管 current）。
+            // server/off 模式：遵循 enabled 开关，走下方 batch refresh。
+            let is_client_or_solo = matches!(remote_mode.as_str(), "client" | "solo");
+            if is_client_or_solo {
                 if secret.is_empty() {
-                    println!("[QuotaRefresh] client 模式但未配置 secret，跳过本轮");
+                    println!(
+                        "[QuotaRefresh] {} 模式但未配置 secret，跳过本轮",
+                        remote_mode
+                    );
                     tokio::time::sleep(tokio::time::Duration::from_secs(
                         u64::from(interval_minutes) * 60,
                     ))
@@ -2010,12 +2034,15 @@ pub fn start_quota_refresh(
                                     }
                                     (updated, pruned)
                                 };
-                                // 3) 同步 Server 的 current 到本机（UI 统一 + 本机 Codex CLI 用同一个号）
+                                // 3) 同步 Server 的 current 到本机（仅 client 模式）
                                 //    - 拉 Server 最新 token
                                 //    - 写本机 store（accounts.json） + 官方 ~/.codex/auth.json
                                 //    - 更新本机 current 指针
-                                //    规则：若 Server 正常，本机始终跟随 Server 的 current。
-                                if let Ok(cur) =
+                                //    规则：若 Server 正常，client 始终跟随 Server 的 current。
+                                //    client_owns_current=true（旧 solo 迁过来的）：本机 codex
+                                //    直接跑，current 由本机用户决定，不被 Server 反向同步。
+                                if remote_mode == "client" && !client_owns_current {
+                                  if let Ok(cur) =
                                     crate::remote_client::get_current(&base, &secret).await
                                 {
                                     if let Some(cid) = cur.current.clone() {
@@ -2087,9 +2114,10 @@ pub fn start_quota_refresh(
                                         }
                                     }
                                 }
+                                } // end: if remote_mode == "client" && !client_owns_current
                                 println!(
-                                    "[QuotaRefresh] client 从 Server 同步 {} 个额度，删除本地残留 {} 个",
-                                    updated, pruned
+                                    "[QuotaRefresh] {} 从 Server 同步 {} 个额度，删除本地残留 {} 个",
+                                    remote_mode, updated, pruned
                                 );
                                 let _ = app_handle.emit("accounts-updated", ());
                             }
@@ -2202,7 +2230,7 @@ pub fn start_quota_refresh(
                     Some(t) => t,
                     None => {
                         if let Some(ref rt_val) = rt {
-                            match crate::oauth::refresh_access_token(rt_val).await {
+                            match crate::oauth::refresh_access_token_locked(id, rt_val).await {
                                 Ok(res) => {
                                     if let Ok(mut s) = store.lock() {
                                         if let Some(acc) = s.accounts.get_mut(id) {
@@ -2261,6 +2289,9 @@ pub fn start_quota_refresh(
                                     is_valid_for_cli: usage.is_valid_for_cli,
                                     updated_at: chrono::Utc::now(),
                                 });
+                                // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
+                                acc.is_token_invalid = false;
+                                acc.is_logged_out = false;
                                 let _ = s.save();
                             }
                         }
@@ -2501,20 +2532,29 @@ async fn get_quota_internal(state: &AppState, id: String) -> Result<UsageDisplay
             }
         }
     }
-    let (access_token, account_id, refresh_token) = {
+    let (access_token, account_id, refresh_token, is_client_or_solo) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let account = store.accounts.get(&id).ok_or("账号不存在")?;
         let at = AccountStore::extract_access_token(&account.auth_json);
         let aid = AccountStore::extract_account_id(&account.auth_json);
         let rt = account.refresh_token.clone();
-        (at, aid, rt)
+        let solo_or_client =
+            matches!(store.settings.remote_mode.as_str(), "client" | "solo");
+        (at, aid, rt, solo_or_client)
     };
 
     // 如果没有 access_token，先用 refresh_token 换一个
+    // client/solo 模式：rt 是 Server 的权威，本机不刷 —— 没有 at 就直接报错给上层
+    // （上层若是 remote_refresh_account_quota，会走 Server fetch_token；若是 fallback
+    // 走到本地，说明 Server 也没这个号，那只能等用户重登或重推到 Server）。
     let access_token = if let Some(at) = access_token {
         at
+    } else if is_client_or_solo {
+        return Err(
+            "TOKEN_INVALID:client/solo 模式禁止本机 rt 刷新；请确认账号已同步到 Server".to_string(),
+        );
     } else if let Some(ref rt) = refresh_token {
-        match crate::oauth::refresh_access_token(rt).await {
+        match crate::oauth::refresh_access_token_locked(&id, rt).await {
             Ok(token_res) => {
                 // 保存新 token
                 let mut store = state.store.lock().map_err(|e| e.to_string())?;
@@ -2538,8 +2578,9 @@ async fn get_quota_internal(state: &AppState, id: String) -> Result<UsageDisplay
         return Err("TOKEN_INVALID:无 access_token 且无 refresh_token".to_string());
     };
 
+    // client/solo 模式禁止 fetch_usage_direct 内部本地 rt 刷新（usage.rs:102）
     let result =
-        UsageFetcher::fetch_usage_direct(access_token, account_id, refresh_token, true).await;
+        UsageFetcher::fetch_usage_direct(access_token, account_id, refresh_token, !is_client_or_solo).await;
 
     // 检测封号/失效：分开标记
     if let Err(ref e) = result {
@@ -2605,6 +2646,9 @@ async fn get_quota_internal(state: &AppState, id: String) -> Result<UsageDisplay
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
         if let Some(account) = store.accounts.get_mut(&id) {
             account.cached_quota = Some(usage_to_cached(&display));
+            // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
+            account.is_token_invalid = false;
+            account.is_logged_out = false;
             if let Err(e) = store.save() {
                 eprintln!("[Store] 保存失败: {}", e);
             }
@@ -2721,7 +2765,7 @@ async fn get_quota_by_id(
     }
 
     // 1. 从 Store 获取该账号的 Token
-    let (access_token_opt, account_id, refresh_token) = {
+    let (access_token_opt, account_id, refresh_token, is_client_or_solo) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let account = store
             .accounts
@@ -2734,15 +2778,23 @@ async fn get_quota_by_id(
             .refresh_token
             .clone()
             .or_else(|| AccountStore::extract_refresh_token(&account.auth_json));
+        let solo_or_client =
+            matches!(store.settings.remote_mode.as_str(), "client" | "solo");
 
-        (at, aid, rt)
+        (at, aid, rt, solo_or_client)
     };
 
     // 如果没有 access_token，先用 refresh_token 换一个
+    // client/solo 模式：禁止本机 rt 刷新（rt 是 Server 的权威，本机偷偷 rotate 会让
+    // Server 那边的 rt 立刻被 OpenAI 标 reused）
     let access_token = if let Some(at) = access_token_opt {
         at
+    } else if is_client_or_solo {
+        return Err(
+            "TOKEN_INVALID:client/solo 模式禁止本机 rt 刷新；请确认账号已同步到 Server".to_string(),
+        );
     } else if let Some(ref rt) = refresh_token {
-        match crate::oauth::refresh_access_token(rt).await {
+        match crate::oauth::refresh_access_token_locked(&id, rt).await {
             Ok(token_res) => {
                 let mut store = state.store.lock().map_err(|e| e.to_string())?;
                 if let Some(account) = store.accounts.get_mut(&id) {
@@ -2765,12 +2817,12 @@ async fn get_quota_by_id(
         return Err("TOKEN_INVALID:无 access_token 且无 refresh_token".to_string());
     };
 
-    // 2. 使用 Token 获取用量（允许自动刷新）
+    // 2. 使用 Token 获取用量（client/solo 模式同样禁止 usage.rs 内部本地 rt 刷新）
     let result = UsageFetcher::fetch_usage_direct(
         access_token,
         account_id,
         refresh_token,
-        true, // 允许 refresh，解决 token 过期问题
+        !is_client_or_solo, // client/solo 禁本地 refresh，其它模式 allow
     )
     .await;
 
@@ -2874,6 +2926,9 @@ async fn get_quota_by_id(
                 is_valid_for_cli: usage.is_valid_for_cli,
                 updated_at: Utc::now(),
             });
+            // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
+            account.is_token_invalid = false;
+            account.is_logged_out = false;
         }
         store.save()?;
     } else {
@@ -2893,6 +2948,9 @@ async fn get_quota_by_id(
                 is_valid_for_cli: usage.is_valid_for_cli,
                 updated_at: Utc::now(),
             });
+            // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
+            account.is_token_invalid = false;
+            account.is_logged_out = false;
         }
         store.save()?;
     }

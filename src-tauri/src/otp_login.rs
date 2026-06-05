@@ -343,7 +343,7 @@ pub async fn run_login(
 fn build_auth_url(code_challenge: &str, state: &str, redirect_uri: &str) -> String {
     // 与 oauth_server.rs 保持一致：raw 拼接，不 urlencode
     let qs = format!(
-        "response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}&originator=codex_vscode",
+        "response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}&originator=codex_cli_rs",
         oauth::CLIENT_ID,
         redirect_uri,
         "openid profile email offline_access",

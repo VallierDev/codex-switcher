@@ -2,8 +2,10 @@ use base64::{engine::general_purpose, Engine as _};
 use rand::{rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// OpenAI 官方授权常量 (参考 codex-main)
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -85,6 +87,9 @@ pub async fn exchange_code(
     let response = token_client()
         .post(TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
+        // 真 codex 的 token 请求走 default_client，必带 originator + UA；对齐之。
+        .header("User-Agent", crate::codex_ua::codex_user_agent())
+        .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
         .timeout(Duration::from_secs(20))
         .body(body)
         .send()
@@ -102,6 +107,31 @@ pub async fn exchange_code(
         .map_err(|e| format!("解析令牌响应失败: {}", e))
 }
 
+/// per-account rt 锁。OpenAI 的 rt 是单次使用 + 轮换：同账号并发 refresh 会让一方
+/// 拿到 `refresh_token_reused`，rt 链断掉 → 死号。这把锁保证同账号同时只有一次
+/// `refresh_access_token` 在飞，串行化所有调用点（Server 内的 quota_refresh /
+/// keepalive / anchor / fetch_token / UI 触发）。**所有 rt 旋转都应该走 `_locked`
+/// 版本**，裸 `refresh_access_token` 只留给 OAuth 初次换码（无 race，账号还没建）。
+fn rt_lock_for(account_id: &str) -> Arc<AsyncMutex<()>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut g = map.lock().expect("rt-locks map poisoned");
+    g.entry(account_id.to_string())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+/// 锁保护版的 `refresh_access_token`：同 account_id 强串行。
+/// 任何 Server 端调 OpenAI rotate rt 的地方都该用这个；裸版本只留给 OAuth 初次换码。
+pub async fn refresh_access_token_locked(
+    account_id: &str,
+    refresh_token: &str,
+) -> Result<TokenResponse, String> {
+    let lock = rt_lock_for(account_id);
+    let _guard = lock.lock().await;
+    refresh_access_token(refresh_token).await
+}
+
 /// 使用刷新令牌获取新访问令牌
 pub async fn refresh_access_token(refresh_token: &str) -> Result<TokenResponse, String> {
     let params = [
@@ -116,6 +146,9 @@ pub async fn refresh_access_token(refresh_token: &str) -> Result<TokenResponse, 
     let response = token_client()
         .post(TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
+        // 真 codex 的 token 请求走 default_client，必带 originator + UA；对齐之。
+        .header("User-Agent", crate::codex_ua::codex_user_agent())
+        .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
         .timeout(Duration::from_secs(15))
         .form(&params)
         .send()

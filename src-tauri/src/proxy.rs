@@ -122,10 +122,8 @@ async fn silent_refresh_current(state: &ProxyState) -> SilentRefreshOutcome {
                             store.sync_account_from_auth_json(&current_id, t.auth_json.clone());
                             let _ = store.save();
                         }
-                        if let Err(e) = AccountStore::write_codex_auth_extended_expiry(&t.auth_json)
-                        {
-                            eprintln!("[Proxy] Server 拉到 token 后写 auth.json 失败: {}", e);
-                        }
+                        // 走 anchor-guarded 路径，anchor 设置时跳过非 anchor 账号的写盘
+                        write_codex_auth_respecting_anchor(state, &current_id, &t.auth_json);
                         invalidate_remote_token_cache();
                         if let Some(tok) = token_str {
                             println!("[Proxy] 通过 Server 刷新成功（{}），重试请求", remote_mode);
@@ -149,7 +147,17 @@ async fn silent_refresh_current(state: &ProxyState) -> SilentRefreshOutcome {
         }
     }
 
-    // 2) 本地 oauth refresh（off/server 模式 或 上面 Server 路径失败的降级）
+    // 2) 本地 oauth refresh（**仅** off/server 模式；client/solo 走不到这里）
+    //
+    // 协议：client/solo 把 rt 权威完全交给 Server。哪怕 Server 抖了一下也不能本机偷偷
+    // rotate —— 一旦 rotate，Server 那边的 rt 会立刻被 OpenAI 标 reused 而死号。
+    // 让 codex 收个 401 走自己的重试链路，比赌"这一次本机刷成功就好"安全得多。
+    if matches!(remote_mode.as_str(), "client" | "solo") {
+        return SilentRefreshOutcome::OtherError(
+            "client/solo 模式禁止本机 rt 刷新；Server 不可达，跳过本机降级".into(),
+        );
+    }
+
     let rt = {
         let store = match state.store.lock() {
             Ok(s) => s,
@@ -165,7 +173,7 @@ async fn silent_refresh_current(state: &ProxyState) -> SilentRefreshOutcome {
         }
     };
 
-    match crate::oauth::refresh_access_token(&rt).await {
+    match crate::oauth::refresh_access_token_locked(&current_id, &rt).await {
         Ok(new_tokens) => {
             // apply 到 store
             let updated_auth = if let Ok(mut store) = state.store.lock() {
@@ -187,11 +195,8 @@ async fn silent_refresh_current(state: &ProxyState) -> SilentRefreshOutcome {
                 None
             };
             if let Some(auth) = updated_auth {
-                if let Err(e) = AccountStore::write_codex_auth(&auth) {
-                    eprintln!("[Proxy] 本地刷新后写 auth.json 失败: {}", e);
-                } else {
-                    println!("[Proxy] 本地 refresh 成功，已同步 auth.json");
-                }
+                // anchor 设置时跳过非 anchor 账号的写盘
+                write_codex_auth_respecting_anchor(state, &current_id, &auth);
             }
             SilentRefreshOutcome::Refreshed(new_tokens.access_token)
         }
@@ -381,10 +386,8 @@ async fn get_current_token(state: &ProxyState) -> Result<(String, bool), String>
                         // 目的：让本机 Codex CLI 永远读到新鲜 access_token，避免它自己触发 oauth refresh
                         // 使 refresh_token 在两端分叉。
                         // 用 extended_expiry 版本：把 expires_at 顶到 +24h，codex 永远不会主动 refresh。
-                        if let Err(e) = AccountStore::write_codex_auth_extended_expiry(&t.auth_json)
-                        {
-                            eprintln!("[Proxy] 写 ~/.codex/auth.json 失败: {}", e);
-                        }
+                        // anchor 设置时跳过非 anchor 账号的写盘（保护手机 bridge 的 disk 镜像）
+                        write_codex_auth_respecting_anchor(state, &current_id, &t.auth_json);
                         if let Some(tok) = AccountStore::extract_access_token(&t.auth_json) {
                             let is_chatgpt = tok.starts_with("eyJ");
                             remote_token_cache_put(&current_id, &tok, is_chatgpt);
@@ -1320,46 +1323,75 @@ async fn handle_request(
     // 那套需求，多一跳 LAN 纯加延迟。让 Relay 在 client 机器本地直接打上游
     // （chat_completions 协议已在更上游分支返回；responses 协议落到下面 get_upstream
     // 直发 unity2/packycode）。
-    let remote_mode = state
+    let (remote_mode, client_direct_upstream) = state
         .store
         .lock()
-        .map(|s| s.settings.remote_mode.clone())
-        .unwrap_or_default();
-    if remote_mode == "client" && relay_route.is_none() {
-        match forward_to_server_parts(&state, &method, &path_and_query, &req_headers, &body_bytes)
-            .await
+        .map(|s| (s.settings.remote_mode.clone(), s.settings.client_direct_upstream))
+        .unwrap_or((String::new(), false));
+
+    // client_direct_upstream=true：HTTP 也走"本机直连上游"（跟 WS 同路）；
+    // 只让 Server 管 RT/AT 轮换。跳过 forward_to_server 这一段，直接 fall through
+    // 到下面的本地路径（resolve_token_with_affinity → forward_with_token）。
+    // resolve_token_with_affinity 在 client 模式下会自动从 Server fetch_token，
+    // 所以 token 中心化的语义保留。
+    if remote_mode == "client" && relay_route.is_none() && !client_direct_upstream {
+        // 先尝试 silent retry：peek 响应首 chunk，撞 usage_limit_reached 就切号重试，最多 3 次
+        match forward_to_server_with_silent_retry(
+            &state,
+            &method,
+            &path_and_query,
+            &req_headers,
+            &body_bytes,
+            3,
+        )
+        .await
         {
-            Ok(mini_resp) => {
-                let status = mini_resp.status();
-                if status == reqwest::StatusCode::PAYMENT_REQUIRED {
-                    let resp_bytes = mini_resp.bytes().await.unwrap_or_default();
-                    let lower = String::from_utf8_lossy(&resp_bytes).to_lowercase();
-                    let is_deactivated = lower.contains("deactivated")
-                        || lower.contains("account_deactivated")
-                        || lower.contains("deactivated_workspace");
-                    if is_deactivated {
-                        println!("[Proxy] Server 返回 402 deactivated，尝试本地账号回退");
-                        if let Some(resp) = try_local_fallback(
-                            &state,
-                            &method,
-                            &path_and_query,
-                            &req_headers,
-                            &body_bytes,
-                            session_key.as_deref(),
-                        )
-                        .await
-                        {
-                            return Ok(resp);
+            Ok(Some(resp)) => return Ok(resp),
+            Ok(None) => {
+                // 402 deactivated：走老路径，重新 forward 一次拿 body 检查
+                match forward_to_server_parts(
+                    &state,
+                    &method,
+                    &path_and_query,
+                    &req_headers,
+                    &body_bytes,
+                )
+                .await
+                {
+                    Ok(mini_resp) => {
+                        let resp_bytes = mini_resp.bytes().await.unwrap_or_default();
+                        let lower = String::from_utf8_lossy(&resp_bytes).to_lowercase();
+                        let is_deactivated = lower.contains("deactivated")
+                            || lower.contains("account_deactivated")
+                            || lower.contains("deactivated_workspace");
+                        if is_deactivated {
+                            println!("[Proxy] Server 返回 402 deactivated，尝试本地账号回退");
+                            if let Some(resp) = try_local_fallback(
+                                &state,
+                                &method,
+                                &path_and_query,
+                                &req_headers,
+                                &body_bytes,
+                                session_key.as_deref(),
+                            )
+                            .await
+                            {
+                                return Ok(resp);
+                            }
                         }
+                        return Ok(Response::builder()
+                            .status(402)
+                            .header("content-type", "application/json")
+                            .body(full_body(resp_bytes))
+                            .unwrap_or_else(|_| {
+                                error_response(StatusCode::PAYMENT_REQUIRED, "402")
+                            }));
                     }
-                    return Ok(Response::builder()
-                        .status(402)
-                        .header("content-type", "application/json")
-                        .body(full_body(resp_bytes))
-                        .unwrap_or_else(|_| error_response(StatusCode::PAYMENT_REQUIRED, "402")));
+                    Err(e) => {
+                        eprintln!("[Proxy] 402 二次取 body 失败: {}", e);
+                        // 落到下面 fall-through
+                    }
                 }
-                // client 模式：affinity 由 Mini 那侧处理，本机不记录
-                return Ok(build_stream_response(mini_resp, None, None));
             }
             Err(e) => {
                 eprintln!(
@@ -1652,33 +1684,91 @@ async fn handle_request(
                 .body(full_body(resp_bytes))
                 .unwrap_or_else(|_| error_response(StatusCode::TOO_MANY_REQUESTS, "429")));
         }
-        println!("[Proxy] compact 路径 429，尝试切号重试...");
+        println!("[Proxy] compact 路径 429，尝试切号重试（最多 5 个号）...");
         mark_current_quota_depleted(&state);
-        if let Some(retry_resp) = dispatch_quota_switch_retry(
-            &state,
-            &method,
-            &upstream_url,
-            &base_headers,
-            &body_bytes,
-            session_key.as_deref(),
-            SwitchReason::Http429,
-        )
-        .await
-        {
+        const COMPACT_MAX_SWITCH_ATTEMPTS: usize = 5;
+        for attempt in 0..COMPACT_MAX_SWITCH_ATTEMPTS {
+            let Some(retry_resp) = dispatch_quota_switch_retry(
+                &state,
+                &method,
+                &upstream_url,
+                &base_headers,
+                &body_bytes,
+                session_key.as_deref(),
+                SwitchReason::Http429,
+            )
+            .await
+            else {
+                println!(
+                    "[Proxy] compact 第 {}/{} 次切号无候选可选，停止",
+                    attempt + 1,
+                    COMPACT_MAX_SWITCH_ATTEMPTS
+                );
+                break;
+            };
+
             let retry_status = retry_resp.status();
             if retry_status.is_success() {
-                println!("[Proxy] compact 切号重试成功（{}），无损切号", retry_status);
+                println!(
+                    "[Proxy] compact 切号重试成功（{}），第 {} 次无损切号",
+                    retry_status,
+                    attempt + 1
+                );
                 return Ok(retry_resp);
             }
-            // 新号也返 4xx —— 通常是某种服务端绑定（session_id/thread_id 等）
-            // 不能把 4xx 透回 codex，伪装成原始 429（transient）让 codex 放弃这次
-            // compact 但保留 session。
+
+            // 把 4xx body 缓出来留作 log + 判断要不要再切
+            let retry_headers = retry_resp.headers().clone();
+            let retry_body = match retry_resp.into_body().collect().await {
+                Ok(c) => c.to_bytes(),
+                Err(e) => {
+                    eprintln!("[Proxy] compact 重试 body 读取失败: {}", e);
+                    Bytes::new()
+                }
+            };
+            let preview: String = String::from_utf8_lossy(&retry_body)
+                .chars()
+                .take(400)
+                .collect();
             println!(
-                "[Proxy] compact 切号后新号返 {}，伪装成 429 透回避免 codex 终端崩",
+                "[Proxy] compact 第 {} 次切号返 {} body[0:400]={:?}",
+                attempt + 1,
+                retry_status,
+                preview
+            );
+
+            // 4xx 类账号特异性失败（plan 不够、session 绑定等）→ 当前账号也标耗尽，
+            // 让 dispatch_quota_switch_retry 下一轮请求 Server 换不同的号
+            if retry_status.is_client_error() {
+                mark_current_quota_depleted(&state);
+                if attempt + 1 < COMPACT_MAX_SWITCH_ATTEMPTS {
+                    println!(
+                        "[Proxy] compact 4xx 视为该号不可用，继续试下一个号 ({}/{})",
+                        attempt + 2,
+                        COMPACT_MAX_SWITCH_ATTEMPTS
+                    );
+                    continue;
+                }
+                // 全部用完仍 4xx → 伪装 429 给 codex（避免 4xx 触发 codex 终端崩）
+                println!(
+                    "[Proxy] compact 试完 {} 个号仍 4xx，伪装 429 透回（最后一次 status={}）",
+                    COMPACT_MAX_SWITCH_ATTEMPTS, retry_status
+                );
+                break;
+            }
+
+            // 5xx 类（服务端临时） → 也透回 4xx body 让 codex 自己决定（已经能透回非 4xx）
+            println!(
+                "[Proxy] compact 切号后返 {} 5xx 类，透回原响应",
                 retry_status
             );
-        } else {
-            println!("[Proxy] compact 切号无果，把原始 429 透回");
+            let mut builder = Response::builder().status(retry_status);
+            for (k, v) in retry_headers.iter() {
+                builder = builder.header(k, v);
+            }
+            return Ok(builder
+                .body(full_body(retry_body))
+                .unwrap_or_else(|_| error_response(retry_status, "5xx")));
         }
         return Ok(Response::builder()
             .status(429)
@@ -2128,18 +2218,19 @@ async fn adopt_remote_current(
         }
     }
     // 写入新 token + 更新 current（短作用域 lock，无 await）
-    {
+    // 注意：anchor 设置时**只更新 store.current**，不动 disk auth.json，
+    // 保住手机 bridge 走的 anchor 镜像。proxy 路由走 store.current 的 token，跟 disk 解耦。
+    let auth_to_write = {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
         store.sync_account_from_auth_json(new_id, t.auth_json.clone());
-        if let Some(acc) = store.accounts.get(new_id) {
-            // Relay 走 ApiKey schema、订阅号走 OAuth schema —— 见 to_codex_auth_value 注释。
-            let auth = acc.to_codex_auth_value();
-            // adopt_remote_current 是 client 模式的换号路径，扩展 expires_at 防 codex 自刷
-            crate::account::AccountStore::write_codex_auth_extended_expiry(&auth)
-                .map_err(|e| format!("写 auth.json 失败: {}", e))?;
-        }
+        let auth = store.accounts.get(new_id).map(|acc| acc.to_codex_auth_value());
         store.current = Some(new_id.to_string());
         let _ = store.save();
+        auth
+    };
+    if let Some(auth) = auth_to_write {
+        // anchor-guarded：跳过 anchor 不匹配的写盘
+        write_codex_auth_respecting_anchor(state, new_id, &auth);
     }
     // 同 do_switch 的理由：client 模式被 Server 推过来的切号也不该牵连无关 bridge。
     // 真正"该断的"那条 bridge 在 limit 检测里自己会送 Close。
@@ -2465,6 +2556,164 @@ async fn forward_to_server_parts(
         .send()
         .await
         .map_err(|e| format!("转发到 Server 失败: {}", e))
+}
+
+/// 写 `~/.codex/auth.json` 但**尊重手机锚约束**：anchor 设置了且 account_id != anchor
+/// 时跳过写盘并 log，避免把 anchor 的 disk 镜像覆盖掉、手机 bridge 鉴权挂。
+///
+/// 适用于"被动"写盘路径：silent_refresh、adopt_remote_current、proxy 拿 Server token
+/// 后回写本机这类 background 操作。手动切号（lib.rs::switch_account）走的是"主动"路径，
+/// 用户明知道在切，那条继续无视 anchor、覆盖 disk。
+fn write_codex_auth_respecting_anchor(
+    state: &ProxyState,
+    account_id: &str,
+    auth: &serde_json::Value,
+) {
+    let blocked = state
+        .store
+        .lock()
+        .map(|s| !s.should_write_disk_for(account_id))
+        .unwrap_or(false);
+    if blocked {
+        println!(
+            "[Proxy] 手机锚生效，跳过写 ~/.codex/auth.json（{} != anchor）",
+            account_id
+        );
+        return;
+    }
+    if let Err(e) = crate::account::AccountStore::write_codex_auth_extended_expiry(auth) {
+        eprintln!("[Proxy] 写 ~/.codex/auth.json 失败: {}", e);
+    }
+}
+
+/// 在 client mode 把 forward_to_server_parts 的响应 peek 一下首 chunk，看是否撞限额；
+/// 撞了就调 Server /switch + retry，最多 `max_retries` 次。
+///
+/// **核心目的**：实现"无损切号" —— 让 codex 看不到 usage_limit_reached 错误。
+/// 之前 client mode HTTP 路径裸透传响应（`build_stream_response(mini_resp, None, None)`），
+/// chatgpt.com 返的 usage_limit error 直接传到 codex Desktop UI，用户看到 "已切号但还是错"
+/// 的错觉 —— 实际上 WS 路径异步切了号，但这条 HTTP 请求已经把 error body 透回去了。
+///
+/// 返回值：
+/// - `Ok(Some(resp))`：要返给 codex 的响应（成功或最后一次重试失败都走这里）
+/// - `Ok(None)`：402 Deactivated，让外层走 try_local_fallback 老路径
+/// - `Err(e)`：forward_to_server 本身报错（Server 不可达），让外层 fall-through 到本地直连
+async fn forward_to_server_with_silent_retry(
+    state: &ProxyState,
+    method: &hyper::Method,
+    path_and_query: &str,
+    req_headers: &hyper::HeaderMap,
+    body: &Bytes,
+    max_retries: u32,
+) -> Result<Option<Response<ProxyBody>>, String> {
+    // peek 限额检测复用 PER_ACCOUNT_LIMIT_KEYWORDS：除了 *_reached / *_exceeded 等
+    // wire code，还含人类可读文案 "usage limit" / "hit your usage limit" / "too many
+    // requests" —— Team/组织管理员设的用量上限文案
+    // ("You've hit your usage limit. ... send a request to your admin ...") 的 code
+    // 不一定是 usage_limit_reached，必须靠 message 文本兜底，否则不切号。
+    for attempt in 0..=max_retries {
+        let mini_resp =
+            match forward_to_server_parts(state, method, path_and_query, req_headers, body).await {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
+        let status = mini_resp.status();
+        let headers = mini_resp.headers().clone();
+
+        // 402 deactivated 走外层老路径处理 try_local_fallback
+        if status == reqwest::StatusCode::PAYMENT_REQUIRED {
+            // 注意：这里没消费 body —— 外层会重新调用一次拿 body，但 Server 此时
+            // current 账号没变（我们没 switch），第二次调返回相同结果。可接受。
+            return Ok(None);
+        }
+
+        // peek 第一个 chunk，看是否限额（限额 frame 通常 <2KB，第一个 chunk 一定能拿到）
+        let mut stream = mini_resp.bytes_stream();
+        let first_chunk = match stream.next().await {
+            Some(Ok(c)) => c,
+            Some(Err(e)) => {
+                return Err(format!("silent_retry: 读首 chunk 失败: {}", e));
+            }
+            None => Bytes::new(),
+        };
+
+        let peek_lower = String::from_utf8_lossy(&first_chunk).to_lowercase();
+        let is_rate_limit = PER_ACCOUNT_LIMIT_KEYWORDS
+            .iter()
+            .any(|kw| peek_lower.contains(kw));
+
+        if is_rate_limit && attempt < max_retries {
+            println!(
+                "[Proxy] silent_retry: client HTTP 响应限额，切号重试 ({}/{})",
+                attempt + 1,
+                max_retries
+            );
+            // 调 Server /switch；失败也继续 retry（也许 Server 自己切了号了）
+            if let Err(e) = call_remote_switch_silently(state).await {
+                eprintln!("[Proxy] silent_retry: /switch 调用失败: {}", e);
+            }
+            // 把这次的 stream 丢掉，下一轮重 forward
+            drop(stream);
+            // 给 Server 一点时间把 current 切完毕 + token 同步
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+
+        // 不限额，或最后一次尝试 —— 把 first_chunk 当 prefix，剩余 stream 续上
+        let rest = stream.boxed();
+        let resp =
+            build_stream_response_from_parts(status, headers, first_chunk, rest, None, None);
+        if is_rate_limit {
+            println!(
+                "[Proxy] silent_retry: max_retries={} 用完仍限额，把最后一次响应透回 codex",
+                max_retries
+            );
+        }
+        return Ok(Some(resp));
+    }
+    unreachable!("retry loop 总要返回")
+}
+
+/// 调 Server /switch 让它切换 current 账号。
+/// silent_retry 用，不暴露错误细节给上层（已经在 log 里打了）。
+async fn call_remote_switch_silently(state: &ProxyState) -> Result<(), String> {
+    let (primary, fallback, secret, cur_id) = {
+        let s = state.store.lock().map_err(|e| e.to_string())?;
+        (
+            s.settings.remote_server_url.clone(),
+            s.settings.remote_server_url_fallback.clone(),
+            s.settings.remote_shared_secret.clone(),
+            s.current.clone(),
+        )
+    };
+    if secret.is_empty() {
+        return Err("未配置 remote_shared_secret".to_string());
+    }
+    let base = crate::remote_client::resolve_base_url(&primary, &fallback)
+        .await
+        .map_err(|e| format!("resolve_base_url: {}", e))?;
+    let outcome = crate::remote_client::request_switch(
+        &base,
+        &secret,
+        cur_id.as_deref(),
+        "silent retry: client HTTP usage_limit_reached",
+    )
+    .await?;
+    if outcome.switched {
+        println!(
+            "[Proxy] silent_retry: Server 已切到 {} ({})",
+            outcome.name.clone().unwrap_or_else(|| "?".to_string()),
+            outcome
+                .current
+                .clone()
+                .unwrap_or_else(|| "(unknown id)".to_string())
+        );
+    } else {
+        println!(
+            "[Proxy] silent_retry: Server switch returned switched=false（可能全部 exhausted）"
+        );
+    }
+    Ok(())
 }
 
 /// client 模式回退路径：当 Server 不可达或 Server 告知无可用账号时，尝试使用本机账号直连上游。
@@ -3631,12 +3880,20 @@ fn build_stream_response_from_parts(
     } else {
         futures_util::stream::once(async move { Ok(prefix) }).boxed()
     };
-    // 给 rest 套一层 SSE keep-alive：上游 30s 没新 chunk 就自动塞一行 SSE 注释
-    // (": keep-alive\n\n")，client 解析器忽略，但 TCP 连接和 codex 那头的读循环都不会超时。
-    // codex 自己的 idle_timeout 是 5 分钟（DEFAULT_STREAM_IDLE_TIMEOUT_MS=300_000），
-    // 30s 心跳给 5x 安全边界够。
-    let rest_with_heartbeat = wrap_with_sse_heartbeat(rest, std::time::Duration::from_secs(30));
-    let raw_stream: ByteStream = prefix_stream.chain(rest_with_heartbeat).boxed();
+    // 仅 SSE 响应才套 keep-alive heartbeat。非 SSE（如 /compact 返回的 JSON）注入
+    // `: keep-alive\n\n` 会把 0x0A 控制字节塞进 JSON 字符串内，codex 解析时报
+    // `control character ( -) found while parsing a string` 直接挂掉。
+    let is_sse = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_lowercase().contains("event-stream"))
+        .unwrap_or(false);
+    let rest_after_wrap: ByteStream = if is_sse {
+        wrap_with_sse_heartbeat(rest, std::time::Duration::from_secs(30))
+    } else {
+        rest
+    };
+    let raw_stream: ByteStream = prefix_stream.chain(rest_after_wrap).boxed();
 
     let stream = raw_stream.map(move |result| match result {
         Ok(bytes) => {
@@ -3958,11 +4215,13 @@ async fn handle_websocket(
                 || err_lower.contains("403")
                 || err_lower.contains("unauthorized")
                 || err_lower.contains("forbidden");
-            // 区分两类拒绝：
-            //   - per-account 限额（429 / rate_limit 关键词 / 401/403）→ 切号
-            //   - global 容量满（503 / "at capacity" / "model overloaded"）→ **同号 backoff retry**
-            //     不是单号问题，切号也是撞同样错；同号等几秒再试通常能继续
-            // 真正网络层错误（DNS / TLS / connect refused 等）才报给 client。
+            // 切号策略（与 OpenAI 风控对齐）：**只有上游明确给出 per-account 额度信号
+            // （429 / usage_limit_reached / insufficient_quota 等）才允许切号**。
+            //   - global 容量满（503 / at capacity / overloaded）→ 同号 backoff retry，不切号
+            //   - 401/403 auth → 原地 silent_refresh 当前账号，不切号
+            //   - 纯网络层 / 502 / 504 / 未知 → 直接返回错误让 codex 自己重连，不切号
+            // 频繁切号 = 频繁改写 ~/.codex/auth.json / 轮换身份，会被 OpenAI 判异常封号；
+            // 而把网络抖动当成"额度耗尽"切号，还会把整个号池误标 five_hour_left=0。
             let is_global_capacity =
                 err_lower.contains("503") || matches_global_capacity(&err_lower);
             let is_per_account_limit = err_lower.contains("429")
@@ -3970,21 +4229,40 @@ async fn handle_websocket(
                     .iter()
                     .any(|kw| err_lower.contains(kw));
 
-            if !is_auth_err
-                && !is_global_capacity
-                && !is_per_account_limit
-                && !err_lower.contains("502")
-                && !err_lower.contains("504")
-            {
-                eprintln!("[Proxy] WebSocket 上游连接失败（网络层）: {}", e);
-                return Ok(error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "WebSocket 上游连接失败",
-                ));
-            }
+            // 复用：用给定 token / 协议 / relay base 构建上游 WS 请求（透明 header + 注入 Bearer）
+            let make_upstream_req = |tok: &str,
+                                     chatgpt: bool,
+                                     relay: Option<&str>|
+             -> Option<tungstenite::http::Request<()>> {
+                let (h_url, _) = get_upstream(chatgpt, relay, &path);
+                let w_url = h_url
+                    .replacen("https://", "wss://", 1)
+                    .replacen("http://", "ws://", 1);
+                let mut r = w_url.as_str().into_client_request().ok()?;
+                for (name, value) in req.headers() {
+                    let lower = name.as_str().to_lowercase();
+                    if matches!(
+                        lower.as_str(),
+                        "authorization"
+                            | "host"
+                            | "upgrade"
+                            | "connection"
+                            | "sec-websocket-key"
+                            | "sec-websocket-version"
+                            | "sec-websocket-extensions"
+                    ) {
+                        continue;
+                    }
+                    r.headers_mut().insert(name.clone(), value.clone());
+                }
+                if let Ok(av) = HeaderValue::from_str(&format!("Bearer {}", tok)) {
+                    r.headers_mut().insert(hyper::header::AUTHORIZATION, av);
+                }
+                Some(r)
+            };
 
-            // global 容量满：先尝试同号 backoff retry，3 次失败再降级走切号
-            if is_global_capacity && !is_auth_err && !is_per_account_limit {
+            // ───── 1) 全局容量满 → 同号 backoff retry，绝不切号 ─────
+            if is_global_capacity && !is_per_account_limit {
                 println!("[Proxy] WebSocket 握手被上游拒绝（容量满），同号 backoff retry...");
                 let mut same_account_retry = None;
                 for attempt in 1..=3u64 {
@@ -4035,127 +4313,58 @@ async fn handle_websocket(
                 if let Some(conn) = same_account_retry {
                     conn
                 } else {
-                    println!("[Proxy] 容量满同号 retry 三次都失败，降级走切号兜底");
-                    // 落到切号逻辑（fall through 不行，得显式调）
-                    let mut retry_conn = None;
-                    for _attempt in 0..3 {
-                        if let PickResult::Found { id, token: new_tok } = pick_next_account(&state)
-                        {
-                            if do_switch(&state, &id, SwitchReason::WebSocketPrecheck).is_err() {
-                                continue;
-                            }
-                            let new_chatgpt = new_tok.starts_with("eyJ");
-                            let new_relay = account_relay_base_url(&state, &id);
-                            let (new_url, _) =
-                                get_upstream(new_chatgpt, new_relay.as_deref(), &path);
-                            let ws = new_url
-                                .replacen("https://", "wss://", 1)
-                                .replacen("http://", "ws://", 1);
-                            if let Ok(mut r) = ws.as_str().into_client_request() {
-                                for (n, v) in req.headers() {
-                                    let l = n.as_str().to_lowercase();
-                                    if matches!(
-                                        l.as_str(),
-                                        "authorization"
-                                            | "host"
-                                            | "upgrade"
-                                            | "connection"
-                                            | "sec-websocket-key"
-                                            | "sec-websocket-version"
-                                            | "sec-websocket-extensions"
-                                    ) {
-                                        continue;
-                                    }
-                                    r.headers_mut().insert(n.clone(), v.clone());
-                                }
-                                if let Ok(av) =
-                                    HeaderValue::from_str(&format!("Bearer {}", new_tok))
-                                {
-                                    r.headers_mut().insert(hyper::header::AUTHORIZATION, av);
-                                }
-                                if let Ok(c) = tokio_tungstenite::connect_async(r).await {
-                                    retry_conn = Some(c);
-                                    break;
-                                }
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    match retry_conn {
-                        Some(conn) => conn,
-                        None => {
-                            return Ok(error_response(
-                                StatusCode::BAD_GATEWAY,
-                                "上游容量满且重试无果",
-                            ));
-                        }
-                    }
+                    // 容量满是上游全局问题，切号也撞同样错且烧账号 → 不切号，直接报错让 codex 重连
+                    println!("[Proxy] 容量满同号 retry 三次都失败，不切号，返回错误");
+                    return Ok(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "上游容量满，已同号重试无果",
+                    ));
                 }
-            } else {
-                // per-account 限额 / auth：直接走切号
-                println!(
-                    "[Proxy] WebSocket 握手被上游拒绝 ({})，切号重连...",
-                    if is_auth_err {
-                        "auth"
-                    } else {
-                        "per-account 限额"
-                    }
-                );
+            } else if is_per_account_limit {
+                // ───── 2) 明确 per-account 限额 → 切号（唯一允许切号的情况）─────
+                println!("[Proxy] WebSocket 握手命中 per-account 限额，标记当前号耗尽并切号...");
                 mark_current_quota_depleted(&state);
 
-                // 切号重连，最多试 3 个号；连不上也算这个号当前不可用，标 depleted 避免重复挑
+                // 最多试 3 个号。注意：只有候选号自己也回 per-account 限额才标它耗尽 + 继续换；
+                // 候选号若是网络层 / 其它非额度错误 → 是网络坏了不是号坏了，立刻停止，绝不标耗尽
+                //（否则一波网络抖动会把整个号池误标 five_hour_left=0，连其它会话都切不动）。
                 let mut retry_conn = None;
                 for _attempt in 0..3 {
-                    if let PickResult::Found { id, token: new_tok } = pick_next_account(&state) {
-                        if do_switch(&state, &id, SwitchReason::WebSocketPrecheck).is_err() {
-                            continue;
-                        }
-                        let new_chatgpt = new_tok.starts_with("eyJ");
-                        let new_relay = account_relay_base_url(&state, &id);
-                        let (new_url, _) = get_upstream(new_chatgpt, new_relay.as_deref(), &path);
-                        let ws = new_url
-                            .replacen("https://", "wss://", 1)
-                            .replacen("http://", "ws://", 1);
-
-                        if let Ok(mut r) = ws.as_str().into_client_request() {
-                            for (n, v) in req.headers() {
-                                let l = n.as_str().to_lowercase();
-                                if matches!(
-                                    l.as_str(),
-                                    "authorization"
-                                        | "host"
-                                        | "upgrade"
-                                        | "connection"
-                                        | "sec-websocket-key"
-                                        | "sec-websocket-version"
-                                        | "sec-websocket-extensions"
-                                ) {
-                                    continue;
-                                }
-                                r.headers_mut().insert(n.clone(), v.clone());
-                            }
-                            if let Ok(av) = HeaderValue::from_str(&format!("Bearer {}", new_tok)) {
-                                r.headers_mut().insert(hyper::header::AUTHORIZATION, av);
-                            }
-                            match tokio_tungstenite::connect_async(r).await {
-                                Ok(c) => {
-                                    println!("[Proxy] WebSocket 切号重连成功（{}）", id);
-                                    retry_conn = Some(c);
-                                    break;
-                                }
-                                Err(e2) => {
-                                    println!(
-                                        "[Proxy] 切号到 {} 后仍连不上（{}），继续试下一个",
-                                        id, e2
-                                    );
-                                    // 这个号也用不了 → 标耗尽，下一轮 pick 不会再选
-                                    mark_current_quota_depleted(&state);
-                                }
-                            }
-                        }
-                    } else {
+                    let PickResult::Found { id, token: new_tok } = pick_next_account(&state) else {
                         break;
+                    };
+                    if do_switch(&state, &id, SwitchReason::WebSocketPrecheck).is_err() {
+                        continue;
+                    }
+                    let new_chatgpt = new_tok.starts_with("eyJ");
+                    let new_relay = account_relay_base_url(&state, &id);
+                    let Some(r) = make_upstream_req(&new_tok, new_chatgpt, new_relay.as_deref())
+                    else {
+                        continue;
+                    };
+                    match tokio_tungstenite::connect_async(r).await {
+                        Ok(c) => {
+                            println!("[Proxy] WebSocket 切号重连成功（{}）", id);
+                            retry_conn = Some(c);
+                            break;
+                        }
+                        Err(e2) => {
+                            let e2l = e2.to_string().to_lowercase();
+                            let e2_is_limit = e2l.contains("429")
+                                || PER_ACCOUNT_LIMIT_KEYWORDS.iter().any(|kw| e2l.contains(kw));
+                            if e2_is_limit {
+                                // 这个号也确实满了 → 标耗尽，换下一个
+                                println!("[Proxy] 切到 {} 仍 per-account 限额，标耗尽换下一个", id);
+                                mark_current_quota_depleted(&state);
+                                continue;
+                            }
+                            // 网络层 / 其它非额度错误 → 不是号的问题，停止切号、不污染号池
+                            println!(
+                                "[Proxy] 切到 {} 后非额度错误（{}），停止切号（不标耗尽）",
+                                id, e2
+                            );
+                            break;
+                        }
                     }
                 }
 
@@ -4164,11 +4373,51 @@ async fn handle_websocket(
                     None => {
                         return Ok(error_response(
                             StatusCode::BAD_GATEWAY,
-                            "所有账号 WebSocket 连接均失败",
+                            "per-account 限额切号后仍无可用账号",
                         ));
                     }
                 }
-            } // 关闭 is_global_capacity 的 else 分支
+            } else if is_auth_err {
+                // ───── 3) auth（401/403）→ 原地刷新当前账号 token，不切号 ─────
+                println!("[Proxy] WebSocket 握手 401/403，原地 silent_refresh 当前账号（不切号）...");
+                match silent_refresh_current(&state).await {
+                    SilentRefreshOutcome::Refreshed(new_tok) => {
+                        let new_chatgpt = new_tok.starts_with("eyJ");
+                        match make_upstream_req(&new_tok, new_chatgpt, relay_base_url.as_deref()) {
+                            Some(r) => match tokio_tungstenite::connect_async(r).await {
+                                Ok(c) => c,
+                                Err(e2) => {
+                                    return Ok(error_response(
+                                        StatusCode::BAD_GATEWAY,
+                                        &format!("刷新后 WebSocket 仍连接失败: {}", e2),
+                                    ));
+                                }
+                            },
+                            None => {
+                                return Ok(error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "刷新后 WebSocket 请求构建失败",
+                                ));
+                            }
+                        }
+                    }
+                    _ => {
+                        // LoggedOut / NoRefreshToken / OtherError：不在 WS 路径切号（避免烧号），
+                        // 报错让 codex 自己重连；真要换号交给用户或 HTTP 路径决策
+                        return Ok(error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "WebSocket 认证失败（已尝试刷新当前账号，未切号）",
+                        ));
+                    }
+                }
+            } else {
+                // ───── 4) 纯网络层 / 502 / 504 / 未知 → 不切号，直接返回让 codex 重连 ─────
+                eprintln!("[Proxy] WebSocket 上游连接失败（网络层/非额度，不切号）: {}", e);
+                return Ok(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "WebSocket 上游连接失败",
+                ));
+            }
         }
     };
 
@@ -4604,6 +4853,25 @@ async fn bridge_websockets<S1, S2>(
     let state_clone = state.clone();
     let ws_session_key_r = ws_session_key.clone();
     let upstream_to_client = async {
+        // 跟踪本轮 response 状态，用于 mid-stream drop 时合成 response.completed
+        //
+        // 问题背景：codex Desktop 走 WS 看 chatgpt.com 的 Responses 流式输出。
+        // 上游 Clash 节点偶尔在 stream 80-95% 处掉 TLS → bridge 退出 → client 收 Close。
+        // codex 看不到 response.completed → **从头重发整个 prompt + 重新接收完整输出** →
+        // 等于已经产出的内容白白烧 token。
+        //
+        // 这里追踪三个状态：
+        //   - response_id: 从 response.created 抓到的 id
+        //   - saw_completed: 已经收到正经的 response.completed
+        //   - has_function_call: 看到 tool_call 类事件（这种情况不能合成 completed，
+        //     codex 会按 tool_call 路径走，缺数据会卡死）
+        //
+        // 流结束时（None / Err）若 response_id 存在、未完成、无 tool_call、
+        // 且已经流出足够内容（>=20 帧），就给 client 合成一条 response.completed。
+        // 用户看到的回答会比真实截止 + 几句，但 **codex 不再重发**。
+        let mut response_id: Option<String> = None;
+        let mut saw_completed = false;
+        let mut has_function_call = false;
         while let Some(msg) = upstream_read.next().await {
             match msg {
                 Ok(msg) => {
@@ -4615,6 +4883,33 @@ async fn bridge_websockets<S1, S2>(
                             "[Proxy] WS bridge: 首帧 upstream→client ({})",
                             describe_ws_msg(&msg)
                         );
+                    }
+                    // 提取 response 状态：仅扫描 Text 帧关键事件
+                    if let tungstenite::Message::Text(ref t) = msg {
+                        if response_id.is_none() && t.contains("\"response.created\"") {
+                            // 从 JSON 抽 response.id，失败也不影响主流程
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+                                if let Some(id) = v
+                                    .get("response")
+                                    .and_then(|r| r.get("id"))
+                                    .and_then(|i| i.as_str())
+                                {
+                                    response_id = Some(id.to_string());
+                                }
+                            }
+                        }
+                        if t.contains("\"response.completed\"") {
+                            saw_completed = true;
+                        }
+                        // tool/function call 进行中：不能合成 completed（codex 等 tool 输出）
+                        if !has_function_call
+                            && (t.contains("\"function_call\"")
+                                || t.contains("\"tool_call\"")
+                                || t.contains("response.function_call")
+                                || t.contains("response.tool_call"))
+                        {
+                            has_function_call = true;
+                        }
                     }
                     // 检测错误：**不要把错误消息转发给 client**（之前的 bug），
                     // 区分两种 case：
@@ -4733,6 +5028,46 @@ async fn bridge_websockets<S1, S2>(
                     break;
                 }
             }
+        }
+        // 流结束：判断要不要给 client 合成一条 response.completed 防止 codex 全量 retry
+        let frames = u2c_count_b.load(std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "[Proxy] WS bridge: upstream loop ended — frames={} response_id={:?} saw_completed={} has_function_call={}",
+            frames, response_id, saw_completed, has_function_call
+        );
+        if !saw_completed && !has_function_call && frames >= 20 {
+            // 即使 response_id 没抓到，也合成一条（用 generated id）—— 反正 codex 看的是
+            // type=response.completed 就当一轮 done，不会拒绝
+            let rid = response_id
+                .clone()
+                .unwrap_or_else(|| format!("resp_synthetic_{}", chrono::Utc::now().timestamp_millis()));
+            let synthetic = serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": rid,
+                    "object": "response",
+                    "status": "completed",
+                    "incomplete_details": {
+                        "reason": "upstream_stream_dropped_proxy_synthesized"
+                    }
+                },
+            });
+            let text = synthetic.to_string();
+            println!(
+                "[Proxy] WS bridge: upstream 中途断（u→c={} 帧 rid={}），\
+                 合成 response.completed 防止 codex 全量 retry 烧 token",
+                frames, rid
+            );
+            let _ = client_write
+                .send(tungstenite::Message::Text(text.into()))
+                .await;
+            // 主动发 Close 让 codex 干净收尾（不会 reconnect）
+            let _ = client_write.send(tungstenite::Message::Close(None)).await;
+        } else if !saw_completed {
+            println!(
+                "[Proxy] WS bridge: upstream 中途断（u→c={} 帧 has_fn_call={} → 不合成，codex 会 retry）",
+                frames, has_function_call
+            );
         }
     };
 

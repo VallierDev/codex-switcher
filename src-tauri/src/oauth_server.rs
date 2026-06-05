@@ -74,7 +74,7 @@ pub async fn start_oauth_login(
 
     // 3. 构造授权 URL (与官方完全一致: 手动拼接, 不对特殊字符编码)
     let qs = format!(
-        "response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}&originator=codex_vscode",
+        "response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}&originator=codex_cli_rs",
         oauth::CLIENT_ID,
         redirect_uri,
         "openid profile email offline_access",

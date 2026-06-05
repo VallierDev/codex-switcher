@@ -28,6 +28,8 @@ interface AppSettings {
     proxy_bootstrap_time_cap_ms: number;
     relay_auto_switch_out: boolean;
     relay_auto_switch_in: boolean;
+    client_direct_upstream: boolean;
+    client_owns_current: boolean;
 }
 
 interface RemoteHealth {
@@ -74,6 +76,8 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
         proxy_bootstrap_time_cap_ms: 8000,
         relay_auto_switch_out: true,
         relay_auto_switch_in: false,
+        client_direct_upstream: false,
+        client_owns_current: false,
     });
     const [saving, setSaving] = useState(false);
     const [repairing, setRepairing] = useState(false);
@@ -377,6 +381,44 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
                     </label>
                 </div>
 
+                {settings.remote_mode === 'client' && (
+                    <div className="setting-item">
+                        <div className="setting-info">
+                            <span className="setting-label">HTTP 也走本机直连上游</span>
+                            <span className="setting-desc">
+                                开启后 HTTP 也跟 WebSocket 同路，本机直接打上游，不再经 Server 转发；access_token 仍从 Server 拉。适合 Server 出口不稳但本机出口稳的场景。
+                            </span>
+                        </div>
+                        <label className="toggle">
+                            <input
+                                type="checkbox"
+                                checked={settings.client_direct_upstream ?? false}
+                                onChange={e => updateField('client_direct_upstream', e.target.checked)}
+                            />
+                            <span className="toggle-slider"></span>
+                        </label>
+                    </div>
+                )}
+
+                {settings.remote_mode === 'client' && (
+                    <div className="setting-item">
+                        <div className="setting-info">
+                            <span className="setting-label">本机管 current 指针</span>
+                            <span className="setting-desc">
+                                开启后本机自己决定 current（不被 Server `/current` 反向同步覆盖），`~/.codex/auth.json` 也由本机自己写。等价于旧 solo 模式（已并入 client）。
+                            </span>
+                        </div>
+                        <label className="toggle">
+                            <input
+                                type="checkbox"
+                                checked={settings.client_owns_current ?? false}
+                                onChange={e => updateField('client_owns_current', e.target.checked)}
+                            />
+                            <span className="toggle-slider"></span>
+                        </label>
+                    </div>
+                )}
+
                 {
                     settings.background_refresh && settings.remote_mode !== 'client' && (
                         <>
@@ -473,8 +515,8 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
                     <div className="setting-info">
                         <span className="setting-label">工作模式</span>
                         <span className="setting-desc">
-                            off=独立；server=Server 侧提供 API；client=从 Server 拉 token（全部走 Server）；
-                            solo=本机自治 + 切号/刷新后把结果推给 Server（Server 让位保活，断网不卡）
+                            off=独立；server=Server 侧提供 API；client=本机，rt 旋转走 Server。
+                            老 solo 模式已合并到 client（自动迁移：solo → client + 本机直连上游 + 本机管 current）。
                         </span>
                     </div>
                     <select
@@ -484,8 +526,7 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
                     >
                         <option value="off">off（关闭）</option>
                         <option value="server">server（Server 侧）</option>
-                        <option value="client">client（本机，瘦客户端）</option>
-                        <option value="solo">solo（本机自治 + 推送）</option>
+                        <option value="client">client（本机）</option>
                     </select>
                 </div>
 

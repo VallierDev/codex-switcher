@@ -74,9 +74,13 @@ pub fn start(
                 continue;
             }
 
-            // client 模式下：保活交给 Server，本机只做 auth.json 反向同步，不独占刷新
-            if remote_mode == "client" {
-                println!("[Scheduler] client 模式：跳过本机保活，Server 负责刷新");
+            // client / solo 模式：rt 旋转都交给 Server（solo 是临时模式，最终 rt 仍是
+            // Server 唯一 owner）。本机不抢 rt，避免两侧 rotate 冲突让 OpenAI 把 rt 标 reused。
+            if matches!(remote_mode.as_str(), "client" | "solo") {
+                println!(
+                    "[Scheduler] {} 模式：跳过本机保活，rt 由 Server 唯一刷新",
+                    remote_mode
+                );
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 continue;
             }
@@ -158,7 +162,7 @@ pub fn start(
             for target in targets {
                 println!("[Scheduler] 非活跃账号 {} 尝试保活刷新", target.name);
 
-                match oauth::refresh_access_token(&target.refresh_token).await {
+                match oauth::refresh_access_token_locked(&target.id, &target.refresh_token).await {
                     Ok(tokens) => {
                         let mut store = store.lock().unwrap();
                         if store.current.as_deref() == Some(target.id.as_str()) {
@@ -250,7 +254,8 @@ pub fn start(
 /// - main scheduler 用 `should_refresh_inactive_account`（天级粒度），不适合 anchor
 /// - anchor 这里强制 4 min 跑一次；如果 anchor == current 且 main scheduler 也想刷，
 ///   `oauth::refresh_access_token` 是幂等可重入的（每次都拿新 rt），这里抢到先就给它写
-/// - remote_mode == "client" 时跳过：disk 由 `start_fast_auth_sync` 从 Server 拉
+/// - remote_mode == "client" | "solo" 时跳过：client 由 `start_fast_auth_sync`
+///   从 Server 拉；solo 本机虽然跑 codex 但 rt 仍委托 Server（solo 是临时模式）
 pub fn start_anchor_refresh(
     store: Arc<Mutex<AccountStore>>,
     app_handle: tauri::AppHandle,
@@ -284,8 +289,10 @@ pub fn start_anchor_refresh(
                 continue;
             };
 
-            if remote_mode == "client" {
-                // client 模式：disk 由 Server 通过 fast_auth_sync 拉，本机不抢 rt
+            if matches!(remote_mode.as_str(), "client" | "solo") {
+                // client / solo 模式：rt 都委托 Server，本机不抢
+                // - client：disk 由 Server 通过 fast_auth_sync 拉
+                // - solo：本机自己跑 codex，但 rt 仍走 Server（solo 是临时模式）
                 continue;
             }
 
@@ -298,7 +305,7 @@ pub fn start_anchor_refresh(
             };
 
             // 2) 刷新 token
-            match oauth::refresh_access_token(&rt).await {
+            match oauth::refresh_access_token_locked(&anchor_id, &rt).await {
                 Ok(tokens) => {
                     // 3a) 写回 store
                     let auth_value = {

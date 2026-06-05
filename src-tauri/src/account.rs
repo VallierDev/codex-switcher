@@ -145,6 +145,17 @@ pub struct AppSettings {
     /// 默认 false —— 用订阅号时不会偷偷把请求路由到 Relay 扣余额
     #[serde(default = "default_false")]
     pub relay_auto_switch_in: bool,
+
+    /// client 模式：HTTP 也走本机直连上游（跟 WS 同路），跳过 Server 转发；
+    /// access_token 仍从 Server 拉。适合 Server 出口不稳但本机出口稳的场景。
+    #[serde(default = "default_false")]
+    pub client_direct_upstream: bool,
+
+    /// client 模式：本机管 current 指针（不跟随 Server 的 /current）。
+    /// 旧 `solo` 模式合并到 client + 此 flag = true。Server 端 current 不再被本机拉过来覆盖，
+    /// 本机用户在 UI 里切的号是权威。disk 写 `~/.codex/auth.json` 也由本机自己写。
+    #[serde(default = "default_false")]
+    pub client_owns_current: bool,
 }
 
 fn default_bootstrap_byte_cap() -> usize {
@@ -272,6 +283,8 @@ impl Default for AppSettings {
             proxy_bootstrap_time_cap_ms: default_bootstrap_time_cap_ms(),
             relay_auto_switch_out: true,
             relay_auto_switch_in: false,
+            client_direct_upstream: false,
+            client_owns_current: false,
         }
     }
 }
@@ -628,8 +641,30 @@ impl AccountStore {
         if store.migrate_clear_relay_token_invalid() {
             let _ = store.save();
         }
+        if store.migrate_solo_into_client() {
+            let _ = store.save();
+        }
 
         store
+    }
+
+    /// 一次性迁移：旧 `remote_mode == "solo"` 合并到 `client + client_owns_current=true`。
+    /// 原因：solo 跟 client（开 `client_direct_upstream`）的差异只剩下"本机管 current"。
+    /// 把这条做成 flag，模式从 4 个（off/server/client/solo）收敛到 3 个。
+    /// 老用户无感升级 —— 行为完全等价。
+    fn migrate_solo_into_client(&mut self) -> bool {
+        if self.settings.remote_mode == "solo" {
+            self.settings.remote_mode = "client".to_string();
+            self.settings.client_owns_current = true;
+            // solo 历来本机直连上游，没显式开 client_direct_upstream 的也补上
+            self.settings.client_direct_upstream = true;
+            println!(
+                "[Migration] remote_mode: solo → client (+ client_owns_current + client_direct_upstream)"
+            );
+            true
+        } else {
+            false
+        }
     }
 
     /// 一次性迁移：把"老 legacy 账号但其实是 Relay"的记录升级到 `kind = Relay`。
@@ -900,21 +935,32 @@ impl AccountStore {
         serde_json::from_str(&content).map_err(|e| format!("解析 auth.json 失败: {}", e))
     }
 
-    /// 写入 Codex auth.json
-    /// 写 auth.json，但把 tokens.expires_at 字段顶到 24 小时后，让 codex CLI 永远看到"还很新鲜"，
-    /// 不主动触发本地 refresh —— 真正的 token 过期由 proxy 接管处理。
-    /// 适合 client 模式（Server 是 RT 轮换的唯一权威，本机 codex 自己 refresh 必撞）。
+    /// 写入 Codex auth.json，`expires_at` 跟随 access_token JWT 的真实 `exp` claim
+    /// （而不是历史上撒谎成 +24h 的做法）。
+    ///
+    /// **为什么不撒谎了**：实测 openai/codex 源码 `codex-rs/login/src/token_data.rs::parse_jwt_expiration`，
+    /// codex CLI 决定是否 refresh 时**只解 JWT exp claim**，不读 auth.json 的 `expires_at` 字段。
+    /// 我们撒谎 expires_at 对 codex 完全无效。
+    ///
+    /// **现在的策略**：rt 旋转的单写者依旧是 codex-switcher（Server 端走 `refresh_access_token_locked`
+    /// 串行化）。每次 Server rotate 完都把新 token 立刻写盘 → codex CLI 下次读到的 JWT
+    /// 都是新鲜的（真实 exp ≈ 240h / 10 天） → codex CLI 在那 10 天内永远不需要自刷。
+    /// 只要 Server 在 10 天窗口里至少成功 rotate 一次（实际几乎每小时都有 proxy 调用），
+    /// codex 永远不会撞 race。
+    ///
+    /// 函数名保留 `_extended_expiry` 兼容老调用点；语义已变成"写真实 exp"。
     pub fn write_codex_auth_extended_expiry(auth: &serde_json::Value) -> Result<(), String> {
         let mut patched = auth.clone();
-        let new_exp = chrono::Utc::now() + chrono::Duration::hours(24);
-        if let Some(tokens) = patched.get_mut("tokens") {
-            if let Some(obj) = tokens.as_object_mut() {
-                obj.insert(
+        if let Some(real_exp_iso) = extract_access_token_jwt_exp_iso(&patched) {
+            if let Some(tokens) = patched.get_mut("tokens").and_then(|t| t.as_object_mut()) {
+                tokens.insert(
                     "expires_at".to_string(),
-                    serde_json::Value::String(new_exp.to_rfc3339()),
+                    serde_json::Value::String(real_exp_iso),
                 );
             }
         }
+        // 如果 JWT 解不出 exp（畸形 token），就保留调用方传进来的 expires_at 不动，
+        // 不再写撒谎值 —— 兜底交给 codex 自己的 JWT exp 检查。
         Self::write_codex_auth(&patched)
     }
 
@@ -1192,21 +1238,20 @@ impl AccountStore {
         }
     }
 
-    /// 退出兜底：把 anchor 当前 auth_json **以 access_token JWT 的真实 exp** 落盘。
+    /// 退出兜底：确保 anchor 的 auth.json 落盘且 `expires_at` 是真实 JWT exp。
     ///
-    /// 平时 `write_codex_auth_extended_expiry` 会把磁盘上的 expires_at 撒谎成
-    /// +24h，让 Codex.app / codex CLI 永远不想自己 refresh（rt 单写者保持是
-    /// codex-switcher）。这条不变量只在 codex-switcher 活着时有效——一旦本程
-    /// 序退出（graceful 或 panic），Codex.app 会拿着撒谎的 expires_at 继续用，
-    /// 真 at 过期后手机 bridge 401 但 Codex.app 不知道该 refresh → 链路静默断。
+    /// **当前状态（已与 codex 源码对齐）**：`write_codex_auth_extended_expiry` 在
+    /// 平时就一直写真实 JWT exp（不再撒谎 +24h），原因：实测 codex-rs/login/src/
+    /// token_data.rs::parse_jwt_expiration → codex CLI 只解 JWT exp claim 决定
+    /// 是否 refresh，根本不读 auth.json 的 `expires_at`。撒谎对 codex 无效。
     ///
-    /// v0.7.1 关键发现：OAuth response 的 `expires_in` 字段就是 86400 (24h)，
-    /// 跟我们撒谎值是同一个数字 —— 早期版本写"真实 exp"等于啥也没做。
-    /// 现在我们改成解 access_token JWT 的 `exp` claim（实测 OpenAI 给的 access
-    /// token 真实寿命 ~240h / 10 天），写到磁盘上让 Codex.app 看到"再过几天就
-    /// 该自己 refresh"，从而在 codex-switcher 死亡几天后还能触发 Codex.app
-    /// 自己 refresh（代价：rt 一次轮换，下次启动要重新登录 anchor，但避免了
-    /// 手机 bridge 静默断线）。
+    /// 因此这个"退出兜底"现在主要是**幂等保险**：磁盘大概率已经是真实 exp（从
+    /// 上次正常 rotate 时写的），但 anchor 切过号/被改过的边缘情况下，退出时
+    /// 再写一遍能保证 disk 跟 store 完全一致。
+    ///
+    /// **历史背景**（v0.7.1）：早期 `write_codex_auth_extended_expiry` 撒谎
+    /// expires_at=+24h，依赖此函数在退出时改回真值。现 v0.7.3+ 平时就写真值，
+    /// 此函数从"修补撒谎"退化为"幂等再写一次"。
     pub fn restore_disk_real_expiry_for_anchor(&self) -> Result<bool, String> {
         let Some(anchor) = self.session_anchor() else {
             return Ok(false);
@@ -1533,12 +1578,18 @@ impl AccountStore {
     }
 
     /// 记录保活刷新成功
+    ///
+    /// 同时清掉 `is_token_invalid` / `is_logged_out` —— refresh_token 都能拿到新
+    /// access_token，说明 token 没真过期，之前那次 TOKEN_INVALID 是 transient。
+    /// 不清这俩 flag 的话，UI 会一直挂着"过期"badge（last_error 是 null，badge 是 sticky）。
     pub fn mark_keepalive_attempt_success(&mut self, id: &str) {
         if let Some(account) = self.accounts.get_mut(id) {
             let now = Utc::now();
             account.keepalive.last_attempt_at = Some(now);
             account.keepalive.last_success_at = Some(now);
             account.keepalive.last_error = None;
+            account.is_token_invalid = false;
+            account.is_logged_out = false;
         }
     }
 

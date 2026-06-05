@@ -145,26 +145,35 @@ pub fn show_main_window_from_cmd(app: &AppHandle) {
 }
 
 /// 更新托盘 tooltip（不再需要完整菜单）
+///
+/// **关键**：`tray.set_tooltip` 是 Tauri/Cocoa GUI API，内部走 mpmc channel
+/// 等主线程在 NSApplication runloop 处理。如果调用时**还持有 store.lock()**，
+/// 而主线程刚好在执行 UI 的 `get_accounts`（也要拿同一把 store lock），就死锁：
+///   - tokio worker: 持 store.lock() → 调 set_tooltip → 等主线程
+///   - 主线程: 在 get_accounts → 等 store.lock()
+/// 修法：tooltip 构建放在内层 block 让 guard 在 set_tooltip 前 drop。
 pub fn update_tray_menu(app: &AppHandle) {
     let state = app.state::<crate::AppState>();
-    let store = match state.store.lock() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    let tooltip = if let Some(current_id) = &store.current {
-        if let Some(acc) = store.accounts.get(current_id) {
-            let quota = acc
-                .cached_quota
-                .as_ref()
-                .map(|q| format!(" | 5H: {:.0}%  周: {:.0}%", q.five_hour_left, q.weekly_left))
-                .unwrap_or_default();
-            format!("Codex Switcher - {}{}", acc.name, quota)
+    let tooltip = {
+        let store = match state.store.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if let Some(current_id) = &store.current {
+            if let Some(acc) = store.accounts.get(current_id) {
+                let quota = acc
+                    .cached_quota
+                    .as_ref()
+                    .map(|q| format!(" | 5H: {:.0}%  周: {:.0}%", q.five_hour_left, q.weekly_left))
+                    .unwrap_or_default();
+                format!("Codex Switcher - {}{}", acc.name, quota)
+            } else {
+                "Codex Switcher".to_string()
+            }
         } else {
-            "Codex Switcher".to_string()
+            "Codex Switcher - 未登录".to_string()
         }
-    } else {
-        "Codex Switcher - 未登录".to_string()
+        // store guard 在 block 结束（这一行）时 drop，set_tooltip 在外面跑
     };
 
     if let Some(tray) = app.tray_by_id("main") {
