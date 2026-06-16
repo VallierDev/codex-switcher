@@ -12,6 +12,7 @@ export interface CachedQuota {
     weekly_label?: string;
     plan_type: string;
     is_valid_for_cli?: boolean;
+    reset_credits?: number | null;
     updated_at: string;
 }
 

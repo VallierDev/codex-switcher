@@ -4109,6 +4109,7 @@ async fn handle_websocket(
                                                 weekly_label: usage.weekly_label.clone(),
                                                 plan_type: usage.plan_type.clone(),
                                                 is_valid_for_cli: usage.is_valid_for_cli,
+                                                reset_credits: usage.reset_credits,
                                                 updated_at: chrono::Utc::now(),
                                             });
                                             let _ = store.save();

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge } from 'lucide-react';
+import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge, UserPlus } from 'lucide-react';
 import { Account, AppSettings, RelayUsageCache, effectiveKind } from '../hooks/useAccounts';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -27,6 +27,44 @@ import { useShortCountdown } from '../hooks/useCountdown';
 import './AccountList.css';
 import { ConfirmModal } from './ConfirmModal';
 
+/** 把上游英文邀请提示翻成人话 */
+function friendlyInviteMessage(raw: string | null | undefined): string {
+    const m = (raw || '').trim();
+    if (!m) return '邀请未成功';
+    if (/already has a referral sent/i.test(m)) return '已经给该邮箱发过邀请了（同一邮箱不能重复邀请）';
+    if (/cannot be referred/i.test(m)) return '该邮箱无法被邀请（通常是已注册过 ChatGPT 的老用户，推荐奖励只对新邮箱有效）';
+    if (/not available for your plan/i.test(m)) return '当前套餐不支持发邀请（free 号没有邀请权限）';
+    return m;
+}
+
+/** 解出 accept-referral 链接里的 referral_context（base64 JSON），拿到奖励类型/被邀邮箱 */
+function decodeReferralBenefit(url: string): string | null {
+    try {
+        const ctx = new URL(url).searchParams.get('referral_context');
+        if (!ctx) return null;
+        const json = JSON.parse(atob(ctx.replace(/-/g, '+').replace(/_/g, '/')));
+        if (/rate_limit_reset/i.test(json.referral_type || '')) return '🔄 主动重置次数 +1';
+        return json.invite_page_benefit_text || json.referral_type || null;
+    } catch {
+        return null;
+    }
+}
+
+interface InviteLink {
+    email: string;
+    referral_id: string;
+    invite_url: string;
+}
+interface InviteResult {
+    ok: boolean;
+    status_code: number;
+    emails: string[];
+    invites: InviteLink[];
+    failed_emails: string[];
+    message: string | null;
+    upstream_raw: string;
+}
+
 interface UsageData {
     five_hour_left: number;
     five_hour_reset: string;
@@ -38,6 +76,7 @@ interface UsageData {
     weekly_label: string;
     plan_type: string;
     is_valid_for_cli: boolean;
+    reset_credits?: number | null;
 }
 
 type FilterType = 'all' | 'sub' | 'plus' | 'pro' | 'team' | 'free' | 'relay' | 'coding_plan' | 'third_party';
@@ -86,6 +125,14 @@ export function AccountList({
     const [relayUsageMap, setRelayUsageMap] = useState<Record<string, RelayUsageCache>>({});
     const [cookieEditor, setCookieEditor] = useState<{ id: string; name: string; value: string } | null>(null);
     const [savingCookie, setSavingCookie] = useState(false);
+    // Codex 邀请弹窗
+    const [inviteModal, setInviteModal] = useState<{ id: string; name: string } | null>(null);
+    const [inviteEmails, setInviteEmails] = useState('');
+    const [inviteSending, setInviteSending] = useState(false);
+    const [inviteResult, setInviteResult] = useState<InviteResult | null>(null);
+    const [inviteError, setInviteError] = useState<string | null>(null);
+    // Codex 启动：用该账号在隔离 CODEX_HOME 直连下开一个真 codex 终端
+    const [launchingIds, setLaunchingIds] = useState<Set<string>>(new Set());
 
     const autoReload = settings.auto_reload_ide;
     const setAutoReload = (val: boolean) => onUpdateSettings({ ...settings, auto_reload_ide: val });
@@ -95,6 +142,63 @@ export function AccountList({
             setCopiedId(id);
             setTimeout(() => setCopiedId(null), 2000);
         });
+    };
+
+    const handleLaunchCodex = async (id: string, name: string) => {
+        if (launchingIds.has(id)) return;
+        setLaunchingIds(prev => new Set(prev).add(id));
+        try {
+            const msg = await invoke<string>('open_codex_terminal', { id });
+            setPushToast({ type: 'success', text: msg || `${name} 已打开 codex 终端` });
+        } catch (e) {
+            setPushToast({ type: 'error', text: `${name} 启动失败：${String(e)}` });
+        } finally {
+            setLaunchingIds(prev => { const n = new Set(prev); n.delete(id); return n; });
+            setTimeout(() => setPushToast(null), 4000);
+        }
+    };
+
+    const openInvite = (id: string, name: string) => {
+        setInviteModal({ id, name });
+        setInviteEmails('');
+        setInviteResult(null);
+        setInviteError(null);
+    };
+
+    const handleSendInvite = async () => {
+        if (!inviteModal) return;
+        const emails = inviteEmails
+            .split(/[\s,;]+/)
+            .map(e => e.trim())
+            .filter(Boolean);
+        if (emails.length === 0) {
+            setInviteError('请至少填写 1 个邀请邮箱');
+            return;
+        }
+        setInviteSending(true);
+        setInviteError(null);
+        setInviteResult(null);
+        try {
+            const res = await invoke<InviteResult>('send_codex_invite', { id: inviteModal.id, emails });
+            setInviteResult(res);
+            if (!res.ok) {
+                // 优先用上游结构化 message（如重复邀请 "already has a referral sent"、
+                // free 号 "Referral invites are not available for your plan"）
+                let msg = res.message || `上游返回 HTTP ${res.status_code}`;
+                if (!res.message) {
+                    try {
+                        const j = JSON.parse(res.upstream_raw);
+                        const detail = j?.detail ?? j?.error?.message ?? j?.error;
+                        if (detail) msg = typeof detail === 'string' ? detail : JSON.stringify(detail);
+                    } catch { /* upstream_raw 非 JSON，保留默认文案 */ }
+                }
+                setInviteError(msg);
+            }
+        } catch (e) {
+            setInviteError(String(e));
+        } finally {
+            setInviteSending(false);
+        }
     };
 
     // 初始化数据
@@ -127,6 +231,7 @@ export function AccountList({
                     weekly_label: acc.cached_quota.weekly_label || '周限额',
                     plan_type: acc.cached_quota.plan_type,
                     is_valid_for_cli: isValid,
+                    reset_credits: acc.cached_quota.reset_credits,
                 };
                 if (!isValid) initialInvalids.add(acc.id);
             }
@@ -642,6 +747,9 @@ export function AccountList({
                                         )}
                                         {isBanned ? <span className="badge banned" title="该账号已被 OpenAI 封禁">封号</span> : isLoggedOut ? <span className="badge logged-out" title="您已登出或登录了其他账号，请重新登录">已登出</span> : isInvalid && <span className="badge expired" title="该账号 Token 已过期或失效">过期</span>}
                                         {usage?.plan_type && <span className="badge plan">{usage.plan_type.toUpperCase()}</span>}
+                                        {usage?.reset_credits != null && (
+                                            <span className="badge reset-credits" title="主动重置次数（可手动重置限额的剩余次数）">🔄 {usage.reset_credits}</span>
+                                        )}
                                     </div>
                                 </div>
                                 <div className="col-quota-merged">
@@ -663,6 +771,18 @@ export function AccountList({
                                         <span className="time-label">刷新:</span>
                                         <span className="time-val">{formatDate(acc.cached_quota?.updated_at)}</span>
                                     </div>
+                                    {effectiveKind(acc) !== 'relay' && (
+                                        <div className="wakeup-row">
+                                            <button
+                                                className="wakeup-btn"
+                                                onClick={() => handleLaunchCodex(acc.id, acc.name)}
+                                                disabled={launchingIds.has(acc.id)}
+                                                title='用该账号开一个真 codex 终端（隔离 + 直连），可发一句"你好"触发 referral 兑现'
+                                            >
+                                                {launchingIds.has(acc.id) ? '启动中…' : '🚀 启动 codex'}
+                                            </button>
+                                        </div>
+                                    )}
                                 </div>
                                 <div className="col-actions">
                                     <button className="action-btn refresh" onClick={() => handleRefreshOne(acc.id)} disabled={isRefreshing} title="刷新"><RefreshCw size={14} className={isRefreshing ? 'spinning' : ''} /></button>
@@ -678,6 +798,9 @@ export function AccountList({
                                     )}
                                     {!isCurrent && (
                                         <button className="action-btn switch" onClick={() => onSwitch(acc.id)} disabled={switchingIds.has(acc.id)} title="切换"><ArrowLeftRight size={14} /></button>
+                                    )}
+                                    {effectiveKind(acc) !== 'relay' && (usage?.plan_type ?? '').toLowerCase() !== 'free' && (
+                                        <button className="action-btn invite" onClick={() => openInvite(acc.id, acc.name)} title="发送 Codex 邀请"><UserPlus size={14} /></button>
                                     )}
                                     <button className="action-btn delete" onClick={() => setAccountToDelete({ id: acc.id, name: acc.name })} title="删除"><Trash2 size={14} /></button>
                                 </div>
@@ -740,6 +863,88 @@ export function AccountList({
                             </button>
                             <button type="button" className="btn btn-primary" onClick={handleSaveUsageCookie} disabled={savingCookie}>
                                 {savingCookie ? '保存中…' : '保存并刷新'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {inviteModal && (
+                <div className="modal-overlay" onClick={() => !inviteSending && setInviteModal(null)}>
+                    <div className="modal-content" onClick={e => e.stopPropagation()}>
+                        <div className="modal-header">
+                            <div className="header-top">
+                                <h2>发送 Codex 邀请</h2>
+                                <button className="close-btn" onClick={() => setInviteModal(null)} disabled={inviteSending}>
+                                    ×
+                                </button>
+                            </div>
+                        </div>
+                        <div className="modal-body">
+                            <p className="modal-tip" style={{ marginBottom: 10 }}>
+                                账号 <strong>{inviteModal.name}</strong>。每行一个邮箱（逗号/空格也行），最多 50 个。奖励是<strong>主动重置次数</strong>，仅对<strong>没注册过 ChatGPT 的新邮箱</strong>有效；同一邮箱只能邀一次。
+                            </p>
+                            <textarea
+                                value={inviteEmails}
+                                onChange={e => setInviteEmails(e.target.value)}
+                                rows={4}
+                                placeholder={'a@example.com\nb@example.com'}
+                                style={{ fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12, width: '100%' }}
+                                disabled={inviteSending}
+                            />
+                            {inviteError && inviteResult?.failed_emails?.length === 0 && (
+                                <div className="invite-result-card err" style={{ marginTop: 10 }}>
+                                    <span className="invite-result-icon">✗</span>
+                                    <span>{friendlyInviteMessage(inviteError)}</span>
+                                </div>
+                            )}
+                            {inviteResult && inviteResult.invites.length > 0 && (
+                                <div className="invite-result-list">
+                                    {inviteResult.invites.map((inv, i) => {
+                                        const benefit = inv.invite_url ? decodeReferralBenefit(inv.invite_url) : null;
+                                        return (
+                                            <div key={i} className="invite-result-card ok">
+                                                <span className="invite-result-icon">✓</span>
+                                                <div className="invite-result-main">
+                                                    <div className="invite-result-email">{inv.email || '—'}</div>
+                                                    {benefit && <div className="invite-result-benefit">{benefit}</div>}
+                                                </div>
+                                                {inv.invite_url && (
+                                                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => handleCopy(`inv-${i}`, inv.invite_url)}>
+                                                        {copiedId === `inv-${i}` ? '已复制' : '复制链接'}
+                                                    </button>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                            {inviteResult && inviteResult.failed_emails.length > 0 && (
+                                <div className="invite-result-list">
+                                    {inviteResult.failed_emails.map((em, i) => (
+                                        <div key={i} className="invite-result-card err">
+                                            <span className="invite-result-icon">✗</span>
+                                            <div className="invite-result-main">
+                                                <div className="invite-result-email">{em}</div>
+                                                <div className="invite-result-benefit">{friendlyInviteMessage(inviteResult.message)}</div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                            {inviteResult && inviteResult.ok && inviteResult.invites.length === 0 && inviteResult.failed_emails.length === 0 && (
+                                <div className="invite-result-card ok" style={{ marginTop: 10 }}>
+                                    <span className="invite-result-icon">✓</span>
+                                    <span>已发送，邮件已投递到对方邮箱。</span>
+                                </div>
+                            )}
+                        </div>
+                        <div className="modal-footer">
+                            <button type="button" className="btn btn-ghost" onClick={() => setInviteModal(null)} disabled={inviteSending}>
+                                关闭
+                            </button>
+                            <button type="button" className="btn btn-primary" onClick={handleSendInvite} disabled={inviteSending}>
+                                {inviteSending ? '发送中…' : '发送邀请'}
                             </button>
                         </div>
                     </div>

@@ -383,6 +383,13 @@
     color: white;
 }
 
+/* 主动重置次数 badge */
+.badge.reset-credits {
+    background: rgba(56, 189, 248, 0.18);
+    color: #7dd3fc;
+    cursor: help;
+}
+
 .badge.expired {
     background: rgba(239, 68, 68, 0.2);
     color: #ef4444;
@@ -622,12 +629,12 @@
 }
 
 .col-actions {
-    width: 140px;
+    width: 188px;
     flex-shrink: 0;
     display: flex;
     align-items: center;
     justify-content: flex-end;
-    gap: 8px;
+    gap: 6px;
 }
 
 .action-btn {
@@ -674,6 +681,131 @@
     background: rgba(248, 81, 73, 0.15);
     border-color: rgba(248, 81, 73, 0.5);
     color: var(--danger-color);
+}
+
+.action-btn.invite:hover:not(:disabled) {
+    background: rgba(56, 189, 248, 0.15);
+    border-color: rgba(56, 189, 248, 0.5);
+    color: #7dd3fc;
+}
+
+/* 保活列里的「唤醒」小按钮 */
+.wakeup-btn {
+    align-self: flex-start;
+    padding: 2px 8px;
+    font-size: 11px;
+    line-height: 1.4;
+    background: rgba(56, 189, 248, 0.12);
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    border-radius: 6px;
+    color: #7dd3fc;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.wakeup-btn:hover:not(:disabled) {
+    background: rgba(56, 189, 248, 0.22);
+    border-color: rgba(56, 189, 248, 0.6);
+}
+
+.wakeup-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+.wakeup-row {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+    margin-top: 4px;
+}
+
+/* 唤醒结果就地显示在按钮下方，绿✓回复 / 红✗原因 */
+.wakeup-result {
+    font-size: 11px;
+    line-height: 1.35;
+    max-width: 100%;
+    word-break: break-word;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    cursor: help;
+}
+
+.wakeup-result.ok {
+    color: var(--success-color, #3fb950);
+}
+
+.wakeup-result.err {
+    color: #f0883e;
+}
+
+/* 邀请结果卡片 */
+.invite-result-list {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.invite-result-card {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    font-size: 12px;
+    border: 1px solid transparent;
+}
+
+.invite-result-card.ok {
+    background: rgba(63, 185, 80, 0.1);
+    border-color: rgba(63, 185, 80, 0.3);
+}
+
+.invite-result-card.err {
+    background: rgba(240, 136, 62, 0.1);
+    border-color: rgba(240, 136, 62, 0.35);
+}
+
+.invite-result-icon {
+    flex-shrink: 0;
+    font-weight: 700;
+}
+
+.invite-result-card.ok .invite-result-icon {
+    color: var(--success-color, #3fb950);
+}
+
+.invite-result-card.err .invite-result-icon {
+    color: #f0883e;
+}
+
+.invite-result-main {
+    flex: 1;
+    min-width: 0;
+}
+
+.invite-result-email {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.invite-result-benefit {
+    margin-top: 2px;
+    font-size: 11px;
+    opacity: 0.85;
+}
+
+.invite-result-card.ok .invite-result-benefit {
+    color: #7dd3fc;
+}
+
+.invite-result-card.err .invite-result-benefit {
+    color: #f0883e;
 }
 
 .action-btn.anchor:hover:not(:disabled) {

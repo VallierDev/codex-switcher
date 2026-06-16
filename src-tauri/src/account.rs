@@ -533,6 +533,9 @@ pub struct CachedQuota {
     pub plan_type: String,
     #[serde(default = "default_true")]
     pub is_valid_for_cli: bool,
+    /// 主动重置次数（rate_limit_reset_credits.available_count）。老数据无此字段
+    #[serde(default)]
+    pub reset_credits: Option<i32>,
     pub updated_at: DateTime<Utc>,
 }
 

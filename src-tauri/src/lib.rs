@@ -1511,6 +1511,7 @@ async fn switch_account(
                         weekly_label: usage.weekly_label.clone(),
                         plan_type: usage.plan_type.clone(),
                         is_valid_for_cli: usage.is_valid_for_cli,
+                        reset_credits: usage.reset_credits,
                         updated_at: chrono::Utc::now(),
                     });
                     if let Err(e) = store.save() {
@@ -2287,6 +2288,7 @@ pub fn start_quota_refresh(
                                     weekly_label: usage.weekly_label.clone(),
                                     plan_type: usage.plan_type.clone(),
                                     is_valid_for_cli: usage.is_valid_for_cli,
+                                    reset_credits: usage.reset_credits,
                                     updated_at: chrono::Utc::now(),
                                 });
                                 // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
@@ -2670,8 +2672,220 @@ fn usage_to_cached(u: &UsageDisplay) -> crate::account::CachedQuota {
         weekly_label: u.weekly_label.clone(),
         plan_type: u.plan_type.clone(),
         is_valid_for_cli: u.is_valid_for_cli,
+        reset_credits: u.reset_credits,
         updated_at: Utc::now(),
     }
+}
+
+/// 发送 Codex 推荐邀请（POST /backend-api/wham/referrals/invite）。
+/// 复用账号自身 token，走 quota 同一条出口（Pro 号同 IP 约束见 usage::send_referral_invite）。
+#[tauri::command]
+async fn send_codex_invite(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    emails: Vec<String>,
+) -> Result<usage::InviteResult, String> {
+    // 清洗邮箱：trim、去空、去重（大小写无关）
+    let mut seen = std::collections::HashSet::new();
+    let emails: Vec<String> = emails
+        .into_iter()
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .filter(|e| seen.insert(e.to_lowercase()))
+        .collect();
+    if emails.is_empty() {
+        return Err("至少需要 1 个邀请邮箱".to_string());
+    }
+    if emails.len() > 50 {
+        return Err(format!("邀请邮箱过多：{} 个，最多 50 个", emails.len()));
+    }
+
+    // 取该账号 token / account_id（逻辑与 get_quota_by_id 一致）
+    let (access_token_opt, account_id, refresh_token, is_client_or_solo) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let account = store
+            .accounts
+            .get(&id)
+            .ok_or_else(|| format!("账号 {} 不存在", id))?;
+        if account.is_relay() {
+            return Err("RELAY_ACCOUNT:中转站账号不支持 Codex 邀请".to_string());
+        }
+        let at = AccountStore::extract_access_token(&account.auth_json);
+        let aid = AccountStore::extract_account_id(&account.auth_json);
+        let rt = account
+            .refresh_token
+            .clone()
+            .or_else(|| AccountStore::extract_refresh_token(&account.auth_json));
+        let solo_or_client = matches!(store.settings.remote_mode.as_str(), "client" | "solo");
+        (at, aid, rt, solo_or_client)
+    };
+
+    let access_token = if let Some(at) = access_token_opt {
+        at
+    } else if is_client_or_solo {
+        return Err(
+            "TOKEN_INVALID:client/solo 模式禁止本机 rt 刷新；请确认账号已同步到 Server".to_string(),
+        );
+    } else if let Some(ref rt) = refresh_token {
+        match crate::oauth::refresh_access_token_locked(&id, rt).await {
+            Ok(token_res) => {
+                let mut store = state.store.lock().map_err(|e| e.to_string())?;
+                if let Some(account) = store.accounts.get_mut(&id) {
+                    AccountStore::apply_refreshed_tokens(
+                        account,
+                        token_res.access_token.clone(),
+                        token_res.refresh_token.clone(),
+                        token_res.id_token,
+                        token_res.expires_in,
+                    );
+                    let _ = store.save();
+                }
+                token_res.access_token
+            }
+            Err(e) => return Err(format!("TOKEN_INVALID:刷新 token 失败: {}", e)),
+        }
+    } else {
+        return Err("TOKEN_INVALID:无 access_token 且无 refresh_token".to_string());
+    };
+
+    usage::send_referral_invite(&access_token, account_id.as_deref(), &emails, None).await
+}
+
+/// 唤醒/账户检测：用账号 token 模拟 codex CLI 发一句「你好」，
+/// 200=活着且回话 / 429=配额耗尽 / 403=需验证 / 401=失效。
+#[tauri::command]
+async fn send_codex_wakeup(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    prompt: Option<String>,
+) -> Result<usage::WakeupResult, String> {
+    let prompt = prompt.unwrap_or_else(|| "你好".to_string());
+
+    let (access_token_opt, account_id, refresh_token, is_client_or_solo) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let account = store
+            .accounts
+            .get(&id)
+            .ok_or_else(|| format!("账号 {} 不存在", id))?;
+        if account.is_relay() {
+            return Err("RELAY_ACCOUNT:中转站账号不支持 Codex 唤醒".to_string());
+        }
+        let at = AccountStore::extract_access_token(&account.auth_json);
+        let aid = AccountStore::extract_account_id(&account.auth_json);
+        let rt = account
+            .refresh_token
+            .clone()
+            .or_else(|| AccountStore::extract_refresh_token(&account.auth_json));
+        let solo_or_client = matches!(store.settings.remote_mode.as_str(), "client" | "solo");
+        (at, aid, rt, solo_or_client)
+    };
+
+    let access_token = if let Some(at) = access_token_opt {
+        at
+    } else if is_client_or_solo {
+        return Err(
+            "TOKEN_INVALID:client/solo 模式禁止本机 rt 刷新；请确认账号已同步到 Server".to_string(),
+        );
+    } else if let Some(ref rt) = refresh_token {
+        match crate::oauth::refresh_access_token_locked(&id, rt).await {
+            Ok(token_res) => {
+                let mut store = state.store.lock().map_err(|e| e.to_string())?;
+                if let Some(account) = store.accounts.get_mut(&id) {
+                    AccountStore::apply_refreshed_tokens(
+                        account,
+                        token_res.access_token.clone(),
+                        token_res.refresh_token.clone(),
+                        token_res.id_token,
+                        token_res.expires_in,
+                    );
+                    let _ = store.save();
+                }
+                token_res.access_token
+            }
+            Err(e) => return Err(format!("TOKEN_INVALID:刷新 token 失败: {}", e)),
+        }
+    } else {
+        return Err("TOKEN_INVALID:无 access_token 且无 refresh_token".to_string());
+    };
+
+    usage::send_wakeup(
+        &access_token,
+        account_id.as_deref(),
+        &prompt,
+        usage::DEFAULT_WAKEUP_MODEL,
+    )
+    .await
+}
+
+/// 用指定账号在「隔离 CODEX_HOME + 直连 OpenAI」下打开一个交互式 codex 终端。
+///
+/// 用途：referral 兑现需要"真 codex CLI 的 turn"——手搓 API 不算数。这里给该号
+/// 单独建一个 CODEX_HOME（塞它自己的 auth.json + 默认 openai provider 直连，
+/// **不走 codex-switcher proxy**，避免被改写成激活账号），再开 Terminal 跑 codex，
+/// 你在里面发一句"你好"即可触发兑现（前提：该号已在网页完成 referral 接受）。
+///
+/// 注意：codex 启动会刷新并轮换 refresh_token，本号在 store/Server 里的副本会变旧。
+/// 薅 referral 不依赖回写（奖励照样到账），但该 free 号之后可能因 token 失步被吊销——
+/// 一次性号可不管。
+#[tauri::command]
+fn open_codex_terminal(state: State<AppState>, id: String) -> Result<String, String> {
+    let (auth_json, name) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let acc = store
+            .accounts
+            .get(&id)
+            .ok_or_else(|| format!("账号 {} 不存在", id))?;
+        if acc.is_relay() {
+            return Err("RELAY_ACCOUNT:中转站账号不支持 codex 终端".to_string());
+        }
+        (acc.auth_json.clone(), acc.name.clone())
+    };
+
+    // auth_json 已是 codex 格式（{last_refresh, tokens:{...}}），补上 OPENAI_API_KEY: null
+    let mut auth = auth_json;
+    if !auth.is_object() {
+        return Err("账号 auth_json 结构异常".to_string());
+    }
+    if auth.get("tokens").and_then(|t| t.get("access_token")).is_none() {
+        return Err("账号缺少 codex tokens，无法启动".to_string());
+    }
+    if let Some(obj) = auth.as_object_mut() {
+        obj.entry("OPENAI_API_KEY".to_string())
+            .or_insert(serde_json::Value::Null);
+    }
+
+    // 隔离 CODEX_HOME：~/.codex-switcher/codex-launch/<id>/
+    let home = dirs::home_dir()
+        .ok_or("无法获取用户目录")?
+        .join(".codex-switcher")
+        .join("codex-launch")
+        .join(&id);
+    std::fs::create_dir_all(&home).map_err(|e| format!("创建 CODEX_HOME 失败: {}", e))?;
+    std::fs::write(
+        home.join("auth.json"),
+        serde_json::to_string(&auth).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("写 auth.json 失败: {}", e))?;
+    // 默认 openai provider（直连 chatgpt.com），不设 model_provider = 不走 switcher proxy
+    let config = "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"low\"\napproval_policy = \"never\"\nsandbox_mode = \"read-only\"\n";
+    std::fs::write(home.join("config.toml"), config)
+        .map_err(|e| format!("写 config.toml 失败: {}", e))?;
+
+    // 开 Terminal.app 跑 codex（登录 shell 有 PATH，能找到 codex）
+    let home_str = home.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let inner = format!(
+        "export CODEX_HOME=\\\"{}\\\"; clear; echo '账号: {} — 在下面直接发一句 你好 即可触发 referral 兑现'; codex",
+        home_str,
+        name.replace('\'', "")
+    );
+    let script = format!("tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell", inner);
+    Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .spawn()
+        .map_err(|e| format!("打开 Terminal 失败: {}", e))?;
+
+    Ok(format!("已为 {} 打开 codex 终端", name))
 }
 
 /// 将当前 Codex auth.json 强制同步到指定账号
@@ -2924,6 +3138,7 @@ async fn get_quota_by_id(
                 weekly_label: usage.weekly_label.clone(),
                 plan_type: usage.plan_type.clone(),
                 is_valid_for_cli: usage.is_valid_for_cli,
+                reset_credits: usage.reset_credits,
                 updated_at: Utc::now(),
             });
             // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
@@ -2946,6 +3161,7 @@ async fn get_quota_by_id(
                 weekly_label: usage.weekly_label.clone(),
                 plan_type: usage.plan_type.clone(),
                 is_valid_for_cli: usage.is_valid_for_cli,
+                reset_credits: usage.reset_credits,
                 updated_at: Utc::now(),
             });
             // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
@@ -5146,6 +5362,9 @@ pub fn run() {
             bulk_import_accounts,
             check_codex_login,
             get_quota_by_id,
+            send_codex_invite,
+            send_codex_wakeup,
+            open_codex_terminal,
             oauth_server::start_oauth_login,
             oauth_server::submit_oauth_callback,
             oauth_server::copy_to_clipboard,

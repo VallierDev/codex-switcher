@@ -50,6 +50,8 @@ pub struct UsageDisplay {
     pub credits_balance: Option<f64>,
     /// 是否有额度
     pub has_credits: bool,
+    /// 主动重置次数（rate_limit_reset_credits.available_count）。None = 接口未返回
+    pub reset_credits: Option<i32>,
     /// Token 是否对 CLI 有效 (api.openai.com)
     pub is_valid_for_cli: bool,
 }
@@ -211,6 +213,13 @@ impl UsageFetcher {
             .and_then(|c| c.get("balance"))
             .and_then(Self::parse_number);
 
+        // 主动重置次数：rate_limit_reset_credits.available_count
+        let reset_credits = json
+            .get("rate_limit_reset_credits")
+            .and_then(|r| r.get("available_count"))
+            .and_then(Self::parse_number)
+            .map(|f| f as i32);
+
         Ok(UsageDisplay {
             plan_type,
             five_hour_used: p_used,
@@ -225,6 +234,7 @@ impl UsageFetcher {
             weekly_reset_at: s_reset_at,
             credits_balance,
             has_credits: has_credits || unlimited,
+            reset_credits,
             is_valid_for_cli: true,
         })
     }
@@ -875,6 +885,289 @@ impl UsageFetcher {
         chrono::NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M:%S")
             .ok()
             .map(|dt| dt.and_utc().timestamp())
+    }
+}
+
+/// 默认 referral_key —— ChatGPT 推荐邀请的常驻邀请类型。
+pub const DEFAULT_REFERRAL_KEY: &str = "codex_referral_persistent_invite";
+
+/// 单条邀请结果（对应上游 invites[] 元素）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteLink {
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub referral_id: String,
+    #[serde(default)]
+    pub invite_url: String,
+}
+
+/// 发送邀请的整体结果，回传给前端展示
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteResult {
+    pub ok: bool,
+    pub status_code: u16,
+    pub emails: Vec<String>,
+    pub invites: Vec<InviteLink>,
+    /// 上游拒绝的邮箱（如重复邀请 → "This person already has a referral sent to them"）
+    #[serde(default)]
+    pub failed_emails: Vec<String>,
+    /// 上游附带的提示文案（失败原因等）
+    #[serde(default)]
+    pub message: Option<String>,
+    /// 上游原始响应（成功/失败都带上，方便前端兜底展示）
+    pub upstream_raw: String,
+}
+
+/// 调用 ChatGPT 推荐邀请接口：`POST /backend-api/wham/referrals/invite`。
+///
+/// 复用 quota 的同一条出口（`usage_client` + codex UA），保证带 token 的请求
+/// 跟该账号平时的 quota 查询走同一个 egress —— 这对 Pro 号尤其重要：
+/// 同一 token 从不同国家 IP 发请求会被 OpenAI 直接 token_invalidated。
+pub async fn send_referral_invite(
+    access_token: &str,
+    account_id: Option<&str>,
+    emails: &[String],
+    referral_key: Option<&str>,
+) -> Result<InviteResult, String> {
+    if emails.is_empty() {
+        return Err("至少需要 1 个邀请邮箱".to_string());
+    }
+
+    let referral_key = referral_key
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_REFERRAL_KEY);
+
+    let body = serde_json::json!({
+        "referral_key": referral_key,
+        "emails": emails,
+    });
+
+    let client = usage_client();
+    let mut req = client
+        .post("https://chatgpt.com/backend-api/wham/referrals/invite")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("User-Agent", crate::codex_ua::codex_user_agent())
+        .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(45))
+        .json(&body);
+    if let Some(id) = account_id {
+        if !id.is_empty() {
+            req = req.header("ChatGPT-Account-Id", id);
+        }
+    }
+
+    let resp = req.send().await.map_err(|e| format!("网络请求失败: {}", e))?;
+    let status = resp.status();
+    let raw = resp.text().await.unwrap_or_default();
+
+    let parsed = serde_json::from_str::<Value>(&raw).ok();
+    let invites = parsed
+        .as_ref()
+        .and_then(|v| v.get("invites").cloned())
+        .and_then(|v| serde_json::from_value::<Vec<InviteLink>>(v).ok())
+        .unwrap_or_default();
+
+    // failed_emails / message 既可能在顶层，也可能嵌在 detail 对象里（403 那种）。
+    // 取一个"既看顶层又看 detail"的视图。
+    let detail_obj = parsed.as_ref().and_then(|v| v.get("detail"));
+    let pick = |key: &str| -> Option<Value> {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .or_else(|| detail_obj.and_then(|d| d.get(key)))
+            .cloned()
+    };
+
+    let failed_emails = pick("failed_emails")
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // message：顶层 message → detail.message → detail 本身是字符串
+    let message = pick("message")
+        .and_then(|m| m.as_str().map(|s| s.to_string()))
+        .or_else(|| detail_obj.and_then(|d| d.as_str()).map(|s| s.to_string()));
+
+    // ok = HTTP 2xx 且没有任何被拒邮箱
+    let ok = status.is_success() && failed_emails.is_empty();
+
+    Ok(InviteResult {
+        ok,
+        status_code: status.as_u16(),
+        emails: emails.to_vec(),
+        invites,
+        failed_emails,
+        message,
+        upstream_raw: raw,
+    })
+}
+
+/// 默认唤醒模型（实测 ChatGPT 账号 codex responses 接口当前接受 gpt-5.5；
+/// gpt-5-codex / gpt-5.3-codex 等已被该端点拒绝）。
+pub const DEFAULT_WAKEUP_MODEL: &str = "gpt-5.5";
+
+/// 唤醒结果，回传给前端
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WakeupResult {
+    /// true = 模型正常回了话（HTTP 2xx）
+    pub ok: bool,
+    pub status_code: u16,
+    pub model: String,
+    /// 发出去的唤醒词
+    pub prompt: String,
+    /// 模型回复（成功时）
+    pub reply: String,
+    /// 失败摘要（usage_limit_reached / needs_verification / token_invalid …）
+    pub error: Option<String>,
+}
+
+/// 用账号 token 模拟官方 codex CLI，向 `chatgpt.com/backend-api/codex/responses`
+/// 发一句最小对话（默认「你好」）。等价于 cockpit 的「唤醒/账户检测」：
+/// 200=活着且回话，429=配额耗尽，403=需验证，401=token 失效。
+/// 走 quota 同一条出口（Pro 号同 IP 约束见 [[pro_account_multi_region_token_invalidated]]）。
+pub async fn send_wakeup(
+    access_token: &str,
+    account_id: Option<&str>,
+    prompt: &str,
+    model: &str,
+) -> Result<WakeupResult, String> {
+    let prompt = if prompt.trim().is_empty() { "你好" } else { prompt.trim() };
+    let model = if model.trim().is_empty() { DEFAULT_WAKEUP_MODEL } else { model.trim() };
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    let body = serde_json::json!({
+        "model": model,
+        "instructions": "You are a helpful assistant.",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": prompt }],
+        }],
+        "tools": [],
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "reasoning": { "effort": "low", "summary": "auto" },
+        "store": false,
+        "stream": true,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": session_id,
+    });
+
+    let client = usage_client();
+    let mut req = client
+        .post("https://chatgpt.com/backend-api/codex/responses")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("OpenAI-Beta", "responses=experimental")
+        .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
+        .header("User-Agent", crate::codex_ua::codex_user_agent())
+        .header("session_id", &session_id)
+        .header("Accept", "text/event-stream")
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(60))
+        .json(&body);
+    if let Some(id) = account_id {
+        if !id.is_empty() {
+            req = req.header("ChatGPT-Account-Id", id);
+        }
+    }
+
+    let resp = req.send().await.map_err(|e| format!("网络请求失败: {}", e))?;
+    let status = resp.status();
+    let raw = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        Ok(WakeupResult {
+            ok: true,
+            status_code: status.as_u16(),
+            model: model.to_string(),
+            prompt: prompt.to_string(),
+            reply: parse_wakeup_reply(&raw),
+            error: None,
+        })
+    } else {
+        Ok(WakeupResult {
+            ok: false,
+            status_code: status.as_u16(),
+            model: model.to_string(),
+            prompt: prompt.to_string(),
+            reply: String::new(),
+            error: Some(parse_wakeup_error(&raw, status.as_u16())),
+        })
+    }
+}
+
+/// 从 SSE 流里抠出 assistant 回复：优先拼 `response.output_text.delta` 的增量，
+/// 退化到 `response.output_text.done` 的整段 text。
+fn parse_wakeup_reply(sse: &str) -> String {
+    let mut acc = String::new();
+    let mut done_text: Option<String> = None;
+    for line in sse.lines() {
+        let line = line.trim_start();
+        let payload = match line.strip_prefix("data:") {
+            Some(p) => p.trim(),
+            None => continue,
+        };
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(payload) else { continue };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("response.output_text.delta") => {
+                if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
+                    acc.push_str(d);
+                }
+            }
+            Some("response.output_text.done") => {
+                if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+                    done_text = Some(t.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let out = if !acc.trim().is_empty() {
+        acc
+    } else {
+        done_text.unwrap_or_default()
+    };
+    out.trim().to_string()
+}
+
+/// 把非 2xx 响应体翻成简短人话。
+fn parse_wakeup_error(raw: &str, status: u16) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(raw) {
+        // {"error":{"type":"usage_limit_reached","message":"..."}}
+        if let Some(err) = v.get("error") {
+            let ty = err.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            if ty == "usage_limit_reached" {
+                return "配额已耗尽（usage_limit_reached）".to_string();
+            }
+            if !msg.is_empty() {
+                return msg.to_string();
+            }
+            if !ty.is_empty() {
+                return ty.to_string();
+            }
+        }
+        // {"detail":"..."}
+        if let Some(detail) = v.get("detail").and_then(|d| d.as_str()) {
+            return detail.to_string();
+        }
+    }
+    match status {
+        401 => "token 失效（401）".to_string(),
+        403 => "需要验证或提交保证书（403）".to_string(),
+        429 => "配额已耗尽（429）".to_string(),
+        _ => format!("上游返回 HTTP {}", status),
     }
 }
 

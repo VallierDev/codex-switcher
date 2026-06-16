@@ -14,6 +14,7 @@ export interface UsageDisplay {
     weekly_reset_at?: number;
     credits_balance: number | null;
     has_credits: boolean;
+    reset_credits?: number | null;
 }
 
 /// Relay (中转账号) 没有 OpenAI 5h+周窗口模型，把 GLM 这类返回的百分比剩余值
