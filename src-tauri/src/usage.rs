@@ -21,6 +21,21 @@ fn usage_client() -> &'static reqwest::Client {
     })
 }
 
+/// Spark（GPT-5.3-Codex-Spark）独立限额窗口。来自 wham/usage 的
+/// `additional_rate_limits[]`（limit_name == "GPT-5.3-Codex-Spark"）。
+/// free 号没有 → None。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SparkWindows {
+    /// 5小时剩余百分比
+    pub five_hour_left: i32,
+    pub five_hour_reset: String,
+    pub five_hour_reset_at: Option<i64>,
+    /// 周剩余百分比
+    pub weekly_left: i32,
+    pub weekly_reset: String,
+    pub weekly_reset_at: Option<i64>,
+}
+
 /// 前端展示的用量数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageDisplay {
@@ -52,6 +67,9 @@ pub struct UsageDisplay {
     pub has_credits: bool,
     /// 主动重置次数（rate_limit_reset_credits.available_count）。None = 接口未返回
     pub reset_credits: Option<i32>,
+    /// Spark 独立限额窗口（仅 Pro 等有 Spark 的号；free=None）
+    #[serde(default)]
+    pub spark: Option<SparkWindows>,
     /// Token 是否对 CLI 有效 (api.openai.com)
     pub is_valid_for_cli: bool,
 }
@@ -220,6 +238,34 @@ impl UsageFetcher {
             .and_then(Self::parse_number)
             .map(|f| f as i32);
 
+        // Spark 独立限额：additional_rate_limits[] 里 limit_name == GPT-5.3-Codex-Spark
+        let spark = json
+            .get("additional_rate_limits")
+            .and_then(|a| a.as_array())
+            .and_then(|arr| {
+                arr.iter().find(|e| {
+                    e.get("limit_name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| n.eq_ignore_ascii_case("GPT-5.3-Codex-Spark"))
+                        .unwrap_or(false)
+                })
+            })
+            .and_then(|e| e.get("rate_limit"))
+            .map(|rl| {
+                let (p_used, p_reset, _l, p_at) =
+                    Self::parse_window(rl.get("primary_window"), "5H 限额");
+                let (s_used, s_reset, _l2, s_at) =
+                    Self::parse_window(rl.get("secondary_window"), "周限额");
+                SparkWindows {
+                    five_hour_left: 100 - p_used,
+                    five_hour_reset: p_reset,
+                    five_hour_reset_at: p_at,
+                    weekly_left: 100 - s_used,
+                    weekly_reset: s_reset,
+                    weekly_reset_at: s_at,
+                }
+            });
+
         Ok(UsageDisplay {
             plan_type,
             five_hour_used: p_used,
@@ -235,6 +281,7 @@ impl UsageFetcher {
             credits_balance,
             has_credits: has_credits || unlimited,
             reset_credits,
+            spark,
             is_valid_for_cli: true,
         })
     }

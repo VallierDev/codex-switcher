@@ -1180,6 +1180,109 @@ fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(
 // 核心请求处理
 // ────────────────────────────────────────────────────────────────
 
+/// OpenAI `chat/completions` 入站处理：翻成 codex `responses`，用一个 Spark-capable(Pro)
+/// 账号打 ChatGPT 上游，缓冲整条 SSE 后组装回单条 chat/completions JSON。
+/// 供 glance 等 OpenAI 兼容客户端复用 ChatGPT 订阅里闲置的 Spark 额度。
+async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<ProxyBody> {
+    let chat: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid JSON: {}", e)),
+    };
+
+    // 选供号：第一个非 relay 且 plan_type==pro 的账号（Spark 专属）。
+    let (token, account_id, name) = {
+        let store = match state.store.lock() {
+            Ok(s) => s,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+        let mut picked: Option<(String, Option<String>, String)> = None;
+        for (_id, acc) in store.accounts.iter() {
+            if acc.is_relay() {
+                continue;
+            }
+            let plan = acc
+                .cached_quota
+                .as_ref()
+                .map(|q| q.plan_type.to_lowercase())
+                .unwrap_or_default();
+            if plan == "pro" {
+                if let Some(tok) = AccountStore::extract_access_token(&acc.auth_json) {
+                    picked = Some((
+                        tok,
+                        AccountStore::extract_account_id(&acc.auth_json),
+                        acc.name.clone(),
+                    ));
+                    break;
+                }
+            }
+        }
+        match picked {
+            Some(p) => p,
+            None => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "没有可用的 Pro 账号（chat 入站/Spark 需要一个 plan=pro 的账号；先刷新一次该号配额）",
+                )
+            }
+        }
+    };
+
+    let default_model = "gpt-5.3-codex-spark";
+    let responses_body = crate::chat_inbound::chat_to_responses(&chat, default_model);
+    let model = responses_body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or(default_model)
+        .to_string();
+    println!("[ChatInbound] 账号={} model={}", name, model);
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let mut up = client
+        .post(format!("{}/responses", CHATGPT_ORIGIN))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("OpenAI-Beta", "responses=experimental")
+        .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
+        .header("User-Agent", crate::codex_ua::codex_user_agent())
+        .header("session_id", &session_id)
+        .header("Accept", "text/event-stream")
+        .header("Content-Type", "application/json")
+        .json(&responses_body);
+    if let Some(aid) = account_id.as_deref() {
+        if !aid.is_empty() {
+            up = up.header("ChatGPT-Account-Id", aid);
+        }
+    }
+
+    let resp = match up.send().await {
+        Ok(r) => r,
+        Err(e) => return error_response(StatusCode::BAD_GATEWAY, &format!("上游请求失败: {}", e)),
+    };
+    let status = resp.status();
+    let raw = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = crate::chat_inbound::extract_upstream_error(&raw)
+            .unwrap_or_else(|| format!("上游 HTTP {}", status.as_u16()));
+        return error_response(
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            &msg,
+        );
+    }
+
+    let chat_resp = crate::chat_inbound::responses_sse_to_chat(&raw, &model);
+    Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(full_body(Bytes::from(chat_resp.to_string())))
+        .unwrap()
+}
+
 async fn handle_request(
     state: Arc<ProxyState>,
     req: Request<Incoming>,
@@ -1274,6 +1377,16 @@ async fn handle_request(
             return Ok(error_response(StatusCode::BAD_REQUEST, "读取请求体失败"));
         }
     };
+
+    // ── OpenAI chat/completions 入站（glance 等 OpenAI 兼容客户端用 ChatGPT 账号的 codex 模型）──
+    // 与下面 responses 路径完全独立：chat → 翻成 codex responses → 打 ChatGPT 上游 → 缓冲 SSE
+    // → 组装回单条 chat/completions JSON。详见 chat_inbound 模块。
+    {
+        let p = path_and_query.split('?').next().unwrap_or("");
+        if method == Method::POST && (p == "/v1/chat/completions" || p == "/chat/completions") {
+            return Ok(handle_chat_inbound(state, &body_bytes).await);
+        }
+    }
 
     // ── Relay 路由前置处理 ──
     // 1) 当 current 是 Relay 时，重写 body 里的 `model` 字段（codex 端发的 gpt-* → glm-*）
@@ -4110,6 +4223,7 @@ async fn handle_websocket(
                                                 plan_type: usage.plan_type.clone(),
                                                 is_valid_for_cli: usage.is_valid_for_cli,
                                                 reset_credits: usage.reset_credits,
+                                                spark: usage.spark.clone(),
                                                 updated_at: chrono::Utc::now(),
                                             });
                                             let _ = store.save();

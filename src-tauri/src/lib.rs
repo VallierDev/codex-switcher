@@ -4,6 +4,7 @@
 
 pub mod account;
 mod bulk_import;
+pub mod chat_inbound;
 mod codex_sessions;
 mod codex_ua;
 mod deep_link;
@@ -1512,6 +1513,7 @@ async fn switch_account(
                         plan_type: usage.plan_type.clone(),
                         is_valid_for_cli: usage.is_valid_for_cli,
                         reset_credits: usage.reset_credits,
+                        spark: usage.spark.clone(),
                         updated_at: chrono::Utc::now(),
                     });
                     if let Err(e) = store.save() {
@@ -2289,6 +2291,7 @@ pub fn start_quota_refresh(
                                     plan_type: usage.plan_type.clone(),
                                     is_valid_for_cli: usage.is_valid_for_cli,
                                     reset_credits: usage.reset_credits,
+                                    spark: usage.spark.clone(),
                                     updated_at: chrono::Utc::now(),
                                 });
                                 // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
@@ -2673,6 +2676,7 @@ fn usage_to_cached(u: &UsageDisplay) -> crate::account::CachedQuota {
         plan_type: u.plan_type.clone(),
         is_valid_for_cli: u.is_valid_for_cli,
         reset_credits: u.reset_credits,
+        spark: u.spark.clone(),
         updated_at: Utc::now(),
     }
 }
@@ -3139,6 +3143,7 @@ async fn get_quota_by_id(
                 plan_type: usage.plan_type.clone(),
                 is_valid_for_cli: usage.is_valid_for_cli,
                 reset_credits: usage.reset_credits,
+                spark: usage.spark.clone(),
                 updated_at: Utc::now(),
             });
             // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
@@ -3162,6 +3167,7 @@ async fn get_quota_by_id(
                 plan_type: usage.plan_type.clone(),
                 is_valid_for_cli: usage.is_valid_for_cli,
                 reset_credits: usage.reset_credits,
+                spark: usage.spark.clone(),
                 updated_at: Utc::now(),
             });
             // quota 拉到了 = token 没过期，清掉历史 stale 失效标记

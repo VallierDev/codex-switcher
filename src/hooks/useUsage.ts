@@ -15,6 +15,16 @@ export interface UsageDisplay {
     credits_balance: number | null;
     has_credits: boolean;
     reset_credits?: number | null;
+    spark?: SparkWindows | null;
+}
+
+export interface SparkWindows {
+    five_hour_left: number;
+    five_hour_reset: string;
+    five_hour_reset_at?: number;
+    weekly_left: number;
+    weekly_reset: string;
+    weekly_reset_at?: number;
 }
 
 /// Relay (中转账号) 没有 OpenAI 5h+周窗口模型，把 GLM 这类返回的百分比剩余值

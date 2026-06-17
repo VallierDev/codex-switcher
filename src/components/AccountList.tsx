@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge, UserPlus } from 'lucide-react';
-import { Account, AppSettings, RelayUsageCache, effectiveKind } from '../hooks/useAccounts';
+import { Account, AppSettings, RelayUsageCache, SparkWindows, effectiveKind } from '../hooks/useAccounts';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 
@@ -77,6 +77,7 @@ interface UsageData {
     plan_type: string;
     is_valid_for_cli: boolean;
     reset_credits?: number | null;
+    spark?: SparkWindows | null;
 }
 
 type FilterType = 'all' | 'sub' | 'plus' | 'pro' | 'team' | 'free' | 'relay' | 'coding_plan' | 'third_party';
@@ -232,6 +233,7 @@ export function AccountList({
                     plan_type: acc.cached_quota.plan_type,
                     is_valid_for_cli: isValid,
                     reset_credits: acc.cached_quota.reset_credits,
+                    spark: acc.cached_quota.spark,
                 };
                 if (!isValid) initialInvalids.add(acc.id);
             }
@@ -759,6 +761,12 @@ export function AccountList({
                                         <div className="quota-grid">
                                             <QuotaItem label={usage.five_hour_label} percentage={usage.five_hour_left} reset={usage.five_hour_reset} resetAt={usage.five_hour_reset_at} />
                                             <QuotaItem label={usage.weekly_label} percentage={usage.weekly_left} reset={usage.weekly_reset} resetAt={usage.weekly_reset_at} />
+                                            {usage.spark && (
+                                                <>
+                                                    <QuotaItem label="Spark 5H" percentage={usage.spark.five_hour_left} reset={usage.spark.five_hour_reset} resetAt={usage.spark.five_hour_reset_at} />
+                                                    <QuotaItem label="Spark 周" percentage={usage.spark.weekly_left} reset={usage.spark.weekly_reset} resetAt={usage.spark.weekly_reset_at} />
+                                                </>
+                                            )}
                                         </div>
                                     ) : <span className="quota-empty">未获取数据</span>}
                                 </div>

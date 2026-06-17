@@ -123,6 +123,25 @@ flowchart LR
 
 这个组合适合长期开发：Codex Switcher 保证请求不中断，glance 让低难度高 token 的任务走 Coding Plan，用更低成本把任务量堆起来。
 
+## 用 ChatGPT 订阅给 glance / hermes 供算力（chat 入站桥接，v0.7.5）
+
+Codex Switcher 内置一个 OpenAI 兼容的 `chat/completions` 入站端点：把请求翻译成 Codex 的 `responses` 协议、用你某个 **Pro 账号** 打 ChatGPT 上游，再把 SSE 组装回标准 chat 响应。这样任何 OpenAI 兼容客户端（glance、hermes 等）都能直接复用 ChatGPT 订阅里的 codex 模型——尤其是编码场景几乎用不上、纯属闲置的 `gpt-5.3-codex-spark` 额度。
+
+- **端点**：`POST http://<host>:18080/v1/chat/completions`（本机用 `localhost:18080`；局域网其它机器指向本机内网 IP）。
+- **接法**：客户端 `base_url` 指向上面、`model` 设 `gpt-5.3-codex-spark`，`api_key` 随便填（桥接用账号自身 token，忽略传入 key）。
+- **工具调用**：完整支持 function calling 多轮往返（chat `tool_calls` ⇄ responses `function_call` / `function_call_output`），glance sub-agent、hermes agent loop 都能透明使用。
+- **视觉自动切换**：Spark 不支持图片；请求带图时桥接自动改用 `gpt-5.4-mini`（有视觉、对主额度消耗更小），纯文本仍走 Spark 的独立免费桶。
+- **省额度**：文本 → Spark（独立闲置桶，不碰主 5h/周）；视觉 → gpt-5.4-mini。
+
+> 例：glance 后端 `base_url=http://localhost:18080/v1`、`model=gpt-5.3-codex-spark`；hermes 在 `config.yaml` 用 `provider: custom` + 同样的 base_url/model。多客户端共用同一个 Pro 账号的 Spark 桶，账号列表的 Spark 限额可用来盯用量。
+
+## 账号面板新增（v0.7.5）
+
+- **主动重置次数徽章** `🔄 N`：来自 `wham/usage` 的 `rate_limit_reset_credits.available_count`（手动重置限额的剩余次数）。
+- **Spark 独立限额**：Pro 账号额外显示 `Spark 5H / Spark 周`（解析 `additional_rate_limits` 的 GPT-5.3-Codex-Spark 窗口）。
+- **软件内 Codex 邀请**：付费号一键发 referral 邀请邮件，弹窗展示邀请链接（解码出奖励 = 主动重置次数）与失败原因；free 号无邀请权限，入口自动隐藏。
+- **🚀 启动 codex（鼠标悬停显示）**：用某账号在隔离 `CODEX_HOME` + 直连 OpenAI 下开一个真 codex 终端（referral 兑现需要真 codex CLI 的一次 turn）。
+
 ## 核心能力
 
 ### 多账号管理

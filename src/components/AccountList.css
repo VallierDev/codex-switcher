@@ -719,6 +719,15 @@
     align-items: flex-start;
     gap: 3px;
     margin-top: 4px;
+    /* 非常用功能：默认隐藏，鼠标经过该行才淡入 */
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+}
+
+.account-row:hover .wakeup-row {
+    opacity: 1;
+    pointer-events: auto;
 }
 
 /* 唤醒结果就地显示在按钮下方，绿✓回复 / 红✗原因 */

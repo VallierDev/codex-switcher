@@ -472,6 +472,7 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
                             plan_type: usage.plan_type.clone(),
                             is_valid_for_cli: usage.is_valid_for_cli,
                             reset_credits: usage.reset_credits,
+                            spark: usage.spark.clone(),
                             updated_at: chrono::Utc::now(),
                         });
                         acc.is_banned = false;
@@ -656,6 +657,7 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
                         plan_type: usage.plan_type.clone(),
                         is_valid_for_cli: usage.is_valid_for_cli,
                         reset_credits: usage.reset_credits,
+                        spark: usage.spark.clone(),
                         updated_at: chrono::Utc::now(),
                     });
                     acc.is_banned = false;

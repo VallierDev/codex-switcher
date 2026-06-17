@@ -13,7 +13,17 @@ export interface CachedQuota {
     plan_type: string;
     is_valid_for_cli?: boolean;
     reset_credits?: number | null;
+    spark?: SparkWindows | null;
     updated_at: string;
+}
+
+export interface SparkWindows {
+    five_hour_left: number;
+    five_hour_reset: string;
+    five_hour_reset_at?: number;
+    weekly_left: number;
+    weekly_reset: string;
+    weekly_reset_at?: number;
 }
 
 export interface AppSettings {
