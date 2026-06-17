@@ -1227,6 +1227,7 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
         }
     };
 
+    let want_stream = chat.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let default_model = "gpt-5.3-codex-spark";
     let responses_body = crate::chat_inbound::chat_to_responses(&chat, default_model);
     let model = responses_body
@@ -1236,7 +1237,6 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
         .to_string();
     println!("[ChatInbound] 账号={} model={}", name, model);
 
-    let session_id = uuid::Uuid::new_v4().to_string();
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -1244,43 +1244,70 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
         Ok(c) => c,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let mut up = client
-        .post(format!("{}/responses", CHATGPT_ORIGIN))
-        .header("Authorization", format!("Bearer {}", token))
-        .header("OpenAI-Beta", "responses=experimental")
-        .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
-        .header("User-Agent", crate::codex_ua::codex_user_agent())
-        .header("session_id", &session_id)
-        .header("Accept", "text/event-stream")
-        .header("Content-Type", "application/json")
-        .json(&responses_body);
-    if let Some(aid) = account_id.as_deref() {
-        if !aid.is_empty() {
-            up = up.header("ChatGPT-Account-Id", aid);
+
+    // spark 偶尔"只 reasoning 不出 message"（空响应）—— 最多重试一次。
+    // 每次新 session_id，避免命中相同的空结果缓存。
+    let mut chat_resp = serde_json::Value::Null;
+    for attempt in 0..2 {
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut up = client
+            .post(format!("{}/responses", CHATGPT_ORIGIN))
+            .header("Authorization", format!("Bearer {}", token))
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
+            .header("User-Agent", crate::codex_ua::codex_user_agent())
+            .header("session_id", &sid)
+            .header("Accept", "text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&responses_body);
+        if let Some(aid) = account_id.as_deref() {
+            if !aid.is_empty() {
+                up = up.header("ChatGPT-Account-Id", aid);
+            }
         }
+        let resp = match up.send().await {
+            Ok(r) => r,
+            Err(e) => return error_response(StatusCode::BAD_GATEWAY, &format!("上游请求失败: {}", e)),
+        };
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let msg = crate::chat_inbound::extract_upstream_error(&raw)
+                .unwrap_or_else(|| format!("上游 HTTP {}", status.as_u16()));
+            return error_response(
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                &msg,
+            );
+        }
+        let parsed = crate::chat_inbound::responses_sse_to_chat(&raw, &model);
+        // 有内容或有 tool_calls 就用它；否则（空响应）再试一次
+        let msg = &parsed["choices"][0]["message"];
+        let has_content = msg.get("content").map(|c| !c.is_null()).unwrap_or(false);
+        let has_tools = msg.get("tool_calls").map(|t| t.is_array()).unwrap_or(false);
+        chat_resp = parsed;
+        if has_content || has_tools || attempt == 1 {
+            break;
+        }
+        println!("[ChatInbound] 空响应，重试一次（attempt {}）", attempt + 1);
     }
 
-    let resp = match up.send().await {
-        Ok(r) => r,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, &format!("上游请求失败: {}", e)),
-    };
-    let status = resp.status();
-    let raw = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = crate::chat_inbound::extract_upstream_error(&raw)
-            .unwrap_or_else(|| format!("上游 HTTP {}", status.as_u16()));
-        return error_response(
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            &msg,
-        );
+    if want_stream {
+        // stream=true：回 Chat Completions SSE，否则只认 SSE delta 的客户端（hermes）
+        // 拿到普通 JSON 解析不出内容 → content=None → 空响应误判。
+        let sse = crate::chat_inbound::chat_completion_to_sse(&chat_resp);
+        Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(full_body(Bytes::from(sse)))
+            .unwrap()
+    } else {
+        Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(full_body(Bytes::from(chat_resp.to_string())))
+            .unwrap()
     }
-
-    let chat_resp = crate::chat_inbound::responses_sse_to_chat(&raw, &model);
-    Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        .body(full_body(Bytes::from(chat_resp.to_string())))
-        .unwrap()
 }
 
 async fn handle_request(

@@ -139,7 +139,14 @@ pub fn chat_to_responses(chat: &Value, fallback_model: &str) -> Value {
         }
     }
 
-    // 有图 → 强制视觉模型（Spark/glm-4.5v 在 codex 端都不行）
+    // 别名映射：任何含 "spark" 的模型名 → 真 Spark 模型。这样客户端能用 **不含
+    // "codex" 的名字**（如 `spark-bridge`）来请求 Spark —— 绕开 hermes 那类「看到模型名
+    // 带 codex 就自动路由到原生 codex 账号、无视 base_url」的行为。glance 直接发
+    // gpt-5.3-codex-spark 也含 spark，映射到自己，无影响。
+    if model.to_lowercase().contains("spark") {
+        model = "gpt-5.3-codex-spark".to_string();
+    }
+    // 有图 → 强制视觉模型（Spark/glm-4.5v 在 codex 端都不支持图片）
     if has_image {
         model = VISION_MODEL.to_string();
     }
@@ -174,7 +181,8 @@ pub fn chat_to_responses(chat: &Value, fallback_model: &str) -> Value {
         "parallel_tool_calls": false,
         "store": false,
         "stream": true,
-        // 不带 reasoning 字段，避开多轮 encrypted_content 强校验
+        // codex 是推理模型：开 reasoning 它才会规划、该收尾时收尾（不开会无脑探索到上限）。
+        "reasoning": { "effort": "medium" },
         "include": ["reasoning.encrypted_content"],
     })
 }
@@ -182,6 +190,9 @@ pub fn chat_to_responses(chat: &Value, fallback_model: &str) -> Value {
 /// 把 Codex responses SSE 缓冲流组装成 OpenAI chat/completions JSON。
 pub fn responses_sse_to_chat(sse: &str, model: &str) -> Value {
     let mut text = String::new();
+    // 兜底：有些响应文本只走 output_text.done / output_item.done(message)，不走 delta。
+    let mut done_text = String::new();
+    let mut item_text = String::new();
     // function_call 累积：item_id → (name, call_id, arguments)
     let mut fc_args: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut tool_calls: Vec<Value> = Vec::new();
@@ -215,8 +226,26 @@ pub fn responses_sse_to_chat(sse: &str, model: &str) -> Value {
                     fc_args.entry(item_id.to_string()).or_default().push_str(delta);
                 }
             }
+            // output_text.done 带整段 text —— 作 delta 的兜底
+            Some("response.output_text.done") => {
+                if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+                    if !t.is_empty() {
+                        done_text.push_str(t);
+                    }
+                }
+            }
             Some("response.output_item.done") => {
                 if let Some(item) = v.get("item") {
+                    // message item：把 content[] 里的 output_text 抠出来当最终兜底
+                    if item.get("type").and_then(|t| t.as_str()) == Some("message") {
+                        if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
+                            for p in parts {
+                                if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
+                                    item_text.push_str(t);
+                                }
+                            }
+                        }
+                    }
                     if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
                         let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -263,16 +292,25 @@ pub fn responses_sse_to_chat(sse: &str, model: &str) -> Value {
         }
     }
 
+    // 最终文本：delta 累积优先，其次 output_text.done，再次 message item 的 content
+    let final_text = if !text.trim().is_empty() {
+        text
+    } else if !done_text.trim().is_empty() {
+        done_text
+    } else {
+        item_text
+    };
+
     let finish_reason = if !tool_calls.is_empty() {
         "tool_calls"
     } else {
         "stop"
     };
     let mut message = json!({"role": "assistant"});
-    message["content"] = if text.is_empty() {
+    message["content"] = if final_text.is_empty() {
         Value::Null
     } else {
-        Value::String(text)
+        Value::String(final_text)
     };
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
@@ -304,6 +342,59 @@ pub fn extract_upstream_error(raw: &str) -> Option<String> {
     None
 }
 
+/// 把组装好的非流式 chat.completion 转成 Chat Completions SSE（text/event-stream）。
+/// 一次性把缓冲好的整条回复拆成几个 chunk 重放，满足 hermes 等只认 SSE delta 的流式客户端。
+pub fn chat_completion_to_sse(chat: &Value) -> String {
+    let id = chat.get("id").and_then(|v| v.as_str()).unwrap_or("chatcmpl-glance-codex");
+    let model = chat.get("model").and_then(|v| v.as_str()).unwrap_or("gpt-5.3-codex-spark");
+    let created = chat.get("created").and_then(|v| v.as_u64()).unwrap_or(0);
+    let msg = &chat["choices"][0]["message"];
+    let finish = chat["choices"][0]
+        .get("finish_reason")
+        .cloned()
+        .unwrap_or(Value::String("stop".into()));
+
+    let chunk = |delta: Value, fin: Value| -> String {
+        let v = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{ "index": 0, "delta": delta, "finish_reason": fin }],
+        });
+        format!("data: {}\n\n", v)
+    };
+
+    let mut out = String::new();
+    // 1) 首包：role
+    out.push_str(&chunk(json!({ "role": "assistant" }), Value::Null));
+    // 2) content（若有）
+    if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
+        if !c.is_empty() {
+            out.push_str(&chunk(json!({ "content": c }), Value::Null));
+        }
+    }
+    // 3) tool_calls（若有）—— 整条带 index 一次发出
+    if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+        let with_index: Vec<Value> = tcs
+            .iter()
+            .enumerate()
+            .map(|(i, tc)| {
+                let mut tc = tc.clone();
+                if let Some(obj) = tc.as_object_mut() {
+                    obj.insert("index".into(), json!(i));
+                }
+                tc
+            })
+            .collect();
+        out.push_str(&chunk(json!({ "tool_calls": with_index }), Value::Null));
+    }
+    // 4) 收尾 + DONE
+    out.push_str(&chunk(json!({}), finish));
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,7 +415,7 @@ mod tests {
         assert_eq!(r["input"][0]["role"], "user");
         assert_eq!(r["tools"][0]["name"], "f");
         assert_eq!(r["stream"], true);
-        assert!(r.get("reasoning").is_none());
+        assert_eq!(r["reasoning"]["effort"], "medium");
     }
 
     #[test]
@@ -371,6 +462,31 @@ mod tests {
     }
 
     #[test]
+    fn spark_alias_maps_to_real_model() {
+        // hermes 用不含 codex 的别名 → 仍映射到真 spark
+        let chat = json!({"model":"spark-bridge","messages":[{"role":"user","content":"hi"}]});
+        let r = chat_to_responses(&chat, "fb");
+        assert_eq!(r["model"], "gpt-5.3-codex-spark");
+    }
+
+    #[test]
+    fn sse_to_chat_text_via_done_only() {
+        // 文本只走 output_text.done（无 delta）→ 仍能解析出 content
+        let sse = "data: {\"type\":\"response.output_text.done\",\"text\":\"仅 done 的回复\"}\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n";
+        let c = responses_sse_to_chat(sse, "m");
+        assert_eq!(c["choices"][0]["message"]["content"], "仅 done 的回复");
+    }
+
+    #[test]
+    fn sse_to_chat_text_via_message_item() {
+        // 文本只在 output_item.done 的 message content 里
+        let sse = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"item 里的回复\"}]}}\n";
+        let c = responses_sse_to_chat(sse, "m");
+        assert_eq!(c["choices"][0]["message"]["content"], "item 里的回复");
+    }
+
+    #[test]
     fn sse_to_chat_text_and_tool() {
         let sse = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\
                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\
@@ -381,5 +497,32 @@ mod tests {
         assert_eq!(c["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "f");
         assert_eq!(c["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(c["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn sse_chunks_carry_content_and_done() {
+        let chat = json!({
+            "id": "x", "model": "m",
+            "choices": [{"index":0,"message":{"role":"assistant","content":"hi there"},"finish_reason":"stop"}]
+        });
+        let sse = chat_completion_to_sse(&chat);
+        assert!(sse.contains("\"role\":\"assistant\""));
+        assert!(sse.contains("\"content\":\"hi there\""));
+        assert!(sse.contains("\"finish_reason\":\"stop\""));
+        assert!(sse.trim_end().ends_with("data: [DONE]"));
+    }
+
+    #[test]
+    fn sse_chunks_carry_tool_calls_with_index() {
+        let chat = json!({
+            "id": "x", "model": "m",
+            "choices": [{"index":0,"message":{"role":"assistant","content":null,
+                "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+                "finish_reason":"tool_calls"}]
+        });
+        let sse = chat_completion_to_sse(&chat);
+        assert!(sse.contains("\"tool_calls\""));
+        assert!(sse.contains("\"index\":0"));
+        assert!(sse.contains("\"finish_reason\":\"tool_calls\""));
     }
 }
