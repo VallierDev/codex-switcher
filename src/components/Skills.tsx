@@ -8,6 +8,7 @@ interface SkillApps {
     claude: boolean;
     gemini: boolean;
     opencode: boolean;
+    zcode: boolean;
 }
 
 interface InstalledSkill {
@@ -42,7 +43,7 @@ interface SkillRepo {
 
 type Tab = 'installed' | 'discover' | 'repos';
 
-const APPS = ['codex', 'claude', 'gemini', 'opencode'] as const;
+const APPS = ['codex', 'claude', 'gemini', 'opencode', 'zcode'] as const;
 
 export function Skills() {
     const [tab, setTab] = useState<Tab>('installed');

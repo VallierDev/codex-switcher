@@ -1,12 +1,11 @@
 //! Skills 管理模块
 //!
 //! SSOT 目录: ~/.codex/skills/
-//! 同步到: ~/.claude/skills/, ~/.gemini/skills/, ~/.config/opencode/skills/
+//! 同步到: ~/.claude/skills/, ~/.gemini/skills/, ~/.config/opencode/skills/, ~/.agents/skills/
 //! 数据存储: ~/.codex-switcher/skills.json
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 // ────────────────────────────────────────────────────────────────
@@ -19,6 +18,8 @@ pub struct SkillApps {
     pub claude: bool,
     pub gemini: bool,
     pub opencode: bool,
+    #[serde(default)]
+    pub zcode: bool,
 }
 
 impl Default for SkillApps {
@@ -28,6 +29,7 @@ impl Default for SkillApps {
             claude: false,
             gemini: false,
             opencode: false,
+            zcode: false,
         }
     }
 }
@@ -118,6 +120,7 @@ fn app_skills_dir(app: &str) -> Option<PathBuf> {
         "codex" => Some(home.join(".codex").join("skills")),
         "claude" => Some(home.join(".claude").join("skills")),
         "gemini" => Some(home.join(".gemini").join("skills")),
+        "zcode" => Some(home.join(".agents").join("skills")),
         "opencode" => {
             // Windows: %APPDATA%\opencode\skills, Unix: ~/.config/opencode/skills
             #[cfg(windows)]
@@ -176,7 +179,7 @@ pub fn init_ssot() -> Result<(), String> {
     }
 
     // 确保各 CLI 的 skills 目录是指向 SSOT 的 symlink
-    let apps = ["codex", "claude", "gemini", "opencode"];
+    let apps = ["codex", "claude", "gemini", "opencode", "zcode"];
     for app in &apps {
         link_app_to_ssot(app)?;
     }
@@ -209,6 +212,9 @@ fn link_app_to_ssot(app: &str) -> Result<(), String> {
                 .unwrap_or(false);
             if is_empty {
                 let _ = std::fs::remove_dir(&target);
+            } else if app == "zcode" {
+                migrate_existing_app_skills_to_ssot(app, &target, &ssot)?;
+                let _ = std::fs::remove_dir_all(&target);
             } else {
                 // 非空真实目录 → 不覆盖，用户可能有独立内容
                 println!("[Skills] {} skills 目录非空且不是 symlink，跳过", app);
@@ -256,6 +262,52 @@ fn link_app_to_ssot(app: &str) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+/// ZCode 的共享目录 ~/.agents/skills 可能已被独立安装过 skill。
+/// 启用共享时先并入 SSOT，再把目录替换成 symlink，避免丢失原有内容。
+fn migrate_existing_app_skills_to_ssot(
+    app: &str,
+    target: &std::path::Path,
+    ssot: &std::path::Path,
+) -> Result<(), String> {
+    let backup_root = dirs::home_dir()
+        .unwrap()
+        .join(".codex-switcher")
+        .join("skills-backup")
+        .join(format!("{}-{}", app, Utc::now().format("%Y%m%d%H%M%S")));
+
+    for entry in std::fs::read_dir(target).map_err(|e| format!("读取目录失败: {}", e))? {
+        let entry = entry.map_err(|e| format!("读取条目失败: {}", e))?;
+        let name = entry.file_name();
+        let src = entry.path();
+        let dst = ssot.join(&name);
+
+        if !dst.exists() {
+            if src.is_dir() {
+                copy_dir_recursive(&src, &dst)?;
+            } else {
+                if let Some(parent) = dst.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::copy(&src, &dst).map_err(|e| format!("复制文件失败: {}", e))?;
+            }
+            continue;
+        }
+
+        let backup = backup_root.join(&name);
+        if src.is_dir() {
+            copy_dir_recursive(&src, &backup)?;
+        } else {
+            if let Some(parent) = backup.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::copy(&src, &backup).map_err(|e| format!("备份文件失败: {}", e))?;
+        }
+    }
+
+    println!("[Skills] 已迁移 {} 现有 skills 到 SSOT", app);
     Ok(())
 }
 
@@ -347,7 +399,6 @@ impl SkillStore {
     /// 新架构：整个目录是 symlink，不需要 per-skill 同步
     pub fn toggle_app_link(app: &str, enabled: bool) -> Result<(), String> {
         let target = app_skills_dir(app).ok_or_else(|| format!("未知 app: {}", app))?;
-        let ssot = ssot_dir();
 
         if enabled {
             link_app_to_ssot(app)?;
@@ -380,7 +431,7 @@ impl SkillStore {
         let mut status = std::collections::HashMap::new();
         let ssot = ssot_dir();
 
-        for app in &["codex", "claude", "gemini", "opencode"] {
+        for app in &["codex", "claude", "gemini", "opencode", "zcode"] {
             let linked = if let Some(target) = app_skills_dir(app) {
                 if target.is_symlink() {
                     std::fs::read_link(&target)

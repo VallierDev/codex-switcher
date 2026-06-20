@@ -143,17 +143,40 @@ pub async fn refresh_access_token(refresh_token: &str) -> Result<TokenResponse, 
 
     // 关键：之前没 timeout，OpenAI 边缘把这个账号 hang 住时整条 quota 刷新永久卡死。
     // 15s 是经验值：正常 < 1s 完成，10s+ 基本可以判定为边缘节流/限流。
-    let response = token_client()
-        .post(TOKEN_URL)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        // 真 codex 的 token 请求走 default_client，必带 originator + UA；对齐之。
-        .header("User-Agent", crate::codex_ua::codex_user_agent())
-        .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
-        .timeout(Duration::from_secs(15))
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| format!("刷新令牌失败: {}", e))?;
+    //
+    // 网络重试：Server 经 192.168.2.250→38 出口到 auth.openai.com，send 层抖动
+    // （"error sending request" / 超时 / 连接重置）是常态。send 失败说明请求多半没到
+    // OpenAI、rt 没被消耗，重试是安全的；且能避免上层把网络抖动误判成 token 失效。
+    // 只对 send 层错误重试，HTTP 已返回（含 invalid_grant 拒绝）一律不重试。
+    let mut last_err = String::new();
+    let mut response = None;
+    for attempt in 0..3 {
+        match token_client()
+            .post(TOKEN_URL)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            // 真 codex 的 token 请求走 default_client，必带 originator + UA；对齐之。
+            .header("User-Agent", crate::codex_ua::codex_user_agent())
+            .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
+            .timeout(Duration::from_secs(15))
+            .form(&params)
+            .send()
+            .await
+        {
+            Ok(r) => {
+                response = Some(r);
+                break;
+            }
+            Err(e) => {
+                last_err = format!("刷新令牌失败: {}", e);
+                if attempt < 2 {
+                    // 200ms / 600ms 退避，避开瞬时抖动
+                    tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 * 2 + 1)))
+                        .await;
+                }
+            }
+        }
+    }
+    let response = response.ok_or(last_err)?;
 
     if !response.status().is_success() {
         let error_body = response.text().await.unwrap_or_default();

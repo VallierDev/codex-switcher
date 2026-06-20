@@ -1721,29 +1721,43 @@ async fn handle_request(
                 SilentRefreshOutcome::LoggedOut
                 | SilentRefreshOutcome::OtherError(_)
                 | SilentRefreshOutcome::NoRefreshToken => {
-                    let (mark_field, log_tag): (&str, &str) = match &outcome {
-                        SilentRefreshOutcome::LoggedOut => ("logged_out", "账号已登出/RT 被轮换"),
-                        SilentRefreshOutcome::NoRefreshToken => {
-                            ("token_invalid", "缺 refresh_token 无法刷新")
-                        }
-                        SilentRefreshOutcome::OtherError(_) => ("token_invalid", "刷新失败"),
+                    // 只有"明确的 auth 信号"才持久标记失效（铁律：网络层/容量/auth 抖动一律不标）：
+                    //   LoggedOut      = OAuth 端点明确 invalid_grant / 登出 → is_logged_out
+                    //   NoRefreshToken = 根本没 refresh_token，无法恢复     → is_token_invalid
+                    //   OtherError     = 网络抖动 / 429 / 5xx / 连不上 auth.openai.com（Server 经
+                    //                    192.168.2.250→38 出口，抖动是常态）→ 瞬时，绝不标记失效，
+                    //                    只切号让本次请求走通，账号状态保持原样（否则好号被误判"过期"）
+                    let mark_field: Option<&str> = match &outcome {
+                        SilentRefreshOutcome::LoggedOut => Some("logged_out"),
+                        SilentRefreshOutcome::NoRefreshToken => Some("token_invalid"),
+                        SilentRefreshOutcome::OtherError(_) => None,
                         _ => unreachable!(),
                     };
-                    println!(
-                        "[Proxy] silent_refresh 不可恢复（{}），标记 + 切号",
-                        log_tag
-                    );
-                    if let Ok(mut store) = state.store.lock() {
-                        if let Some(current_id) = store.current.clone() {
-                            if let Some(acc) = store.accounts.get_mut(&current_id) {
-                                if mark_field == "logged_out" {
-                                    acc.is_logged_out = true;
-                                } else {
-                                    acc.is_token_invalid = true;
+                    let log_tag = match &outcome {
+                        SilentRefreshOutcome::LoggedOut => "账号已登出/RT 被轮换".to_string(),
+                        SilentRefreshOutcome::NoRefreshToken => "缺 refresh_token 无法刷新".to_string(),
+                        SilentRefreshOutcome::OtherError(e) => format!("瞬时刷新失败: {}", e),
+                        _ => unreachable!(),
+                    };
+                    if let Some(field) = mark_field {
+                        println!("[Proxy] silent_refresh 不可恢复（{}），标记 + 切号", log_tag);
+                        if let Ok(mut store) = state.store.lock() {
+                            if let Some(current_id) = store.current.clone() {
+                                if let Some(acc) = store.accounts.get_mut(&current_id) {
+                                    if field == "logged_out" {
+                                        acc.is_logged_out = true;
+                                    } else {
+                                        acc.is_token_invalid = true;
+                                    }
+                                    let _ = store.save();
                                 }
-                                let _ = store.save();
                             }
                         }
+                    } else {
+                        println!(
+                            "[Proxy] silent_refresh 瞬时失败（{}），不标记失效，仅切号重试",
+                            log_tag
+                        );
                     }
                     if let Some(resp) = try_switch_and_retry(
                         &state,
@@ -2461,16 +2475,76 @@ async fn try_switch_and_retry(
                         continue;
                     }
                     BootstrappedForward::Unauthorized => {
-                        // 切到的新号 token 也失效了（refresh_token 已轮换或被吊销），
-                        // 标记 token_invalid 让 pick_next 跳过，继续找下一个
-                        println!("[Proxy] 第 {} 次切号目标号 token 失效", attempt + 1);
-                        if let Ok(mut store) = state.store.lock() {
-                            if let Some(acc) = store.accounts.get_mut(&id) {
-                                acc.is_token_invalid = true;
-                                let _ = store.save();
+                        // 切到的号 401：多半只是 access_token 过期（rt 还活着）——pick_next
+                        // 给的是 store 里的旧 access_token，切号前没刷新。先静默刷新这个号
+                        // （do_switch 后它已是 store.current）再重试一次；只有 OAuth 端点给出
+                        // 明确登出 / invalid_grant 才标记，网络 / 瞬时 / 跨 IP 吊销一律不标，
+                        // 避免把 rt 健康的好号误判成"过期"（团队/免费号被切号风暴扫射误伤）。
+                        match silent_refresh_current(state).await {
+                            SilentRefreshOutcome::Refreshed(fresh) => {
+                                match forward_and_bootstrap(
+                                    state,
+                                    method,
+                                    upstream_url,
+                                    &headers_no_ts,
+                                    &body_for_new,
+                                    &fresh,
+                                    session_key,
+                                )
+                                .await
+                                {
+                                    BootstrappedForward::Ok(resp) => {
+                                        println!(
+                                            "[Proxy] 第 {} 次切号目标号刷新后成功",
+                                            attempt + 1
+                                        );
+                                        return Some(resp);
+                                    }
+                                    _ => {
+                                        // 刷新出新 token 仍 401 = 瞬时/跨 IP 吊销，本轮跳过不标记
+                                        println!(
+                                            "[Proxy] 第 {} 次切号目标号刷新后仍 401（瞬时），跳过不标记",
+                                            attempt + 1
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            SilentRefreshOutcome::LoggedOut => {
+                                println!(
+                                    "[Proxy] 第 {} 次切号目标号已登出/RT 轮换，标记 is_logged_out",
+                                    attempt + 1
+                                );
+                                if let Ok(mut store) = state.store.lock() {
+                                    if let Some(acc) = store.accounts.get_mut(&id) {
+                                        acc.is_logged_out = true;
+                                        let _ = store.save();
+                                    }
+                                }
+                                continue;
+                            }
+                            SilentRefreshOutcome::NoRefreshToken => {
+                                println!(
+                                    "[Proxy] 第 {} 次切号目标号缺 refresh_token，标记 is_token_invalid",
+                                    attempt + 1
+                                );
+                                if let Ok(mut store) = state.store.lock() {
+                                    if let Some(acc) = store.accounts.get_mut(&id) {
+                                        acc.is_token_invalid = true;
+                                        let _ = store.save();
+                                    }
+                                }
+                                continue;
+                            }
+                            SilentRefreshOutcome::OtherError(e) => {
+                                println!(
+                                    "[Proxy] 第 {} 次切号目标号刷新瞬时失败（{}），跳过不标记",
+                                    attempt + 1,
+                                    e
+                                );
+                                continue;
                             }
                         }
-                        continue;
                     }
                     BootstrappedForward::Failed(e) => {
                         eprintln!("[Proxy] 切号后转发失败: {}", e);
@@ -2920,16 +2994,57 @@ async fn try_local_fallback(
             None
         }
         BootstrappedForward::Unauthorized => {
-            // 切到的回退号 token 也失效 → 标 is_token_invalid + save，
-            // 否则下一次 pick_next 又会同分挑到这个号，进入死循环。
-            println!("[Proxy] 本地回退账号 token 失效，标记 is_token_invalid");
-            if let Ok(mut store) = state.store.lock() {
-                if let Some(acc) = store.accounts.get_mut(&id) {
-                    acc.is_token_invalid = true;
-                    let _ = store.save();
+            // 回退号 401：多半只是 access_token 过期（pick_next 给的是旧 token，没刷新）。
+            // do_switch 后它已是 current，先静默刷新再重试一次；只有明确登出 / 缺 rt 才标记，
+            // 网络 / 瞬时一律不标，避免把 rt 健康的好号误判成"过期"。
+            match silent_refresh_current(state).await {
+                SilentRefreshOutcome::Refreshed(fresh) => {
+                    match forward_and_bootstrap(
+                        state,
+                        method,
+                        &upstream_url,
+                        &headers_no_ts,
+                        &body_for_new,
+                        &fresh,
+                        session_key,
+                    )
+                    .await
+                    {
+                        BootstrappedForward::Ok(resp) => {
+                            println!("[Proxy] 本地回退账号刷新后转发成功");
+                            Some(resp)
+                        }
+                        _ => {
+                            println!("[Proxy] 本地回退账号刷新后仍 401（瞬时），不标记");
+                            None
+                        }
+                    }
+                }
+                SilentRefreshOutcome::LoggedOut => {
+                    println!("[Proxy] 本地回退账号已登出/RT 轮换，标记 is_logged_out");
+                    if let Ok(mut store) = state.store.lock() {
+                        if let Some(acc) = store.accounts.get_mut(&id) {
+                            acc.is_logged_out = true;
+                            let _ = store.save();
+                        }
+                    }
+                    None
+                }
+                SilentRefreshOutcome::NoRefreshToken => {
+                    println!("[Proxy] 本地回退账号缺 refresh_token，标记 is_token_invalid");
+                    if let Ok(mut store) = state.store.lock() {
+                        if let Some(acc) = store.accounts.get_mut(&id) {
+                            acc.is_token_invalid = true;
+                            let _ = store.save();
+                        }
+                    }
+                    None
+                }
+                SilentRefreshOutcome::OtherError(e) => {
+                    println!("[Proxy] 本地回退账号刷新瞬时失败（{}），不标记", e);
+                    None
                 }
             }
-            None
         }
         BootstrappedForward::Failed(e) => {
             eprintln!("[Proxy] 本地回退转发失败: {}", e);
