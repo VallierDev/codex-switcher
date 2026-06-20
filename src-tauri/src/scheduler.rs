@@ -24,7 +24,6 @@ const ANCHOR_REFRESH_INTERVAL_SECS: u64 = 4 * 60;
 struct RefreshTarget {
     id: String,
     name: String,
-    refresh_token: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -33,10 +32,16 @@ struct RefreshFailedPayload {
     reason: String,
 }
 
-fn is_reused_or_revoked_error(reason: &str) -> bool {
+/// rt 被其他持有者(本机另一刷新路径 / 手机 Codex.app)抢先轮换 → **瞬时冲突，可恢复**：
+/// store 里早已是赢家写回的最新 rt，下一轮用最新 rt 即可自愈。绝不当死号/需重新登录。
+fn is_reused_error(reason: &str) -> bool {
+    reason.to_lowercase().contains("refresh_token_reused")
+}
+
+/// 真·失效：rt 被吊销 / 过期 / 账号停用 → 确实需要重新登录。
+fn is_revoked_error(reason: &str) -> bool {
     let lower = reason.to_lowercase();
-    lower.contains("refresh_token_reused")
-        || lower.contains("refresh_token_invalidated")
+    lower.contains("refresh_token_invalidated")
         || lower.contains("refresh_token_expired")
         || lower.contains("deactivated")
         || lower.contains("unauthorized")
@@ -138,6 +143,9 @@ pub fn start(
                     .accounts
                     .values()
                     .filter(|account| current != Some(account.id.as_str()))
+                    // anchor 账号由 start_anchor_refresh 独占保活，这里不碰，
+                    // 否则两条循环会对同一把一次性 rt 各刷各的 → reused 冲突
+                    .filter(|account| !account.is_session_anchor)
                     .filter(|account| {
                         AccountStore::should_refresh_inactive_account(
                             account,
@@ -145,14 +153,14 @@ pub fn start(
                         )
                     })
                     .filter_map(|account| {
-                        let rt = account
+                        // 仅作过滤：没 rt 的账号无法保活，跳过；rt 本身由 _fresh 在锁内重读
+                        account
                             .refresh_token
                             .clone()
                             .or_else(|| AccountStore::extract_refresh_token(&account.auth_json))?;
                         Some(RefreshTarget {
                             id: account.id.clone(),
                             name: account.name.clone(),
-                            refresh_token: rt,
                         })
                     })
                     .collect()
@@ -162,7 +170,7 @@ pub fn start(
             for target in targets {
                 println!("[Scheduler] 非活跃账号 {} 尝试保活刷新", target.name);
 
-                match oauth::refresh_access_token_locked(&target.id, &target.refresh_token).await {
+                match oauth::refresh_access_token_locked_fresh(&store, &target.id).await {
                     Ok(tokens) => {
                         let mut store = store.lock().unwrap();
                         if store.current.as_deref() == Some(target.id.as_str()) {
@@ -204,8 +212,14 @@ pub fn start(
                         let reason = err;
                         let mut store = store.lock().unwrap();
                         store.mark_keepalive_attempt_failed(&target.id, reason.clone());
-                        if is_reused_or_revoked_error(&reason) || is_logged_out_error(&reason) {
-                            // 风险保护：检测到 reused/revoked 后，自动停用该账号的非活跃保活，避免重复消耗。
+                        // 只有"真失效"才停用保活 + 标记 + 弹窗：
+                        //   logged_out / revoked = rt 真的没了 → 需重新登录
+                        //   reused = rt 被抢先轮换的瞬时冲突，store 已是最新 rt，下轮自愈 → 绝不停用/不标记
+                        //   其它(网络/429/5xx/超时) = 瞬时 → 不标记
+                        let fatal =
+                            is_logged_out_error(&reason) || is_revoked_error(&reason);
+                        if fatal {
+                            // 风险保护：真失效才停用该账号的非活跃保活，避免重复消耗。
                             let _ = store.set_inactive_refresh_enabled(&target.id, false);
                             if let Some(account) = store.accounts.get_mut(&target.id) {
                                 if is_logged_out_error(&reason) {
@@ -214,6 +228,11 @@ pub fn start(
                                     account.is_token_invalid = true;
                                 }
                             }
+                        } else if is_reused_error(&reason) {
+                            println!(
+                                "[Scheduler] {} 保活遇 rt 轮换冲突(reused)，瞬时跳过，不停用不标记",
+                                target.name
+                            );
                         }
                         let _ = store.save();
                         has_failure_event = true;
@@ -222,13 +241,16 @@ pub fn start(
                             target.name, reason
                         );
 
-                        let _ = app_handle.emit(
-                            "token-refresh-failed",
-                            RefreshFailedPayload {
-                                account_name: target.name,
-                                reason,
-                            },
-                        );
+                        // reused / 网络瞬时不打扰用户，只有真失效才弹"刷新失败"
+                        if fatal {
+                            let _ = app_handle.emit(
+                                "token-refresh-failed",
+                                RefreshFailedPayload {
+                                    account_name: target.name,
+                                    reason,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -250,10 +272,12 @@ pub fn start(
 ///
 /// **触发条件**：store 里存在 `is_session_anchor = true` 的账号。无 anchor 时此 tick 空转。
 ///
-/// **与 main scheduler 关系**：互不阻塞、互不重复。
-/// - main scheduler 用 `should_refresh_inactive_account`（天级粒度），不适合 anchor
-/// - anchor 这里强制 4 min 跑一次；如果 anchor == current 且 main scheduler 也想刷，
-///   `oauth::refresh_access_token` 是幂等可重入的（每次都拿新 rt），这里抢到先就给它写
+/// **与 main scheduler 关系**：每个号同时只有一个主动刷新者（按状态分区），互不抢 rt。
+/// - main scheduler 的 inactive 保活**显式跳过 anchor 账号**（anchor 由这里独占）
+/// - anchor 4 min 跑一次：**anchor == current** 时绝不 rotate（当前号由请求/额度路径维护），
+///   只重新落盘 extended_expiry 保护手机；**anchor != current** 时才由这里 rotate + 落盘。
+///   注意：OpenAI 的 rt 是一次性轮换，`refresh_access_token` **不是**幂等的——两条路径
+///   同时拿各自捕获的旧 rt 去刷必然 reused，所以才要"单刷新者 + 锁内重读最新 rt"。
 /// - remote_mode == "client" | "solo" 时跳过：client 由 `start_fast_auth_sync`
 ///   从 Server 拉；solo 本机虽然跑 codex 但 rt 仍委托 Server（solo 是临时模式）
 pub fn start_anchor_refresh(
@@ -296,7 +320,7 @@ pub fn start_anchor_refresh(
                 continue;
             }
 
-            let Some(rt) = anchor_rt else {
+            let Some(_rt) = anchor_rt else {
                 eprintln!(
                     "[AnchorRefresh] anchor 账号 {} 缺 refresh_token，无法保活（需要重新登录）",
                     anchor_name
@@ -304,8 +328,39 @@ pub fn start_anchor_refresh(
                 continue;
             };
 
-            // 2) 刷新 token
-            match oauth::refresh_access_token_locked(&anchor_id, &rt).await {
+            // 1.5) anchor == current：当前号的 token 已由请求路径/额度刷新按需维护，
+            // anchor 这里**绝不再 rotate**（否则就是和它们抢同一把一次性 rt → reused）。
+            // 只把当前 token 重新按 +24h extended_expiry 落盘，让手机 Codex.app 不自刷。
+            // 真正 rotate 在该号不再是 current（变成"非活跃手机专用号"）时才由这里接手。
+            let restamp_value = {
+                let s = match store.lock() {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                if s.current.as_deref() == Some(anchor_id.as_str()) {
+                    s.accounts
+                        .get(&anchor_id)
+                        .filter(|acc| acc.is_session_anchor)
+                        .map(|acc| acc.to_codex_auth_value())
+                } else {
+                    None
+                }
+            };
+            if let Some(v) = restamp_value {
+                match AccountStore::write_codex_auth_extended_expiry(&v) {
+                    Ok(_) => println!(
+                        "[AnchorRefresh] anchor {} == current，跳过 rotate，仅按 extended_expiry 落盘保护手机",
+                        anchor_name
+                    ),
+                    Err(e) => eprintln!("[AnchorRefresh] (anchor==current) 落盘失败: {}", e),
+                }
+                crate::proxy::invalidate_remote_token_cache();
+                continue;
+            }
+
+            // 2) anchor != current：anchor 是该号唯一保活者，刷新 token
+            // （_fresh：锁内重读最新 rt，避免与 proxy 按需刷新撞 reused）
+            match oauth::refresh_access_token_locked_fresh(&store, &anchor_id).await {
                 Ok(tokens) => {
                     // 3a) 写回 store
                     let auth_value = {
@@ -354,10 +409,15 @@ pub fn start_anchor_refresh(
                         "[AnchorRefresh] ❌ anchor {} 保活失败: {}",
                         anchor_name, reason
                     );
-                    // rt 失效是致命情况：手机 bridge 会跟着断。标记账号 token_invalid，
-                    // 让 UI 弹出"重新登录 anchor"提示
-                    if is_reused_or_revoked_error(&reason) || is_logged_out_error(&reason)
-                    {
+                    // reused = rt 被抢先轮换的瞬时冲突（store 已是最新 rt，下轮锁内重读即自愈），
+                    // 不是真失效 → 绝不标记/弹窗（这正是 nimeitao 反复"需重新登录、刷新就好"的元凶）。
+                    // 只有 logged_out / revoked（rt 真没了，手机 bridge 会跟着断）才标记并提示重登。
+                    if is_reused_error(&reason) {
+                        println!(
+                            "[AnchorRefresh] anchor {} 遇 rt 轮换冲突(reused)，瞬时跳过，不标记",
+                            anchor_name
+                        );
+                    } else if is_logged_out_error(&reason) || is_revoked_error(&reason) {
                         if let Ok(mut store) = store.lock() {
                             if let Some(account) = store.accounts.get_mut(&anchor_id) {
                                 if is_logged_out_error(&reason) {

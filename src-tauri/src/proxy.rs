@@ -953,6 +953,21 @@ fn mark_current_banned(state: &ProxyState) {
     }
 }
 
+/// Spark 模型 id（chat_inbound 已把所有 spark 别名归一到这个）。
+const SPARK_MODEL_ID: &[u8] = b"gpt-5.3-codex-spark";
+
+/// 请求是否针对 Spark 模型。Spark 是 **Pro 专属的独立子限额**（accounts.json
+/// cached_quota.spark），跟基础 5h/周额度是两个池子；gpt-5.5 等走的是基础额度。
+/// 所以 Spark 请求 429 只代表 Spark 耗尽，**绝不能据此判定整个账号没额度而切号**——
+/// 否则会把同账号上正常的 gpt-5.5 会话一起踢到没额度的号上（用户报的"任务停"根因）。
+/// 直接扫 body 里的精确模型 id（chat_inbound 已归一），不解析大 body。
+fn request_is_spark_model(body: &[u8]) -> bool {
+    body.len() >= SPARK_MODEL_ID.len()
+        && body
+            .windows(SPARK_MODEL_ID.len())
+            .any(|w| w == SPARK_MODEL_ID)
+}
+
 /// 429 后标记当前账号的 5h 额度为耗尽
 /// 标记指定账号的 5h 额度为耗尽
 fn mark_account_quota_depleted(state: &ProxyState, account_id: &str) {
@@ -1940,6 +1955,17 @@ async fn handle_request(
                 .body(full_body(resp_bytes))
                 .unwrap_or_else(|_| error_response(StatusCode::TOO_MANY_REQUESTS, "429")));
         }
+        // Spark 模型 429 = Pro 专属子限额耗尽，与基础额度无关：**不切号、不标耗尽**，
+        // 原样把 429 透回给 Spark 调用方（glance/hermes）。否则会把当前账号误判成没额度
+        // 切走，连带把同账号上正常的 gpt-5.5 会话踢到没额度的号 → 任务停。
+        if request_is_spark_model(&body_bytes) {
+            println!("[Proxy] Spark 模型 429（Pro 子限额耗尽），不切号，原样透回 429");
+            return Ok(Response::builder()
+                .status(429)
+                .header("content-type", "application/json")
+                .body(full_body(resp_bytes))
+                .unwrap_or_else(|_| error_response(StatusCode::TOO_MANY_REQUESTS, "429")));
+        }
         let body_lower = String::from_utf8_lossy(&resp_bytes).to_lowercase();
         let is_capacity = body_lower.contains("server_is_overloaded")
             || body_lower.contains("slow_down")
@@ -2825,6 +2851,15 @@ async fn forward_to_server_with_silent_retry(
     // requests" —— Team/组织管理员设的用量上限文案
     // ("You've hit your usage limit. ... send a request to your admin ...") 的 code
     // 不一定是 usage_limit_reached，必须靠 message 文本兜底，否则不切号。
+    //
+    // Spark 请求例外：Spark 是 Pro 专属子限额，跟基础额度是两个池子。它的 429 不该触发
+    // 切号（Server 端 handle_request 也对 spark 429 原样透回），这里把 max_retries 归零，
+    // 只 forward 一次、不调 /switch，直接把 429 透回 Spark 调用方。
+    let max_retries = if request_is_spark_model(body) {
+        0
+    } else {
+        max_retries
+    };
     for attempt in 0..=max_retries {
         let mini_resp =
             match forward_to_server_parts(state, method, path_and_query, req_headers, body).await {
@@ -5052,6 +5087,11 @@ async fn bridge_websockets<S1, S2>(
     let ws_session_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let ws_session_key_w = ws_session_key.clone();
 
+    // 本 WS 会话是否在请求 Spark 模型（client→upstream 首帧里嗅探）。Spark 429 不该切号。
+    let ws_is_spark = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ws_is_spark_w = ws_is_spark.clone();
+    let ws_is_spark_r = ws_is_spark.clone();
+
     // 诊断：每边的帧计数，用于定位"bridge 立刻退出"（Broken pipe 重连噪声）。
     let c2u_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let u2c_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -5078,6 +5118,12 @@ async fn bridge_websockets<S1, S2>(
                     }
                     // 嗅探 client→upstream 的 JSON 文本，提取 session_key（首次命中即固定）
                     if let tungstenite::Message::Text(ref t) = msg {
+                        // 标记 Spark 模型会话：它的 429 不该触发切号（见 request_is_spark_model）
+                        if !ws_is_spark_w.load(std::sync::atomic::Ordering::Relaxed)
+                            && request_is_spark_model(t.as_bytes())
+                        {
+                            ws_is_spark_w.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         if ws_session_key_w
                             .lock()
                             .map(|g| g.is_none())
@@ -5187,6 +5233,12 @@ async fn bridge_websockets<S1, S2>(
                         if is_capacity_only {
                             println!(
                                 "[Proxy] WebSocket 上游容量满（全局过载），关 WS 不切号 → 等 codex App 重连"
+                            );
+                        } else if ws_is_spark_r.load(std::sync::atomic::Ordering::Relaxed) {
+                            // Spark 模型 429 = Pro 子限额耗尽，与基础额度无关：不切号、不标耗尽，
+                            // 只关这条 Spark WS，别把同账号上正常的 gpt-5.5 会话踢走。
+                            println!(
+                                "[Proxy] WebSocket Spark 模型 429（Pro 子限额耗尽），不切号，仅关此 Spark WS"
                             );
                         } else {
                             println!("[Proxy] WebSocket 单号限额，静默切号 + 关 WS");

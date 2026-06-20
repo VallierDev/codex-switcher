@@ -132,6 +132,51 @@ pub async fn refresh_access_token_locked(
     refresh_access_token(refresh_token).await
 }
 
+/// store-aware 锁保护刷新：拿锁后**在锁内重新读取最新 rt**，而不是用调用方预先捕获的
+/// rt。这样杜绝"调用方在排队等锁期间，rt 已被另一个刷新者(quota/keepalive/anchor/proxy)
+/// 轮换掉，自己却仍用旧 rt → `refresh_token_reused`"的同机竞态。成功后在锁内把新 token
+/// 写回 store，保证下一个等锁者读到最新 rt。Server 端周期性 rt 旋转(keepalive/anchor)都该用它。
+pub async fn refresh_access_token_locked_fresh(
+    store: &Arc<StdMutex<crate::account::AccountStore>>,
+    account_id: &str,
+) -> Result<TokenResponse, String> {
+    let lock = rt_lock_for(account_id);
+    let _guard = lock.lock().await;
+
+    // 锁内读最新 rt（不持锁过 await：读完即释放 store 锁再发网络请求）
+    let rt = {
+        let s = store.lock().map_err(|_| "store 锁中毒".to_string())?;
+        let acc = s
+            .accounts
+            .get(account_id)
+            .ok_or_else(|| "账号不存在".to_string())?;
+        acc.refresh_token
+            .clone()
+            .or_else(|| crate::account::AccountStore::extract_refresh_token(&acc.auth_json))
+            .ok_or_else(|| "缺 refresh_token".to_string())?
+    };
+
+    let res = refresh_access_token(&rt).await;
+
+    // 成功则锁内写回，串行化的下一个调用就能读到最新 rt
+    if let Ok(ref tokens) = res {
+        if let Ok(mut s) = store.lock() {
+            if let Some(acc) = s.accounts.get_mut(account_id) {
+                crate::account::AccountStore::apply_refreshed_tokens(
+                    acc,
+                    tokens.access_token.clone(),
+                    tokens.refresh_token.clone(),
+                    tokens.id_token.clone(),
+                    tokens.expires_in,
+                );
+                let _ = s.save();
+            }
+        }
+    }
+
+    res
+}
+
 /// 使用刷新令牌获取新访问令牌
 pub async fn refresh_access_token(refresh_token: &str) -> Result<TokenResponse, String> {
     let params = [
