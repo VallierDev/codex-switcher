@@ -202,9 +202,17 @@ async fn silent_refresh_current(state: &ProxyState) -> SilentRefreshOutcome {
         }
         Err(e) => {
             let lower = e.to_lowercase();
+            // 「session 结束 / rt 被作废」= 刷新也救不回，必须重新登录 → 当 LoggedOut(需重登)。
+            // 注意 refresh_token_reused 不在此列：那是瞬时轮换冲突，归 OtherError 自愈。
             if lower.contains("logged out")
                 || lower.contains("invalid_grant")
                 || lower.contains("signed in to another account")
+                || lower.contains("refresh_token_invalidated")
+                || lower.contains("refresh_token_expired")
+                || lower.contains("session has ended")
+                || lower.contains("session_expired")
+                || lower.contains("please log in again")
+                || lower.contains("please sign in again")
             {
                 SilentRefreshOutcome::LoggedOut
             } else {
@@ -264,6 +272,10 @@ struct ProxyState {
     session_affinity: Arc<SessionAffinity>,
     /// 用户级硬路由：session_id → account 强绑定
     session_routes: Arc<Mutex<SessionRoutesStore>>,
+    /// 429 冷却：account_id → 冷却到期的 epoch 秒。撞 429 的号在此之前不再被选中，
+    /// 避免「5min 额度刷新把 cached 5h 重置回 99% → 立刻又被选中 → 又 429」的来回切号风暴
+    /// （cached 5h% 不反映某些模型的真实限额，所以不能只信它）。
+    quota_cooldown: Arc<Mutex<std::collections::HashMap<String, i64>>>,
 }
 
 /// 启动代理服务器
@@ -310,6 +322,7 @@ pub fn start(
             switch_logger,
             session_affinity,
             session_routes,
+            quota_cooldown: Arc::new(Mutex::new(std::collections::HashMap::new())),
         });
 
         loop {
@@ -824,7 +837,17 @@ fn pick_next_account(state: &ProxyState) -> PickResult {
         };
     }
 
-    let (id, _, _) = &candidates[0];
+    // 优先跳过刚撞过 429 的号（cached 5h% 不反映某些模型真实限额，靠冷却兜底）；
+    // 若所有候选都在冷却期，退回原列表，别因冷却把池子饿空。
+    let filtered: Vec<&(String, String, f64)> = candidates
+        .iter()
+        .filter(|(id, _, _)| !is_in_cooldown(state, id))
+        .collect();
+    let id = if filtered.is_empty() {
+        &candidates[0].0
+    } else {
+        &filtered[0].0
+    };
     if let Some(account) = store.accounts.get(id) {
         if let Some(token) = AccountStore::extract_access_token(&account.auth_json) {
             return PickResult::Found {
@@ -968,10 +991,34 @@ fn request_is_spark_model(body: &[u8]) -> bool {
             .any(|w| w == SPARK_MODEL_ID)
 }
 
-/// 429 后标记当前账号的 5h 额度为耗尽
-/// 标记指定账号的 5h 额度为耗尽
+/// 429 冷却时长（秒）：撞限额后多久内不再选中该号。10min 足以打断「5min 额度刷新
+/// 把 cached 重置 → 立刻又选中 → 又 429」的来回切号；真没额度的号 10min 后再试也无妨。
+const QUOTA_COOLDOWN_SECS: i64 = 600;
+
+/// 把某号加入 429 冷却。
+fn cooldown_account(state: &ProxyState, account_id: &str) {
+    let until = Utc::now().timestamp() + QUOTA_COOLDOWN_SECS;
+    if let Ok(mut cd) = state.quota_cooldown.lock() {
+        cd.insert(account_id.to_string(), until);
+    }
+}
+
+/// 该号当前是否在 429 冷却期内（顺便清掉过期项）。
+fn is_in_cooldown(state: &ProxyState, account_id: &str) -> bool {
+    let now = Utc::now().timestamp();
+    if let Ok(mut cd) = state.quota_cooldown.lock() {
+        cd.retain(|_, &mut until| until > now);
+        return cd.get(account_id).map(|&u| u > now).unwrap_or(false);
+    }
+    false
+}
+
+/// 429 后标记某号 5h 额度耗尽 + 冷却它。
+/// 注意：**每个号(每个 seat/登录)是独立额度**——即使同一 chatgpt_account_id(同团队 workspace)
+/// 也是各算各的。所以冷却只针对当前这个号，绝不按 account_id 连坐冷却别的 seat。
 fn mark_account_quota_depleted(state: &ProxyState, account_id: &str) {
     state.session_affinity.invalidate_account(account_id);
+    cooldown_account(state, account_id);
     if let Ok(mut store) = state.store.lock() {
         if let Some(account) = store.accounts.get_mut(account_id) {
             if let Some(ref mut q) = account.cached_quota {
@@ -983,15 +1030,21 @@ fn mark_account_quota_depleted(state: &ProxyState, account_id: &str) {
 }
 
 fn mark_current_quota_depleted(state: &ProxyState) {
+    let current_id = match state.store.lock() {
+        Ok(s) => s.current.clone(),
+        Err(_) => None,
+    };
+    let Some(current_id) = current_id else {
+        return;
+    };
+    state.session_affinity.invalidate_account(&current_id);
+    cooldown_account(state, &current_id);
     if let Ok(mut store) = state.store.lock() {
-        if let Some(current_id) = store.current.clone() {
-            state.session_affinity.invalidate_account(&current_id);
-            if let Some(account) = store.accounts.get_mut(&current_id) {
-                if let Some(ref mut q) = account.cached_quota {
-                    q.five_hour_left = 0.0;
-                }
-                let _ = store.save();
+        if let Some(account) = store.accounts.get_mut(&current_id) {
+            if let Some(ref mut q) = account.cached_quota {
+                q.five_hour_left = 0.0;
             }
+            let _ = store.save();
         }
     }
 }

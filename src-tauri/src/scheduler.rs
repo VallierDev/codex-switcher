@@ -38,19 +38,25 @@ fn is_reused_error(reason: &str) -> bool {
     reason.to_lowercase().contains("refresh_token_reused")
 }
 
-/// 真·失效：rt 被吊销 / 过期 / 账号停用 → 确实需要重新登录。
+/// 账号停用等真失效（标 is_token_invalid「过期」）。注意 rt 被作废 / session 结束的那批
+/// 走 is_logged_out_error（标「需重新登录」），不在这里。
 fn is_revoked_error(reason: &str) -> bool {
     let lower = reason.to_lowercase();
-    lower.contains("refresh_token_invalidated")
-        || lower.contains("refresh_token_expired")
-        || lower.contains("deactivated")
-        || lower.contains("unauthorized")
-        || lower.contains("invalid_grant")
+    lower.contains("deactivated") || lower.contains("unauthorized")
 }
 
+/// 需要重新登录：session 结束 / rt 被作废 / 被顶号——刷新也救不回，只能重登（标 is_logged_out）。
 fn is_logged_out_error(reason: &str) -> bool {
     let lower = reason.to_lowercase();
-    lower.contains("logged out") || lower.contains("signed in to another account")
+    lower.contains("logged out")
+        || lower.contains("signed in to another account")
+        || lower.contains("refresh_token_invalidated")
+        || lower.contains("refresh_token_expired")
+        || lower.contains("session has ended")
+        || lower.contains("session_expired")
+        || lower.contains("please log in again")
+        || lower.contains("please sign in again")
+        || lower.contains("invalid_grant")
 }
 
 /// 启动后台状态同步调度器
