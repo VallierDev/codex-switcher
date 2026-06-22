@@ -2215,7 +2215,7 @@ pub fn start_quota_refresh(
             for (id, name) in &targets {
                 println!("[QuotaRefresh] 刷新 {} ...", name);
 
-                let (at, aid, rt) = {
+                let (at, aid, rt, is_uid_dup) = {
                     let s = store.lock().unwrap();
                     let acc = match s.accounts.get(id) {
                         Some(a) => a,
@@ -2225,12 +2225,22 @@ pub fn start_quota_refresh(
                         AccountStore::extract_access_token(&acc.auth_json),
                         AccountStore::extract_account_id(&acc.auth_json),
                         acc.refresh_token.clone(),
+                        s.is_secondary_uid_duplicate(id),
                     )
                 };
 
-                // 没有 access_token 先用 refresh_token 换
+                // 没有 access_token 先用 refresh_token 换。
+                // 但同 uid 的次要副本绝不在这里 rotate rt——否则会把同 user 主号的 rt 家族轮废
+                // (reused)。副本没缓存 at 就跳过本轮额度刷新，等它被切为当前号时再按需刷新。
                 let access_token = match at {
                     Some(t) => t,
+                    None if is_uid_dup => {
+                        println!(
+                            "[QuotaRefresh] {} 是同 uid 次要副本且无缓存 token，跳过(不 rotate rt 防互相轮废)",
+                            name
+                        );
+                        continue;
+                    }
                     None => {
                         if let Some(ref rt_val) = rt {
                             match crate::oauth::refresh_access_token_locked(id, rt_val).await {

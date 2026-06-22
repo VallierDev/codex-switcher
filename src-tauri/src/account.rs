@@ -1424,6 +1424,44 @@ impl AccountStore {
             .map(|s| s.to_string())
     }
 
+    /// 同 uid（同一 OpenAI 用户）有多条账号时，判断 `account_id` 是否是"次要副本"。
+    /// 同一 user 的多个 grant（如个人 free 空间 + team 空间）共用一条 refresh-token 轮换家族——
+    /// 若多条都跑后台刷新会互相把对方 rt 轮废（reused → invalidated）。所以后台保活/额度刷新
+    /// 只动"主号"，次要副本返回 true、跳过不碰 rt。
+    /// 主号挑选优先级：当前号 → last_used 最新 → created_at 最新 → id 字典序。
+    pub fn is_secondary_uid_duplicate(&self, account_id: &str) -> bool {
+        let uid = match self
+            .accounts
+            .get(account_id)
+            .and_then(|a| Self::extract_openai_user_id(&a.auth_json))
+        {
+            Some(u) if !u.is_empty() => u,
+            _ => return false,
+        };
+        let group: Vec<&Account> = self
+            .accounts
+            .values()
+            .filter(|a| {
+                Self::extract_openai_user_id(&a.auth_json).as_deref() == Some(uid.as_str())
+            })
+            .collect();
+        if group.len() <= 1 {
+            return false;
+        }
+        let primary = group.iter().max_by(|a, b| {
+            let ca = self.current.as_deref() == Some(a.id.as_str());
+            let cb = self.current.as_deref() == Some(b.id.as_str());
+            ca.cmp(&cb)
+                .then_with(|| a.last_used.cmp(&b.last_used))
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        match primary {
+            Some(p) => p.id.as_str() != account_id,
+            None => false,
+        }
+    }
+
     /// 账号身份是否一致（优先 account_id，其次 openai user id）
     pub fn auth_identity_matches(local_auth: &Value, external_auth: &Value) -> bool {
         let local_account_id = Self::extract_account_id(local_auth);

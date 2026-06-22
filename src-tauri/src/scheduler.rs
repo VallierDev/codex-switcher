@@ -152,6 +152,8 @@ pub fn start(
                     // anchor 账号由 start_anchor_refresh 独占保活，这里不碰，
                     // 否则两条循环会对同一把一次性 rt 各刷各的 → reused 冲突
                     .filter(|account| !account.is_session_anchor)
+                    // 同 uid 多条只刷主号：次要副本不碰 rt，避免同一 user 的 rt 家族被互相轮废
+                    .filter(|account| !store.is_secondary_uid_duplicate(&account.id))
                     .filter(|account| {
                         AccountStore::should_refresh_inactive_account(
                             account,
