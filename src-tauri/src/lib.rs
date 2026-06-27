@@ -1478,6 +1478,7 @@ async fn switch_account(
             account_id,
             refresh_token,
             false,
+            Some(target_id.to_string()),
         )
         .await
         {
@@ -2270,7 +2271,7 @@ pub fn start_quota_refresh(
                     }
                 };
 
-                match usage::UsageFetcher::fetch_usage_direct(access_token, aid, rt, false).await {
+                match usage::UsageFetcher::fetch_usage_direct(access_token, aid, rt, false, Some(id.to_string())).await {
                     Ok((usage, _)) => {
                         let email_for_snap = if let Ok(s) = store.lock() {
                             s.accounts
@@ -2595,7 +2596,7 @@ async fn get_quota_internal(state: &AppState, id: String) -> Result<UsageDisplay
 
     // client/solo 模式禁止 fetch_usage_direct 内部本地 rt 刷新（usage.rs:102）
     let result =
-        UsageFetcher::fetch_usage_direct(access_token, account_id, refresh_token, !is_client_or_solo).await;
+        UsageFetcher::fetch_usage_direct(access_token, account_id, refresh_token, !is_client_or_solo, Some(id.to_string())).await;
 
     // 检测封号/失效：分开标记
     if let Err(ref e) = result {
@@ -3110,6 +3111,7 @@ async fn get_quota_by_id(
         account_id,
         refresh_token,
         !is_client_or_solo, // client/solo 禁本地 refresh，其它模式 allow
+        Some(id.to_string()),
     )
     .await;
 

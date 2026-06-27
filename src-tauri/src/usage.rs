@@ -84,6 +84,9 @@ impl UsageFetcher {
         account_id: Option<String>,
         refresh_token: Option<String>,
         allow_local_refresh: bool,
+        // seat 级唯一锁键（= store 账号 id）。team 多成员共用同一 chatgpt_account_id，
+        // 必须用 seat id 当 rt 刷新锁键，才能跟 proxy / 后台 / scheduler 走同一把锁。
+        refresh_lock_key: Option<String>,
     ) -> Result<(UsageDisplay, Option<crate::oauth::TokenResponse>), String> {
         let mut current_token = access_token;
         let mut new_tokens: Option<crate::oauth::TokenResponse> = None;
@@ -118,11 +121,16 @@ impl UsageFetcher {
         // 注意：rt 旋转走 _locked 串行化，同账号并发自动排队不撞 race
         if allow_local_refresh && (status == 401 || status == 403) && refresh_token.is_some() {
             if let Some(ref rt) = refresh_token {
-                // 锁 key 优先 account_id（最稳定 = OpenAI workspace id），缺时退到 rt
-                // 前缀（rt 跟 OpenAI account 1:1 绑定，唯一性够用，只是切号轮换后失效）
-                let lock_key = account_id.clone().unwrap_or_else(|| {
-                    format!("rt:{}", &rt[..rt.len().min(16)])
-                });
+                // 锁 key 必须 seat 级唯一（= store 账号 id），保证「同一 seat 的 rt 旋转」
+                // 跟 proxy / 后台 QuotaRefresh / scheduler 走同一把锁串行化。
+                // 绝不能用 chatgpt_account_id：team 多成员共用同一 workspace id，会让不同
+                // seat 的刷新撞不到同一把锁 → 跨路径并发刷同一 rt → refresh_token_reused →
+                // 整条 rt 家族被 OpenAI 吊销而死号。seat key 缺失才退到 account_id / rt 前缀。
+                let lock_key = refresh_lock_key
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| account_id.clone())
+                    .unwrap_or_else(|| format!("rt:{}", &rt[..rt.len().min(16)]));
                 match crate::oauth::refresh_access_token_locked(&lock_key, rt).await {
                     Ok(token_res) => {
                         current_token = token_res.access_token.clone();
@@ -137,13 +145,25 @@ impl UsageFetcher {
                     }
                     Err(e) => {
                         let lower = e.to_lowercase();
+                        // 终态（rt 真失效 / session 结束）→ 标"需重新登录"
                         if lower.contains("logged out")
                             || lower.contains("signed in to another account")
                             || lower.contains("invalid_grant")
+                            || lower.contains("refresh_token_invalidated")
+                            || lower.contains("refresh_token_expired")
+                            || lower.contains("session has ended")
+                            || lower.contains("session_expired")
                         {
                             return Err("ACCOUNT_LOGGED_OUT:您已登出或登录了其他账号，请重新登录"
                                 .to_string());
                         }
+                        // 瞬时（refresh_token_reused 轮换冲突 / 网络抖动 / 边缘节流）：
+                        // 绝不翻 is_token_invalid。早退一个非终态错误（不含 TOKEN_INVALID
+                        // 前缀），交给下一轮配额刷新 / proxy 自愈。
+                        return Err(format!(
+                            "TOKEN_REFRESH_TRANSIENT:刷新瞬时失败(reused/网络)，不标记失效: {}",
+                            e
+                        ));
                     }
                 }
             }

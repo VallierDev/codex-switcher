@@ -1462,8 +1462,31 @@ impl AccountStore {
         }
     }
 
-    /// 账号身份是否一致（优先 account_id，其次 openai user id）
+    /// 账号身份是否一致（seat 级）。
+    ///
+    /// **user_id 优先**：team 多成员共用同一 `chatgpt_account_id`(workspace)，只比
+    /// account_id 会把不同成员判成同号 → sync 时把兄弟 seat 的 rt 串过来 → 两边 rt 一起被
+    /// OpenAI 标 refresh_token_reused 而死号。所以两侧都有 user_id 时必须 user_id 一致；
+    /// 缺 user_id 才退回 account_id 比较（老逻辑兜底）。
     pub fn auth_identity_matches(local_auth: &Value, external_auth: &Value) -> bool {
+        let local_uid = Self::extract_openai_user_id(local_auth);
+        let external_uid = Self::extract_openai_user_id(external_auth);
+        if let (Some(local), Some(external)) = (local_uid.as_deref(), external_uid.as_deref()) {
+            if local != external {
+                return false;
+            }
+            // user_id 一致；若两侧都带 account_id，再要求 workspace 也一致（防跨 workspace 误配）
+            let local_account_id = Self::extract_account_id(local_auth);
+            let external_account_id = Self::extract_account_id(external_auth);
+            if let (Some(la), Some(ea)) =
+                (local_account_id.as_deref(), external_account_id.as_deref())
+            {
+                return la == ea;
+            }
+            return true;
+        }
+
+        // 缺 user_id：退回 account_id 比较
         let local_account_id = Self::extract_account_id(local_auth);
         let external_account_id = Self::extract_account_id(external_auth);
         if let (Some(local), Some(external)) =
@@ -1471,13 +1494,6 @@ impl AccountStore {
         {
             return local == external;
         }
-
-        let local_uid = Self::extract_openai_user_id(local_auth);
-        let external_uid = Self::extract_openai_user_id(external_auth);
-        if let (Some(local), Some(external)) = (local_uid.as_deref(), external_uid.as_deref()) {
-            return local == external;
-        }
-
         false
     }
 
@@ -1852,6 +1868,57 @@ mod tests {
 
         let changed = store.sync_account_from_auth_json(&account.id, external);
         assert!(!changed, "refresh token equality must not be enough");
+    }
+
+    /// team 场景 fixture：同一 workspace account_id，但 access_token.sub = 独立 openai user_id。
+    fn auth_with_uid(email: &str, account_id: &str, user_id: &str, refresh_token: &str) -> Value {
+        let fake_jwt_at = format!(
+            "eyJ.{}.sig",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(format!(r#"{{"sub":"{}"}}"#, user_id))
+        );
+        serde_json::json!({
+            "tokens": {
+                "account_id": account_id,
+                "refresh_token": refresh_token,
+                "id_token": make_id_token(email, account_id),
+                "access_token": fake_jwt_at,
+            }
+        })
+    }
+
+    #[test]
+    fn identity_rejects_team_siblings_sharing_workspace() {
+        // 同一 team workspace（account_id 相同）但不同成员（user_id 不同）→ 必须判为不同号，
+        // 否则 sync 会把兄弟 seat 的 rt 串过来 → 双方一起被 OpenAI 标 reused 死号。
+        let seat_a = auth_with_uid("a@example.com", "ws-1", "user-A", "rt-a");
+        let seat_b = auth_with_uid("b@example.com", "ws-1", "user-B", "rt-b");
+        assert!(
+            !AccountStore::auth_identity_matches(&seat_a, &seat_b),
+            "team 同 workspace 不同成员必须判为不同号"
+        );
+    }
+
+    #[test]
+    fn identity_matches_same_seat_relogin() {
+        // 同一 seat 重登：account_id + user_id 都相同 → 同号。
+        let before = auth_with_uid("a@example.com", "ws-1", "user-A", "rt-old");
+        let after = auth_with_uid("a@example.com", "ws-1", "user-A", "rt-new");
+        assert!(
+            AccountStore::auth_identity_matches(&before, &after),
+            "同一 seat 重登必须判为同号"
+        );
+    }
+
+    #[test]
+    fn sync_rejects_team_sibling_auth() {
+        // sync 不能把兄弟 seat 的 auth/rt 写到本 seat 上。
+        let mut store = AccountStore::default();
+        let local = auth_with_uid("a@example.com", "ws-1", "user-A", "rt-a");
+        let sibling = auth_with_uid("b@example.com", "ws-1", "user-B", "rt-b");
+        let account = store.add_account("a@example.com".to_string(), local, None);
+        let changed = store.sync_account_from_auth_json(&account.id, sibling);
+        assert!(!changed, "team 兄弟 seat 的 auth 必须被拒绝，防 rt 串号");
     }
 
     // ===== session-anchor (手机锚) v0.7+ =====

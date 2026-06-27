@@ -454,7 +454,7 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
     };
 
     if let Some(at) = access_token {
-        match crate::usage::UsageFetcher::fetch_usage_direct(at, account_id, refresh_token, true)
+        match crate::usage::UsageFetcher::fetch_usage_direct(at, account_id, refresh_token, true, Some(id.to_string()))
             .await
         {
             Ok((usage, _)) => {
@@ -639,6 +639,7 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
         account_id,
         refresh_token,
         true,
+        Some(id.to_string()),
     )
     .await
     {

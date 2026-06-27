@@ -1065,6 +1065,7 @@ fn spawn_quota_snapshot(
             chatgpt_account_id,
             refresh_token,
             false,
+            Some(store_id.to_string()),
         )
         .await
         {
@@ -4415,6 +4416,7 @@ async fn handle_websocket(
                                 aid,
                                 rt,
                                 false,
+                                Some(id.to_string()),
                             )
                             .await
                             {
