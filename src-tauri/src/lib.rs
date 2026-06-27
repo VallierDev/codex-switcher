@@ -2831,6 +2831,65 @@ async fn send_codex_wakeup(
     .await
 }
 
+/// 主动重置：消耗一次该账号的「主动重置次数」(rate_limit_reset_credits)，
+/// 立即重置已耗尽的限额窗口。POST /backend-api/wham/rate-limit-reset-credits/consume。
+/// 复用账号自身 token，走 quota 同一条出口（Pro 号同 IP 约束见 usage::consume_reset_credit）。
+#[tauri::command]
+async fn consume_reset_credit(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<usage::ResetCreditResult, String> {
+    // 取该账号 token / account_id（逻辑与 send_codex_wakeup 一致）
+    let (access_token_opt, account_id, refresh_token, is_client_or_solo) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let account = store
+            .accounts
+            .get(&id)
+            .ok_or_else(|| format!("账号 {} 不存在", id))?;
+        if account.is_relay() {
+            return Err("RELAY_ACCOUNT:中转站账号不支持主动重置".to_string());
+        }
+        let at = AccountStore::extract_access_token(&account.auth_json);
+        let aid = AccountStore::extract_account_id(&account.auth_json);
+        let rt = account
+            .refresh_token
+            .clone()
+            .or_else(|| AccountStore::extract_refresh_token(&account.auth_json));
+        let solo_or_client = matches!(store.settings.remote_mode.as_str(), "client" | "solo");
+        (at, aid, rt, solo_or_client)
+    };
+
+    let access_token = if let Some(at) = access_token_opt {
+        at
+    } else if is_client_or_solo {
+        return Err(
+            "TOKEN_INVALID:client/solo 模式禁止本机 rt 刷新；请确认账号已同步到 Server".to_string(),
+        );
+    } else if let Some(ref rt) = refresh_token {
+        match crate::oauth::refresh_access_token_locked(&id, rt).await {
+            Ok(token_res) => {
+                let mut store = state.store.lock().map_err(|e| e.to_string())?;
+                if let Some(account) = store.accounts.get_mut(&id) {
+                    AccountStore::apply_refreshed_tokens(
+                        account,
+                        token_res.access_token.clone(),
+                        token_res.refresh_token.clone(),
+                        token_res.id_token,
+                        token_res.expires_in,
+                    );
+                    let _ = store.save();
+                }
+                token_res.access_token
+            }
+            Err(e) => return Err(format!("TOKEN_INVALID:刷新 token 失败: {}", e)),
+        }
+    } else {
+        return Err("TOKEN_INVALID:无 access_token 且无 refresh_token".to_string());
+    };
+
+    usage::consume_reset_credit(&access_token, account_id.as_deref()).await
+}
+
 /// 用指定账号在「隔离 CODEX_HOME + 直连 OpenAI」下打开一个交互式 codex 终端。
 ///
 /// 用途：referral 兑现需要"真 codex CLI 的 turn"——手搓 API 不算数。这里给该号
@@ -5380,6 +5439,7 @@ pub fn run() {
             get_quota_by_id,
             send_codex_invite,
             send_codex_wakeup,
+            consume_reset_credit,
             open_codex_terminal,
             oauth_server::start_oauth_login,
             oauth_server::submit_oauth_callback,

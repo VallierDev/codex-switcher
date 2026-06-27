@@ -65,6 +65,15 @@ interface InviteResult {
     upstream_raw: string;
 }
 
+interface ResetCreditResult {
+    ok: boolean;
+    status_code: number;
+    code: string;
+    windows_reset: number;
+    message: string;
+    upstream_raw: string;
+}
+
 interface UsageData {
     five_hour_left: number;
     five_hour_reset: string;
@@ -134,6 +143,9 @@ export function AccountList({
     const [inviteError, setInviteError] = useState<string | null>(null);
     // Codex 启动：用该账号在隔离 CODEX_HOME 直连下开一个真 codex 终端
     const [launchingIds, setLaunchingIds] = useState<Set<string>>(new Set());
+    // 主动重置：消耗一次 reset_credit 立即重置限额窗口
+    const [resetModal, setResetModal] = useState<{ id: string; name: string; credits: number } | null>(null);
+    const [resetting, setResetting] = useState(false);
 
     const autoReload = settings.auto_reload_ide;
     const setAutoReload = (val: boolean) => onUpdateSettings({ ...settings, auto_reload_ide: val });
@@ -156,6 +168,30 @@ export function AccountList({
         } finally {
             setLaunchingIds(prev => { const n = new Set(prev); n.delete(id); return n; });
             setTimeout(() => setPushToast(null), 4000);
+        }
+    };
+
+    const handleConsumeReset = async () => {
+        if (!resetModal || resetting) return;
+        const { id, name } = resetModal;
+        setResetting(true);
+        try {
+            const res = await invoke<ResetCreditResult>('consume_reset_credit', { id });
+            setResetModal(null);
+            setPushToast({
+                type: res.ok ? 'success' : 'error',
+                text: `${name}：${res.message}`,
+            });
+            // 重置成功(或 nothing_to_reset)后重拉一次 quota，刷新限额条 + 剩余次数
+            if (res.ok || res.code === 'nothing_to_reset') {
+                await handleRefreshOne(id);
+            }
+        } catch (e) {
+            setResetModal(null);
+            setPushToast({ type: 'error', text: `${name} 重置失败：${humanizeRefreshError(String(e))}` });
+        } finally {
+            setResetting(false);
+            setTimeout(() => setPushToast(null), 5000);
         }
     };
 
@@ -750,7 +786,16 @@ export function AccountList({
                                         {isBanned ? <span className="badge banned" title="该账号已被 OpenAI 封禁">封号</span> : isLoggedOut ? <span className="badge logged-out" title="您已登出或登录了其他账号，请重新登录">已登出</span> : isInvalid && <span className="badge expired" title="该账号 Token 已过期或失效">过期</span>}
                                         {usage?.plan_type && <span className="badge plan">{usage.plan_type.toUpperCase()}</span>}
                                         {usage?.reset_credits != null && (
-                                            <span className="badge reset-credits" title="主动重置次数（可手动重置限额的剩余次数）">🔄 {usage.reset_credits}</span>
+                                            usage.reset_credits > 0 ? (
+                                                <span
+                                                    className="badge reset-credits clickable"
+                                                    title="点击立即用一次「主动重置次数」重置已耗尽的限额窗口"
+                                                    onClick={() => setResetModal({ id: acc.id, name: acc.name, credits: usage.reset_credits ?? 0 })}
+                                                    style={{ cursor: 'pointer' }}
+                                                >🔄 {usage.reset_credits}</span>
+                                            ) : (
+                                                <span className="badge reset-credits" title="主动重置次数（剩余 0 次，无法重置）">🔄 {usage.reset_credits}</span>
+                                            )
                                         )}
                                     </div>
                                 </div>
@@ -841,6 +886,18 @@ export function AccountList({
                 }}
                 onCancel={() => setAccountToDelete(null)}
             />
+
+            <ConfirmModal
+                isOpen={!!resetModal}
+                title="主动重置限额"
+                message={<p>确定要为账号 <strong>{resetModal?.name}</strong> 立即重置限额窗口吗？<br /><br />将<strong>消耗 1 次</strong>主动重置次数（剩余 {resetModal?.credits} 次），把当前已耗尽的 5H / 周限额窗口立刻清零。此操作不可撤销。</p>}
+                confirmText="立即重置"
+                isLoading={resetting}
+                loadingText="正在重置…"
+                onConfirm={handleConsumeReset}
+                onCancel={() => { if (!resetting) setResetModal(null); }}
+            />
+
             {cookieEditor && (
                 <div className="modal-overlay" onClick={() => !savingCookie && setCookieEditor(null)}>
                     <div className="modal-content" onClick={e => e.stopPropagation()}>

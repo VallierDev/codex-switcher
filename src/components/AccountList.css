@@ -390,6 +390,17 @@
     cursor: help;
 }
 
+/* 有剩余次数时可点击发起重置 */
+.badge.reset-credits.clickable {
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.badge.reset-credits.clickable:hover {
+    background: rgba(56, 189, 248, 0.32);
+    color: #e0f2fe;
+}
+
 .badge.expired {
     background: rgba(239, 68, 68, 0.2);
     color: #ef4444;

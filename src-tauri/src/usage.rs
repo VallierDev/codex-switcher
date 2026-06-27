@@ -1057,6 +1057,117 @@ pub async fn send_referral_invite(
     })
 }
 
+/// 主动重置（消耗一次 rate_limit_reset_credit）的结果，回传给前端。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetCreditResult {
+    /// true = 上游确实重置了至少一个窗口（code == "reset"）
+    pub ok: bool,
+    pub status_code: u16,
+    /// 上游 code：reset / nothing_to_reset / no_credit / already_redeemed / http_error / unknown
+    pub code: String,
+    /// 实际被重置的窗口数（reset 时 > 0）
+    pub windows_reset: i64,
+    /// 翻成人话的提示文案
+    pub message: String,
+    /// 上游原始响应（成功/失败都带上，方便前端兜底）
+    pub upstream_raw: String,
+}
+
+/// 消耗一次「主动重置次数」立即重置已耗尽的限额窗口：
+/// `POST /backend-api/wham/rate-limit-reset-credits/consume`，body `{"redeem_request_id": "<uuid>"}`。
+///
+/// `redeem_request_id` 是幂等键 —— 同一个 id 重发只会兑现一次（上游回 `already_redeemed`），
+/// 所以每次按钮点击都生成一把新的 UUID。响应形如：
+/// `{"code":"reset|nothing_to_reset|no_credit|already_redeemed","windows_reset":N}`。
+///
+/// 走 quota 同一条出口（`usage_client` + codex UA + originator + ChatGPT-Account-Id），
+/// 保证带 token 的请求跟该账号平时的 quota 查询走同一个 egress（Pro 号同 IP 约束）。
+pub async fn consume_reset_credit(
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<ResetCreditResult, String> {
+    let redeem_request_id = uuid::Uuid::new_v4().to_string();
+    let body = serde_json::json!({ "redeem_request_id": redeem_request_id });
+
+    let client = usage_client();
+    let mut req = client
+        .post("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("User-Agent", crate::codex_ua::codex_user_agent())
+        .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(30))
+        .json(&body);
+    if let Some(id) = account_id {
+        if !id.is_empty() {
+            req = req.header("ChatGPT-Account-Id", id);
+        }
+    }
+
+    let resp = req.send().await.map_err(|e| format!("网络请求失败: {}", e))?;
+    let status = resp.status();
+    let raw = resp.text().await.unwrap_or_default();
+    let parsed = serde_json::from_str::<Value>(&raw).ok();
+
+    if !status.is_success() {
+        // 上游 detail / error.message 优先，缺失时按状态码给一句人话
+        let detail = parsed.as_ref().and_then(|v| {
+            v.get("detail")
+                .and_then(|d| d.as_str())
+                .or_else(|| {
+                    v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                })
+                .map(|s| s.to_string())
+        });
+        let message = detail.unwrap_or_else(|| match status.as_u16() {
+            401 => "token 失效（401），请刷新或重新登录".to_string(),
+            403 => "需要验证（403）".to_string(),
+            429 => "请求过于频繁（429），稍后再试".to_string(),
+            _ => format!("上游返回 HTTP {}", status.as_u16()),
+        });
+        return Ok(ResetCreditResult {
+            ok: false,
+            status_code: status.as_u16(),
+            code: "http_error".to_string(),
+            windows_reset: 0,
+            message,
+            upstream_raw: raw,
+        });
+    }
+
+    let code = parsed
+        .as_ref()
+        .and_then(|v| v.get("code"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let windows_reset = parsed
+        .as_ref()
+        .and_then(|v| v.get("windows_reset"))
+        .and_then(|w| w.as_i64())
+        .unwrap_or(0);
+    let ok = code == "reset";
+    let message = match code.as_str() {
+        "reset" => format!("已重置 {} 个限额窗口", windows_reset),
+        "nothing_to_reset" => "当前没有可重置的限额（额度还没用到上限）".to_string(),
+        "no_credit" => "没有可用的主动重置次数了".to_string(),
+        "already_redeemed" => "该重置请求已经兑现过了".to_string(),
+        other => format!("上游返回：{}", other),
+    };
+
+    Ok(ResetCreditResult {
+        ok,
+        status_code: status.as_u16(),
+        code,
+        windows_reset,
+        message,
+        upstream_raw: raw,
+    })
+}
+
 /// 默认唤醒模型（实测 ChatGPT 账号 codex responses 接口当前接受 gpt-5.5；
 /// gpt-5-codex / gpt-5.3-codex 等已被该端点拒绝）。
 pub const DEFAULT_WAKEUP_MODEL: &str = "gpt-5.5";
