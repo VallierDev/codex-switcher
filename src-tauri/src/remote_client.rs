@@ -155,11 +155,19 @@ pub async fn resolve_base_url(primary: &str, fallback: &str) -> Result<String, S
         // 先回来的那条失败了 —— 等另一条
         Either::Left(((_, false), other)) => {
             let (url, ok) = other.await;
-            if ok { Some(url) } else { None }
+            if ok {
+                Some(url)
+            } else {
+                None
+            }
         }
         Either::Right(((_, false), other)) => {
             let (url, ok) = other.await;
-            if ok { Some(url) } else { None }
+            if ok {
+                Some(url)
+            } else {
+                None
+            }
         }
     };
 
@@ -539,7 +547,23 @@ pub async fn refresh_account_quota(
         return Err(err);
     }
     let usage = body.get("usage").cloned().ok_or("响应缺少 usage 字段")?;
-    serde_json::from_value(usage).map_err(|e| format!("反序列化 usage 失败: {}", e))
+    let parsed: crate::usage::UsageDisplay =
+        serde_json::from_value(usage).map_err(|e| format!("反序列化 usage 失败: {}", e))?;
+    // 防御：旧版 Server 会把上游 503/空体「解析」成 plan_type=unknown + 100%/「未知」。
+    // 那是假额度，绝不能写进本机 cached_quota 覆盖真实数据。Server 升级后此分支不应再触发。
+    let plan = parsed.plan_type.to_lowercase();
+    let looks_empty = (plan == "unknown" || plan.is_empty())
+        && parsed.five_hour_reset == "未知"
+        && parsed.weekly_reset == "未知"
+        && parsed.five_hour_reset_at.is_none()
+        && parsed.weekly_reset_at.is_none();
+    if looks_empty {
+        return Err(
+            "USAGE_EMPTY_FROM_SERVER: Server 返回了空额度(unknown/未知)，可能是上游 503 被旧版误解析；已拒绝写缓存，请升级 Mini Mac 端或稍后重试"
+                .to_string(),
+        );
+    }
+    Ok(parsed)
 }
 
 /// solo 模式心跳：通知 Server "本机在接管全部保活"。
@@ -618,4 +642,30 @@ pub async fn fetch_token(base_url: &str, secret: &str, id: &str) -> Result<Remot
     resp.json::<RemoteToken>()
         .await
         .map_err(|e| format!("解析 token 响应失败: {}", e))
+}
+
+/// 让 Server 就地强制刷新指定账号的 access_token，返回刷新后的 auth_json。
+/// 手机锚保活用:client 拉到的锚 token 快过期时打这个,Server 走单刷新者 locked_fresh
+/// 路径刷新(不新增 reused 源),client 再把返回的新 token 写盘。
+pub async fn refresh_token_now(
+    base_url: &str,
+    secret: &str,
+    id: &str,
+) -> Result<RemoteToken, String> {
+    let url = format!("{}/accounts/{}/refresh-token", trim_url(base_url), id);
+    let resp = client()?
+        .post(&url)
+        .header(AUTH_HEADER, secret)
+        .send()
+        .await
+        .map_err(|e| format!("POST refresh-token 失败: {}", e))?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("共享密钥不正确".to_string());
+    }
+    if !resp.status().is_success() {
+        return Err(format!("Server 返回 {}", resp.status()));
+    }
+    resp.json::<RemoteToken>()
+        .await
+        .map_err(|e| format!("解析 refresh-token 响应失败: {}", e))
 }

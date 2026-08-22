@@ -9,6 +9,9 @@ interface SkillApps {
     gemini: boolean;
     opencode: boolean;
     zcode: boolean;
+    grok: boolean;
+    kimi: boolean;
+    antigravity: boolean;
 }
 
 interface InstalledSkill {
@@ -43,7 +46,7 @@ interface SkillRepo {
 
 type Tab = 'installed' | 'discover' | 'repos';
 
-const APPS = ['codex', 'claude', 'gemini', 'opencode', 'zcode'] as const;
+const APPS = ['codex', 'claude', 'gemini', 'opencode', 'zcode', 'grok', 'kimi', 'antigravity'] as const;
 
 export function Skills() {
     const [tab, setTab] = useState<Tab>('installed');

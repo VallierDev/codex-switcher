@@ -109,11 +109,11 @@ impl SessionRoutesStore {
             fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
         }
         let tmp_path = path.with_extension("json.tmp");
-        let content = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("序列化失败: {}", e))?;
+        let content =
+            serde_json::to_string_pretty(self).map_err(|e| format!("序列化失败: {}", e))?;
         {
-            let mut f = fs::File::create(&tmp_path)
-                .map_err(|e| format!("创建临时文件失败: {}", e))?;
+            let mut f =
+                fs::File::create(&tmp_path).map_err(|e| format!("创建临时文件失败: {}", e))?;
             f.write_all(content.as_bytes())
                 .map_err(|e| format!("写入临时文件失败: {}", e))?;
             f.sync_all().ok();

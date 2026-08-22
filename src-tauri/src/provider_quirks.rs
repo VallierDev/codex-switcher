@@ -100,7 +100,8 @@ pub fn enhance_error_hint(provider: RelayProvider, msg_lower: &str) -> Option<&'
                     "MiMo Web Search Plugin 未激活；到 https://platform.xiaomimimo.com/#/console/plugin 开通后重新发起请求。",
                 );
             }
-            if msg_lower.contains("reasoning_content") && msg_lower.contains("must be passed back") {
+            if msg_lower.contains("reasoning_content") && msg_lower.contains("must be passed back")
+            {
                 return Some(
                     "MiMo thinking 模式要求历史里的 assistant 轮回传完整 reasoning_content；本机已通过 encrypted_content round-trip 修复，如仍报此错可能是 codex 版本不支持，升级 codex 到 0.130+。",
                 );
@@ -174,11 +175,14 @@ mod tests {
 
     #[test]
     fn mimo_web_search_flag_injected_when_tools_has_websearch() {
-        let mut body =
-            br#"{"messages":[],"tools":[{"type":"web_search"}]}"#.to_vec();
+        let mut body = br#"{"messages":[],"tools":[{"type":"web_search"}]}"#.to_vec();
         preprocess_chat_body(RelayProvider::Mimo, &mut body);
         let s = String::from_utf8(body).unwrap();
-        assert!(s.contains("\"webSearchEnabled\":true"), "expected flag in: {}", s);
+        assert!(
+            s.contains("\"webSearchEnabled\":true"),
+            "expected flag in: {}",
+            s
+        );
     }
 
     #[test]
@@ -194,7 +198,10 @@ mod tests {
         let mut body = br#"{"messages":[],"tools":[{"type":"web_search"}]}"#.to_vec();
         let before = body.clone();
         preprocess_chat_body(RelayProvider::Glm, &mut body);
-        assert_eq!(body, before, "GLM body should not be mutated by provider quirks");
+        assert_eq!(
+            body, before,
+            "GLM body should not be mutated by provider quirks"
+        );
     }
 
     #[test]

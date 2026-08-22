@@ -819,7 +819,10 @@ fn transform_tool(tool: Value, is_glm: bool, model: &str, out: &mut Vec<Value>) 
                     }
                 }
                 _ => {
-                    let nsname = tool.get("name").and_then(Value::as_str).unwrap_or("(unnamed)");
+                    let nsname = tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(unnamed)");
                     eprintln!("[relay_translate] drop empty namespace tool {:?}", nsname);
                 }
             }
@@ -1740,8 +1743,10 @@ mod tests {
             translate_request(&serde_json::to_vec(&codex).unwrap(), "glm-5.1").unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         // body 里不该再带 previous_response_id（chat_completions 协议里不存在）
-        assert!(v.get("previous_response_id").map_or(true, |p| p.is_null()),
-            "previous_response_id 应当被忽略，不出现在翻译后 chat 请求里");
+        assert!(
+            v.get("previous_response_id").map_or(true, |p| p.is_null()),
+            "previous_response_id 应当被忽略，不出现在翻译后 chat 请求里"
+        );
     }
 
     #[test]
@@ -1838,7 +1843,7 @@ mod tests {
             &all,
             b"response.reasoning_summary_text.delta"
         ));
-        assert!(contains_event(&all, b"thinking..."));
+        assert!(String::from_utf8_lossy(&all).contains("thinking..."));
         assert!(contains_event(&all, b"response.completed"));
     }
 
@@ -1994,14 +1999,17 @@ mod tests {
         let v = parse(&body);
         let messages = v["messages"].as_array().unwrap();
         // 历史不再丢：c2 的 tool output 也得在
-        let c1_present = messages.iter().any(|m| {
-            m.get("tool_call_id").and_then(Value::as_str) == Some("c1")
-        });
-        let c2_present = messages.iter().any(|m| {
-            m.get("tool_call_id").and_then(Value::as_str) == Some("c2")
-        });
+        let c1_present = messages
+            .iter()
+            .any(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("c1"));
+        let c2_present = messages
+            .iter()
+            .any(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("c2"));
         assert!(c1_present, "c1 tool output must be present");
-        assert!(c2_present, "c2 tool output must be present (no longer pruned)");
+        assert!(
+            c2_present,
+            "c2 tool output must be present (no longer pruned)"
+        );
         // reasoning_content 从 encrypted_content 提到 assistant 消息上了
         let assistant = messages
             .iter()
@@ -2037,11 +2045,27 @@ mod tests {
         let tools = v["tools"].as_array().unwrap();
         let names: Vec<String> = tools
             .iter()
-            .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str).map(String::from))
+            .filter_map(|t| {
+                t.pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
             .collect();
-        assert!(names.contains(&"inner_a".to_string()), "namespace inner_a should be flattened: {:?}", names);
-        assert!(names.contains(&"inner_b".to_string()), "namespace inner_b should be flattened: {:?}", names);
-        assert!(names.contains(&"top".to_string()), "top-level function should survive: {:?}", names);
+        assert!(
+            names.contains(&"inner_a".to_string()),
+            "namespace inner_a should be flattened: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"inner_b".to_string()),
+            "namespace inner_b should be flattened: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"top".to_string()),
+            "top-level function should survive: {:?}",
+            names
+        );
     }
 
     #[test]

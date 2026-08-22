@@ -27,6 +27,20 @@ import { useShortCountdown } from '../hooks/useCountdown';
 import './AccountList.css';
 import { ConfirmModal } from './ConfirmModal';
 
+/** 把 Unix 秒到期时间格式化成本地短时间，如 "07-18 00:34" */
+function fmtExpiry(ts?: number | null): string {
+    if (!ts || ts <= 0) return '未知';
+    return new Date(ts * 1000).toLocaleString(undefined, {
+        month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    });
+}
+
+/** 距到期还剩多少天（向下取整，过期返回 0；无时间返回 null） */
+function daysLeft(ts?: number | null): number | null {
+    if (!ts || ts <= 0) return null;
+    return Math.max(0, Math.floor((ts - Math.floor(Date.now() / 1000)) / 86400));
+}
+
 /** 把上游英文邀请提示翻成人话 */
 function friendlyInviteMessage(raw: string | null | undefined): string {
     const m = (raw || '').trim();
@@ -71,7 +85,17 @@ interface ResetCreditResult {
     code: string;
     windows_reset: number;
     message: string;
+    consumed_credit_id?: string | null;
     upstream_raw: string;
+}
+
+// 一条可用的「主动重置次数」（来自 GET wham/rate-limit-reset-credits）
+interface ResetCreditItem {
+    id: string;
+    expires_at?: number | null; // Unix 秒
+    granted_at?: number | null;
+    title: string;
+    source: string;
 }
 
 interface UsageData {
@@ -143,9 +167,12 @@ export function AccountList({
     const [inviteError, setInviteError] = useState<string | null>(null);
     // Codex 启动：用该账号在隔离 CODEX_HOME 直连下开一个真 codex 终端
     const [launchingIds, setLaunchingIds] = useState<Set<string>>(new Set());
-    // 主动重置：消耗一次 reset_credit 立即重置限额窗口
+    // 主动重置：点徽章先弹窗列出所有重置次数（含到期时间），再消耗一次
     const [resetModal, setResetModal] = useState<{ id: string; name: string; credits: number } | null>(null);
     const [resetting, setResetting] = useState(false);
+    const [resetList, setResetList] = useState<ResetCreditItem[] | null>(null);
+    const [resetListLoading, setResetListLoading] = useState(false);
+    const [resetListError, setResetListError] = useState<string | null>(null);
 
     const autoReload = settings.auto_reload_ide;
     const setAutoReload = (val: boolean) => onUpdateSettings({ ...settings, auto_reload_ide: val });
@@ -171,23 +198,60 @@ export function AccountList({
         }
     };
 
+    // 点 🔄 徽章：开弹窗并拉取该号所有可用重置次数（含各自到期时间）
+    const openResetModal = async (id: string, name: string, credits: number) => {
+        if (resetting) return;
+        setResetModal({ id, name, credits });
+        setResetList(null);
+        setResetListError(null);
+        setResetListLoading(true);
+        try {
+            const items = await invoke<ResetCreditItem[]>('list_reset_credits', { id });
+            setResetList(items);
+        } catch (e) {
+            setResetListError(humanizeRefreshError(String(e)));
+        } finally {
+            setResetListLoading(false);
+        }
+    };
+
+    const closeResetModal = () => {
+        if (resetting) return;
+        setResetModal(null);
+        setResetList(null);
+        setResetListError(null);
+    };
+
+    // 消耗完成后无条件关弹窗（绕过 resetting 守卫，因为此刻 resetting 还为 true）
+    const closeResetModalForce = () => {
+        setResetModal(null);
+        setResetList(null);
+        setResetListError(null);
+    };
+
     const handleConsumeReset = async () => {
         if (!resetModal || resetting) return;
         const { id, name } = resetModal;
+        // 记下当前列表，成功后用 consumed_credit_id 反查「烧掉的是哪条」
+        const listSnapshot = resetList;
         setResetting(true);
         try {
             const res = await invoke<ResetCreditResult>('consume_reset_credit', { id });
-            setResetModal(null);
-            setPushToast({
-                type: res.ok ? 'success' : 'error',
-                text: `${name}：${res.message}`,
-            });
+            closeResetModalForce();
+            let text = `${name}：${res.message}`;
+            if (res.ok && res.consumed_credit_id && listSnapshot) {
+                const burned = listSnapshot.find(c => c.id === res.consumed_credit_id);
+                if (burned?.expires_at) {
+                    text = `${name}：${res.message}（消耗了到期 ${fmtExpiry(burned.expires_at)} 的那条）`;
+                }
+            }
+            setPushToast({ type: res.ok ? 'success' : 'error', text });
             // 重置成功(或 nothing_to_reset)后重拉一次 quota，刷新限额条 + 剩余次数
             if (res.ok || res.code === 'nothing_to_reset') {
                 await handleRefreshOne(id);
             }
         } catch (e) {
-            setResetModal(null);
+            closeResetModalForce();
             setPushToast({ type: 'error', text: `${name} 重置失败：${humanizeRefreshError(String(e))}` });
         } finally {
             setResetting(false);
@@ -405,7 +469,7 @@ export function AccountList({
     const getStatusInfo = (account: Account) => {
         const isCurrent = account.id === currentId;
         const err = account.keepalive?.last_error;
-        const isPermanent = err?.toLowerCase().match(/reused|invalidated|expired/);
+        const isPermanent = err?.toLowerCase().match(/invalidated|expired|invalid_refresh_token|invalid_grant/);
 
         if (isPermanent) return { text: '过期', warn: true };
         if (isCurrent) return { text: '当前账号', warn: false };
@@ -438,7 +502,8 @@ export function AccountList({
         const s = raw.toLowerCase();
         if (s.includes('account_banned')) return '账号已被封禁';
         if (s.includes('token_invalid')) return 'Token 已失效，需要重新登录';
-        if (s.includes('account_logged_out')) return '账号已登出，需要重新登录';
+        if (s.includes('account_logged_out')) return '登录已失效：refresh_token 已过期或被撤销，请重新登录';
+        if (s.includes('token_refresh_transient')) return '刷新失败：网络或服务暂时异常，未判定账号失效';
         if (s.includes('timeout') || s.includes('timed out')) return '请求超时（OpenAI 端慢/被节流）';
         if (s.includes('网络请求失败') || s.includes('network')) return '网络请求失败，检查代理/网络';
         if (s.includes('刷新令牌') || s.includes('refresh')) return 'refresh_token 刷新失败';
@@ -479,6 +544,10 @@ export function AccountList({
                 setInvalidIds(prev => new Set(prev).add(id));
             } else if (errMsg.includes('TOKEN_INVALID')) {
                 setInvalidIds(prev => new Set(prev).add(id));
+            }
+            // 后端已持久化的需重登状态需要重新读取账号列表，避免只显示 toast。
+            if (errMsg.includes('ACCOUNT_LOGGED_OUT')) {
+                onRefreshComplete?.();
             }
             // 把错误 tip 出来，不再静默失败
             setPushToast({
@@ -719,9 +788,16 @@ export function AccountList({
                 <div className="account-table-body">
                     {filteredAccounts.map(acc => {
                         const usage = usageMap[acc.id];
+                        // 被限流 = 任一额度桶（5H / 周 / Spark）剩余为 0，上游已 429 拒绝请求。
+                        // 这一刻消耗一次主动重置回收最大（把 0% 的窗口拉回满）。
+                        const rateLimited = !!usage && (
+                            usage.five_hour_left === 0 ||
+                            usage.weekly_left === 0 ||
+                            (!!usage.spark && (usage.spark.five_hour_left === 0 || usage.spark.weekly_left === 0))
+                        );
                         const status = getStatusInfo(acc);
                         const err = acc.keepalive?.last_error;
-                        const isPermanentError = err?.toLowerCase().match(/reused|invalidated|expired/);
+                        const isPermanentError = err?.toLowerCase().match(/invalidated|expired|invalid_refresh_token|invalid_grant/);
                         const isInvalid = invalidIds.has(acc.id) || !!isPermanentError || acc.is_token_invalid || acc.is_logged_out;
                         const isBanned = bannedIds.has(acc.id);
                         const isLoggedOut = acc.is_logged_out;
@@ -783,16 +859,18 @@ export function AccountList({
                                                 title="手机锚：磁盘 ~/.codex/auth.json 永远跟随此号，Codex.app 手机远程连接绑定此号；切到其他号时 disk 不动、proxy 出口照切"
                                             >📱 手机锚</span>
                                         )}
-                                        {isBanned ? <span className="badge banned" title="该账号已被 OpenAI 封禁">封号</span> : isLoggedOut ? <span className="badge logged-out" title="您已登出或登录了其他账号，请重新登录">已登出</span> : isInvalid && <span className="badge expired" title="该账号 Token 已过期或失效">过期</span>}
+                                        {isBanned ? <span className="badge banned" title="该账号已被 OpenAI 封禁">封号</span> : isLoggedOut ? <span className="badge logged-out" title="登录已失效，可能是 refresh_token 过期、被撤销或会话在其他设备结束">需重新登录</span> : isInvalid && <span className="badge expired" title="该账号 Token 已过期或失效">过期</span>}
                                         {usage?.plan_type && <span className="badge plan">{usage.plan_type.toUpperCase()}</span>}
                                         {usage?.reset_credits != null && (
                                             usage.reset_credits > 0 ? (
                                                 <span
-                                                    className="badge reset-credits clickable"
-                                                    title="点击立即用一次「主动重置次数」重置已耗尽的限额窗口"
-                                                    onClick={() => setResetModal({ id: acc.id, name: acc.name, credits: usage.reset_credits ?? 0 })}
+                                                    className={`badge reset-credits clickable${rateLimited ? ' limited' : ''}`}
+                                                    title={rateLimited
+                                                        ? '⚡ 当前已被限流（额度桶为 0）——现在用一次主动重置回收最大，点击查看明细'
+                                                        : '点击查看所有主动重置次数（含各自到期时间），再消耗一次重置限额窗口'}
+                                                    onClick={() => openResetModal(acc.id, acc.name, usage.reset_credits ?? 0)}
                                                     style={{ cursor: 'pointer' }}
-                                                >🔄 {usage.reset_credits}</span>
+                                                >{rateLimited ? '⚡' : ''}🔄 {usage.reset_credits}</span>
                                             ) : (
                                                 <span className="badge reset-credits" title="主动重置次数（剩余 0 次，无法重置）">🔄 {usage.reset_credits}</span>
                                             )
@@ -887,16 +965,62 @@ export function AccountList({
                 onCancel={() => setAccountToDelete(null)}
             />
 
-            <ConfirmModal
-                isOpen={!!resetModal}
-                title="主动重置限额"
-                message={<p>确定要为账号 <strong>{resetModal?.name}</strong> 立即重置限额窗口吗？<br /><br />将<strong>消耗 1 次</strong>主动重置次数（剩余 {resetModal?.credits} 次），把当前已耗尽的 5H / 周限额窗口立刻清零。此操作不可撤销。</p>}
-                confirmText="立即重置"
-                isLoading={resetting}
-                loadingText="正在重置…"
-                onConfirm={handleConsumeReset}
-                onCancel={() => { if (!resetting) setResetModal(null); }}
-            />
+            {resetModal && (
+                <div className="modal-overlay" onClick={closeResetModal}>
+                    <div className="modal-content reset-credit-modal" onClick={e => e.stopPropagation()}>
+                        <div className="modal-header">
+                            <div className="header-top">
+                                <h2>主动重置 · {resetModal.name}</h2>
+                                <button className="close-btn" onClick={closeResetModal} disabled={resetting}>×</button>
+                            </div>
+                        </div>
+                        <div className="modal-body">
+                            {resetListLoading ? (
+                                <p className="modal-tip">正在拉取重置次数明细…</p>
+                            ) : resetListError ? (
+                                <p className="modal-tip err">拉取明细失败：{resetListError}<br />仍可直接消耗 1 次（剩余 {resetModal.credits} 次）。</p>
+                            ) : resetList && resetList.length > 0 ? (
+                                <>
+                                    <p className="modal-tip" style={{ marginBottom: 10 }}>
+                                        共 <strong>{resetList.length}</strong> 次，按到期时间排序（最早在前）。所有次数<strong>等价</strong>，区别仅到期时间；<strong>消耗哪条由服务端决定</strong>（通常最早到期优先，客户端无法指定）。
+                                    </p>
+                                    <ul className="reset-credit-list">
+                                        {resetList.map((c, i) => {
+                                            const dl = daysLeft(c.expires_at);
+                                            const urgency = dl == null ? '' : dl < 3 ? 'urgent' : dl < 7 ? 'warn' : '';
+                                            return (
+                                                <li key={c.id} className={`reset-credit-row ${urgency}`}>
+                                                    <span className="rc-mark">{i === 0 ? '▸' : ''}</span>
+                                                    <span className="rc-expiry">{fmtExpiry(c.expires_at)}</span>
+                                                    <span className="rc-days">{dl == null ? '' : `剩 ${dl} 天`}</span>
+                                                    <span className="rc-source">{c.source}</span>
+                                                    {i === 0 && <span className="rc-badge">将被消耗</span>}
+                                                </li>
+                                            );
+                                        })}
+                                    </ul>
+                                    <p className="modal-tip" style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
+                                        消耗 1 次会把当前已耗尽的 5H / 周限额窗口立刻清零，此操作不可撤销。若额度还没用到上限，上游会返回「无可重置」且<strong>不扣次数</strong>。
+                                    </p>
+                                </>
+                            ) : (
+                                <p className="modal-tip">该账号当前没有可用的主动重置次数。</p>
+                            )}
+                        </div>
+                        <div className="modal-footer">
+                            <button type="button" className="btn btn-ghost" onClick={closeResetModal} disabled={resetting}>取消</button>
+                            <button
+                                type="button"
+                                className="btn btn-primary"
+                                onClick={handleConsumeReset}
+                                disabled={resetting || resetListLoading || (resetList?.length === 0 && !resetListError)}
+                            >
+                                {resetting ? '正在重置…' : '立即重置'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {cookieEditor && (
                 <div className="modal-overlay" onClick={() => !savingCookie && setCookieEditor(null)}>

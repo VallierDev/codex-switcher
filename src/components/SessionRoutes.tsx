@@ -32,7 +32,7 @@ function accountWarning(account: Account | undefined): string | null {
     const flags: string[] = [];
     if (account.is_banned) flags.push('已封号');
     if (account.is_token_invalid) flags.push('Token 失效');
-    if (account.is_logged_out) flags.push('已登出');
+    if (account.is_logged_out) flags.push('需重新登录');
     return flags.length ? `目标账号异常：${flags.join(' · ')}` : null;
 }
 

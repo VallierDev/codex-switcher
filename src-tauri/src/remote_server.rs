@@ -193,6 +193,9 @@ async fn route(
                 (Method::POST, Some("refresh")) => {
                     return handle_refresh_account(&state, id).await;
                 }
+                (Method::POST, Some("refresh-token")) => {
+                    return handle_refresh_token(&state, id).await;
+                }
                 (Method::GET, None) => return handle_get_account(&state, id),
                 (Method::DELETE, None) => return handle_delete(&state, id),
                 _ => {}
@@ -285,6 +288,56 @@ fn handle_get_token(state: &ApiState, id: &str) -> Response<ResponseBody> {
             }),
         ),
         None => json_resp(StatusCode::NOT_FOUND, json!({"error": "account not found"})),
+    }
+}
+
+/// 强制刷新某账号的 access_token，返回刷新后的 auth_json（与 /token 同形）。
+///
+/// 走 `refresh_access_token_locked_fresh`（per-account rt 锁 + 锁内重读最新 rt + 写回
+/// store）——**单刷新者路径,与 Server 自身的 keepalive/anchor/proxy 刷新串行,不新增
+/// reused 源**。供 client 手机锚保活调用:client 拉到锚 token 发现快过期时打这个端点,
+/// 让 Server 就地把锚账号的 token 刷新,再由 client 拉回本机写盘。
+///
+/// reused 错误 = 瞬时并发(此刻 store 已被赢家刷成最新)——不当失败,直接回读 store 里
+/// 当前(大概率已新鲜)的 auth_json 返回。
+async fn handle_refresh_token(state: &ApiState, id: &str) -> Response<ResponseBody> {
+    let is_relay = state
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.accounts.get(id).map(|a| a.is_relay()))
+        .unwrap_or(false);
+    if is_relay {
+        return json_resp(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "relay account has no refresh_token"}),
+        );
+    }
+
+    let refresh_res = crate::oauth::refresh_access_token_locked_fresh(&state.store, id).await;
+    if let Err(ref e) = refresh_res {
+        // reused 之外的真失败才报错;reused 时 store 已是最新,继续回读返回
+        if !crate::scheduler::is_reused_error(e) {
+            return json_resp(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("refresh failed: {}", e)}),
+            );
+        }
+    }
+    // 成功(_locked_fresh 已写回 store)或 reused(赢家已写回)——都回读 store 最新 auth_json
+    schedule_save(state.store.clone());
+    match state.store.lock() {
+        Ok(s) => match s.accounts.get(id) {
+            Some(a) => json_resp(
+                StatusCode::OK,
+                json!({
+                    "auth_json": a.auth_json,
+                    "refresh_token": a.refresh_token,
+                }),
+            ),
+            None => json_resp(StatusCode::NOT_FOUND, json!({"error": "account not found"})),
+        },
+        Err(e) => err_resp(format!("锁获取失败: {}", e)),
     }
 }
 
@@ -416,8 +469,8 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
         match access_token_opt {
             Some(t) => Some(t),
             None => {
-                if let Some(ref rt) = refresh_token {
-                    match crate::oauth::refresh_access_token_locked(&id, rt).await {
+                if refresh_token.is_some() {
+                    match crate::oauth::refresh_access_token_locked_fresh(&state.store, &id).await {
                         Ok(tok) => {
                             let mutated = if let Ok(mut s) = state.store.lock() {
                                 if let Some(acc) = s.accounts.get_mut(&id) {
@@ -441,6 +494,26 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
                             Some(tok.access_token)
                         }
                         Err(e) => {
+                            let terminal = crate::scheduler::is_logged_out_error(&e)
+                                || crate::scheduler::is_revoked_error(&e);
+                            if crate::scheduler::is_logged_out_error(&e) {
+                                if let Ok(mut s) = state.store.lock() {
+                                    if let Some(acc) = s.accounts.get_mut(&id) {
+                                        acc.is_logged_out = true;
+                                        acc.is_token_invalid = false;
+                                    }
+                                }
+                            } else if crate::scheduler::is_revoked_error(&e) {
+                                if let Ok(mut s) = state.store.lock() {
+                                    if let Some(acc) = s.accounts.get_mut(&id) {
+                                        acc.is_token_invalid = true;
+                                        acc.is_logged_out = false;
+                                    }
+                                }
+                            }
+                            if terminal {
+                                schedule_save(state.store.clone());
+                            }
                             quota_error = Some(format!("刷新 token 失败: {}", e));
                             None
                         }
@@ -454,8 +527,14 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
     };
 
     if let Some(at) = access_token {
-        match crate::usage::UsageFetcher::fetch_usage_direct(at, account_id, refresh_token, true, Some(id.to_string()))
-            .await
+        match crate::usage::UsageFetcher::fetch_usage_direct(
+            at,
+            account_id,
+            refresh_token,
+            true,
+            Some(id.to_string()),
+        )
+        .await
         {
             Ok((usage, _)) => {
                 let mutated = if let Ok(mut s) = state.store.lock() {
@@ -478,6 +557,7 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
                         acc.is_banned = false;
                         acc.is_token_invalid = false;
                         acc.is_logged_out = false;
+                        crate::scheduler::clear_recovered_reused_error(acc);
                         quota_refreshed = true;
                         true
                     } else {
@@ -519,6 +599,22 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
     // 不论 quota 刷新是否成功，upsert 本身已落盘；保证 Server UI 也能看到新账号/状态变更
     let _ = state.app_handle.emit("accounts-updated", ());
     crate::tray::update_tray_menu(&state.app_handle);
+
+    if let Some(error) = quota_error.as_deref() {
+        if error.contains("invalid_grant")
+            || crate::scheduler::is_logged_out_error(error)
+            || crate::scheduler::is_revoked_error(error)
+        {
+            let _ = state.app_handle.emit("accounts-updated", ());
+            return json_resp(StatusCode::BAD_REQUEST, json!({
+                "error": if crate::scheduler::is_logged_out_error(error) {
+                    "ACCOUNT_LOGGED_OUT:登录已失效，refresh_token 已过期或被撤销，请重新登录"
+                } else {
+                    error
+                }
+            }));
+        }
+    }
 
     let body = UpsertResult {
         ok: true,
@@ -595,13 +691,13 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
     let access_token = match access_token_opt {
         Some(t) => t,
         None => {
-            let Some(rt) = refresh_token.clone() else {
+            if refresh_token.is_none() {
                 return json_resp(
                     StatusCode::BAD_REQUEST,
                     json!({"error": "TOKEN_INVALID:无 access_token 且无 refresh_token"}),
                 );
-            };
-            match crate::oauth::refresh_access_token_locked(&id, &rt).await {
+            }
+            match crate::oauth::refresh_access_token_locked_fresh(&state.store, &id).await {
                 Ok(tok) => {
                     let mutated = if let Ok(mut s) = state.store.lock() {
                         if let Some(acc) = s.accounts.get_mut(&id) {
@@ -664,6 +760,7 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
                     acc.is_banned = false;
                     acc.is_token_invalid = false;
                     acc.is_logged_out = false;
+                    crate::scheduler::clear_recovered_reused_error(acc);
                     true
                 } else {
                     false

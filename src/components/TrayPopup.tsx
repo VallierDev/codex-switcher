@@ -190,7 +190,7 @@ export function TrayPopup() {
                     {data.account.name}
                     <span className="tp-plan">{q?.plan_type || '-'}</span>
                     {data.account.is_banned && <span className="tp-banned">封号</span>}
-                    {data.account.is_logged_out && !data.account.is_banned && <span className="tp-logged-out">登出</span>}
+                    {data.account.is_logged_out && !data.account.is_banned && <span className="tp-logged-out">需重登</span>}
                     {data.account.is_token_invalid && !data.account.is_banned && !data.account.is_logged_out && <span className="tp-invalid">失效</span>}
                 </div>
             )}

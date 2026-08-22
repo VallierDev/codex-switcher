@@ -152,7 +152,8 @@ pub fn chat_to_responses(chat: &Value, fallback_model: &str) -> Value {
     }
 
     if instructions.trim().is_empty() {
-        instructions = "You are a helpful assistant. Use the provided tools when needed.".to_string();
+        instructions =
+            "You are a helpful assistant. Use the provided tools when needed.".to_string();
     }
 
     // chat tools → responses tools（function 平铺，无 function 包裹）
@@ -223,7 +224,10 @@ pub fn responses_sse_to_chat(sse: &str, model: &str) -> Value {
                     v.get("item_id").and_then(|x| x.as_str()),
                     v.get("delta").and_then(|x| x.as_str()),
                 ) {
-                    fc_args.entry(item_id.to_string()).or_default().push_str(delta);
+                    fc_args
+                        .entry(item_id.to_string())
+                        .or_default()
+                        .push_str(delta);
                 }
             }
             // output_text.done 带整段 text —— 作 delta 的兜底
@@ -345,8 +349,14 @@ pub fn extract_upstream_error(raw: &str) -> Option<String> {
 /// 把组装好的非流式 chat.completion 转成 Chat Completions SSE（text/event-stream）。
 /// 一次性把缓冲好的整条回复拆成几个 chunk 重放，满足 hermes 等只认 SSE delta 的流式客户端。
 pub fn chat_completion_to_sse(chat: &Value) -> String {
-    let id = chat.get("id").and_then(|v| v.as_str()).unwrap_or("chatcmpl-glance-codex");
-    let model = chat.get("model").and_then(|v| v.as_str()).unwrap_or("gpt-5.3-codex-spark");
+    let id = chat
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("chatcmpl-glance-codex");
+    let model = chat
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gpt-5.3-codex-spark");
     let created = chat.get("created").and_then(|v| v.as_u64()).unwrap_or(0);
     let msg = &chat["choices"][0]["message"];
     let finish = chat["choices"][0]
@@ -456,7 +466,8 @@ mod tests {
 
     #[test]
     fn no_image_keeps_spark() {
-        let chat = json!({"model":"gpt-5.3-codex-spark","messages":[{"role":"user","content":"hi"}]});
+        let chat =
+            json!({"model":"gpt-5.3-codex-spark","messages":[{"role":"user","content":"hi"}]});
         let r = chat_to_responses(&chat, "fb");
         assert_eq!(r["model"], "gpt-5.3-codex-spark");
     }
@@ -494,7 +505,10 @@ mod tests {
                    data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n";
         let c = responses_sse_to_chat(sse, "m");
         assert_eq!(c["choices"][0]["message"]["content"], "hello");
-        assert_eq!(c["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "f");
+        assert_eq!(
+            c["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "f"
+        );
         assert_eq!(c["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(c["usage"]["total_tokens"], 5);
     }

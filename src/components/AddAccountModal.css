@@ -114,6 +114,18 @@
     padding: 24px;
 }
 
+/* 弹窗底部按钮栏（cookieEditor / 邀请 / 主动重置等共用）。
+   居中排列 + 内边距 + 顶部分隔线；AddAccountModal 那种内嵌 footer 用 inline
+   style 覆盖 padding/border 即可，这里不设背景以免给它们多一条灰条。 */
+.modal-footer {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 16px 24px;
+    border-top: 1px solid var(--border-color);
+}
+
 .modal-tip {
     margin-bottom: 20px;
     padding: 12px;

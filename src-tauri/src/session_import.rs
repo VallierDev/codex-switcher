@@ -144,10 +144,7 @@ pub fn import_chatgpt_session(
                                     account: acc_clone,
                                     info,
                                 });
-                                println!(
-                                    "[SessionImport] 覆盖死号 {} (id={})",
-                                    name, existing_id
-                                );
+                                println!("[SessionImport] 覆盖死号 {} (id={})", name, existing_id);
                             }
                         }
                         // 同 workspace 但活号 → 不覆盖
@@ -197,15 +194,16 @@ pub fn import_chatgpt_session(
         let store_arc = state.store.clone();
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
-            let base = match crate::remote_client::resolve_base_url(&server_url, &server_url_fallback)
-                .await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("[SessionImport] Server 不可达，跳过 push: {}", e);
-                    return;
-                }
-            };
+            let base =
+                match crate::remote_client::resolve_base_url(&server_url, &server_url_fallback)
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[SessionImport] Server 不可达，跳过 push: {}", e);
+                        return;
+                    }
+                };
             let mut pushed = 0;
             for id in newly_added_ids {
                 let account_clone = {
@@ -220,14 +218,14 @@ pub fn import_chatgpt_session(
                 };
                 match crate::remote_client::upsert_account(&base, &secret, &account_clone).await {
                     Ok(_) => pushed += 1,
-                    Err(e) => eprintln!(
-                        "[SessionImport] push {} 失败: {}",
-                        account_clone.name, e
-                    ),
+                    Err(e) => eprintln!("[SessionImport] push {} 失败: {}", account_clone.name, e),
                 }
             }
             if pushed > 0 {
-                println!("[SessionImport] 导入后已推 {} 个 session 账号到 Server", pushed);
+                println!(
+                    "[SessionImport] 导入后已推 {} 个 session 账号到 Server",
+                    pushed
+                );
                 let _ = app_clone.emit("accounts-updated", ());
             }
         });
@@ -247,15 +245,17 @@ fn collect_session_like(root: &Value) -> Vec<(String, Value)> {
 fn visit(value: &Value, path: &str, out: &mut Vec<(String, Value)>) {
     match value {
         Value::Object(map) => {
-            let access = first_non_empty_str(value, &["accessToken", "access_token"]).or_else(|| {
-                value.get("token").and_then(|t| {
-                    first_non_empty_str(t, &["accessToken", "access_token"])
+            let access = first_non_empty_str(value, &["accessToken", "access_token"])
+                .or_else(|| {
+                    value
+                        .get("token")
+                        .and_then(|t| first_non_empty_str(t, &["accessToken", "access_token"]))
                 })
-            }).or_else(|| {
-                value.get("credentials").and_then(|t| {
-                    first_non_empty_str(t, &["accessToken", "access_token"])
-                })
-            });
+                .or_else(|| {
+                    value
+                        .get("credentials")
+                        .and_then(|t| first_non_empty_str(t, &["accessToken", "access_token"]))
+                });
 
             let has_identity = value.get("user").map(|u| u.is_object()).unwrap_or(false)
                 || first_non_empty_str(value, &["email", "name", "id"]).is_some()
@@ -290,13 +290,10 @@ fn visit(value: &Value, path: &str, out: &mut Vec<(String, Value)>) {
 
 /// 转一条 session → (auth.json, info, name)
 fn convert_one(record: &Value) -> Result<(Value, ImportedSessionInfo, String), String> {
-    let access_token = first_non_empty_str(
-        record,
-        &["accessToken", "access_token"],
-    )
-    .or_else(|| nested_str(record, "token", &["accessToken", "access_token"]))
-    .or_else(|| nested_str(record, "credentials", &["accessToken", "access_token"]))
-    .ok_or_else(|| "缺少 accessToken".to_string())?;
+    let access_token = first_non_empty_str(record, &["accessToken", "access_token"])
+        .or_else(|| nested_str(record, "token", &["accessToken", "access_token"]))
+        .or_else(|| nested_str(record, "credentials", &["accessToken", "access_token"]))
+        .ok_or_else(|| "缺少 accessToken".to_string())?;
 
     let session_token = first_non_empty_str(record, &["sessionToken", "session_token"])
         .or_else(|| nested_str(record, "token", &["sessionToken", "session_token"]))
@@ -335,7 +332,12 @@ fn convert_one(record: &Value) -> Result<(Value, ImportedSessionInfo, String), S
         .or_else(|| first_non_empty_str(record, &["email"]))
         .or_else(|| nested_str(record, "credentials", &["email"]))
         .or_else(|| nested_str(record, "providerSpecificData", &["email"]))
-        .or_else(|| profile.get("email").and_then(|v| v.as_str()).map(String::from))
+        .or_else(|| {
+            profile
+                .get("email")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
         .or_else(|| {
             id_payload
                 .as_ref()
@@ -453,10 +455,7 @@ fn convert_one(record: &Value) -> Result<(Value, ImportedSessionInfo, String), S
     auth_json.insert("auth_mode".to_string(), json!("chatgpt"));
     auth_json.insert("source".to_string(), json!("chatgpt_web_session"));
     if refresh_token.is_none() {
-        auth_json.insert(
-            "session_import_no_refresh".to_string(),
-            json!(true),
-        );
+        auth_json.insert("session_import_no_refresh".to_string(), json!(true));
     }
 
     let name = email
@@ -624,10 +623,9 @@ mod tests {
         assert_eq!(parts.len(), 3);
 
         // payload 能 base64-decode 出 chatgpt_account_id + email
-        let payload: Value = serde_json::from_slice(
-            &general_purpose::URL_SAFE_NO_PAD.decode(parts[1]).unwrap(),
-        )
-        .unwrap();
+        let payload: Value =
+            serde_json::from_slice(&general_purpose::URL_SAFE_NO_PAD.decode(parts[1]).unwrap())
+                .unwrap();
         assert_eq!(payload.get("email").unwrap(), "mark@example.com");
         assert_eq!(
             payload

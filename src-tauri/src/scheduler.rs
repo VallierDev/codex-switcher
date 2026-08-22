@@ -7,7 +7,7 @@
 //!   刷新出来的 token 落盘到 `~/.codex/auth.json`（用 +24h 撒谎 expires_at 让
 //!   Codex.app 永远不会自己 refresh，rt 单写者就是本程序）
 
-use crate::account::AccountStore;
+use crate::account::{Account, AccountStore};
 use crate::oauth;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -34,29 +34,66 @@ struct RefreshFailedPayload {
 
 /// rt 被其他持有者(本机另一刷新路径 / 手机 Codex.app)抢先轮换 → **瞬时冲突，可恢复**：
 /// store 里早已是赢家写回的最新 rt，下一轮用最新 rt 即可自愈。绝不当死号/需重新登录。
-fn is_reused_error(reason: &str) -> bool {
+pub(crate) fn is_reused_error(reason: &str) -> bool {
     reason.to_lowercase().contains("refresh_token_reused")
+}
+
+/// 额度/API 已再次成功时，只清掉可恢复的 RT 轮换冲突历史。
+/// `invalid_refresh_token` 等终态不能因为旧 access token 暂时还能查额度就被掩盖。
+pub(crate) fn clear_recovered_reused_error(account: &mut Account) -> bool {
+    let should_clear = account
+        .keepalive
+        .last_error
+        .as_deref()
+        .map(is_reused_error)
+        .unwrap_or(false);
+    if should_clear {
+        account.keepalive.last_error = None;
+    }
+    should_clear
 }
 
 /// 账号停用等真失效（标 is_token_invalid「过期」）。注意 rt 被作废 / session 结束的那批
 /// 走 is_logged_out_error（标「需重新登录」），不在这里。
-fn is_revoked_error(reason: &str) -> bool {
+pub(crate) fn is_revoked_error(reason: &str) -> bool {
     let lower = reason.to_lowercase();
     lower.contains("deactivated") || lower.contains("unauthorized")
 }
 
 /// 需要重新登录：session 结束 / rt 被作废 / 被顶号——刷新也救不回，只能重登（标 is_logged_out）。
-fn is_logged_out_error(reason: &str) -> bool {
+pub(crate) fn is_logged_out_error(reason: &str) -> bool {
     let lower = reason.to_lowercase();
     lower.contains("logged out")
         || lower.contains("signed in to another account")
         || lower.contains("refresh_token_invalidated")
         || lower.contains("refresh_token_expired")
+        || lower.contains("invalid_refresh_token")
         || lower.contains("session has ended")
         || lower.contains("session_expired")
         || lower.contains("please log in again")
         || lower.contains("please sign in again")
         || lower.contains("invalid_grant")
+}
+
+/// 把旧版本已经记录下来的明确 refresh-token 终态错误回填到账号状态。
+/// 纯本地迁移：不发网络请求，也不会再次消费 refresh token。
+pub(crate) fn reconcile_persisted_auth_failures(store: &mut AccountStore) -> usize {
+    let mut changed = 0usize;
+    for account in store.accounts.values_mut() {
+        let terminal = account
+            .keepalive
+            .last_error
+            .as_deref()
+            .map(is_logged_out_error)
+            .unwrap_or(false);
+        if terminal && !account.is_logged_out {
+            account.is_logged_out = true;
+            account.is_token_invalid = false;
+            account.keepalive.inactive_refresh_enabled = false;
+            changed += 1;
+        }
+    }
+    changed
 }
 
 /// 启动后台状态同步调度器
@@ -224,8 +261,7 @@ pub fn start(
                         //   logged_out / revoked = rt 真的没了 → 需重新登录
                         //   reused = rt 被抢先轮换的瞬时冲突，store 已是最新 rt，下轮自愈 → 绝不停用/不标记
                         //   其它(网络/429/5xx/超时) = 瞬时 → 不标记
-                        let fatal =
-                            is_logged_out_error(&reason) || is_revoked_error(&reason);
+                        let fatal = is_logged_out_error(&reason) || is_revoked_error(&reason);
                         if fatal {
                             // 风险保护：真失效才停用该账号的非活跃保活，避免重复消耗。
                             let _ = store.set_inactive_refresh_enabled(&target.id, false);
@@ -270,6 +306,33 @@ pub fn start(
             tokio::time::sleep(Duration::from_secs(u64::from(interval_minutes) * 60)).await;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_refresh_token_is_terminal_logged_out_error() {
+        let reason = r#"刷新令牌被拒绝: {"error":{"message":"Invalid refresh token.","code":"invalid_refresh_token"}}"#;
+        assert!(is_logged_out_error(reason));
+        assert!(!is_reused_error(reason));
+    }
+
+    #[test]
+    fn network_refresh_failure_is_not_terminal_logged_out_error() {
+        let reason = "刷新令牌失败: error sending request: operation timed out";
+        assert!(!is_logged_out_error(reason));
+        assert!(!is_revoked_error(reason));
+    }
+
+    #[test]
+    fn reused_refresh_token_is_transient_not_logged_out() {
+        let reason = r#"{"error":{"code":"refresh_token_reused"}}"#;
+        assert!(is_reused_error(reason));
+        assert!(!is_logged_out_error(reason));
+        assert!(!is_revoked_error(reason));
+    }
 }
 
 /// 启动手机锚专用刷新循环（v0.7+）。
@@ -400,9 +463,7 @@ pub fn start_anchor_refresh(
                     };
 
                     // 3b) 写盘（extended_expiry 防 Codex.app 自刷）
-                    if let Err(e) =
-                        AccountStore::write_codex_auth_extended_expiry(&auth_value)
-                    {
+                    if let Err(e) = AccountStore::write_codex_auth_extended_expiry(&auth_value) {
                         eprintln!("[AnchorRefresh] 写 ~/.codex/auth.json 失败: {}", e);
                     } else {
                         println!(

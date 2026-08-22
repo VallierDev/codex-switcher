@@ -69,11 +69,7 @@ pub fn list_codex_sessions(
             }
             Ok(None) => continue,
             Err(e) => {
-                eprintln!(
-                    "[CodexSessions] 解析 {} 失败: {}",
-                    path.display(),
-                    e
-                );
+                eprintln!("[CodexSessions] 解析 {} 失败: {}", path.display(), e);
                 continue;
             }
         }
@@ -199,7 +195,10 @@ fn parse_session_head(path: &Path) -> Result<Option<CodexSession>, String> {
     if first.get("type").and_then(|v| v.as_str()) != Some("session_meta") {
         return Ok(None);
     }
-    let payload = first.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+    let payload = first
+        .get("payload")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let session_id = payload
         .get("id")
         .and_then(|v| v.as_str())
@@ -283,7 +282,13 @@ fn parse_session_head(path: &Path) -> Result<Option<CodexSession>, String> {
 fn clean_user_text(s: &str) -> String {
     let collapsed: String = s
         .chars()
-        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     // 压连续空格
     let mut out = String::with_capacity(collapsed.len().min(220));

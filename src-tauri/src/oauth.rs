@@ -15,6 +15,9 @@ pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// 进程级共享 reqwest::Client：连接池可复用，避免每次 quota 刷新都跑 TLS 握手。
 /// 给整个请求加了一个 connect+request 双限，避免少数账号让 /oauth/token 无限期挂起
 /// （之前 heydsoneicke@gmail.com 的 "刷新不回来" 就是这个 case）。
+///
+/// OAuth 换码和 refresh 不在应用层指定代理，由系统网络层（Clash/TUN、250
+/// 透明接管或环境变量代理）决定实际出口。
 fn token_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -121,6 +124,35 @@ fn rt_lock_for(account_id: &str) -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
+static ROTATED_REFRESH_TOKENS: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
+
+/// 最近一次成功轮换出的 refresh token。
+///
+/// 仅靠 mutex 仍会留下一个窗口：调用方可能在等待 mutex 前就从 store
+/// 取出了旧 rt，拿到锁后再用这个旧 rt 请求 OpenAI。OpenAI 的 refresh token
+/// 是一次性轮换的，这会直接产生 refresh_token_reused。这个进程内缓存让
+/// 排队者在拿锁后改用前一个调用刚写出的新 rt；账号重启/重新登录后使用新的
+/// account id，不会复用旧会话的缓存。
+fn latest_rotated_refresh_token(account_id: &str) -> Option<String> {
+    ROTATED_REFRESH_TOKENS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|g| g.get(account_id).cloned())
+}
+
+fn remember_rotated_refresh_token(account_id: &str, refresh_token: Option<&String>) {
+    let Some(refresh_token) = refresh_token else {
+        return;
+    };
+    if let Ok(mut g) = ROTATED_REFRESH_TOKENS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        g.insert(account_id.to_string(), refresh_token.clone());
+    }
+}
+
 /// 锁保护版的 `refresh_access_token`：同 account_id 强串行。
 /// 任何 Server 端调 OpenAI rotate rt 的地方都该用这个；裸版本只留给 OAuth 初次换码。
 pub async fn refresh_access_token_locked(
@@ -129,7 +161,26 @@ pub async fn refresh_access_token_locked(
 ) -> Result<TokenResponse, String> {
     let lock = rt_lock_for(account_id);
     let _guard = lock.lock().await;
-    refresh_access_token(refresh_token).await
+    // 先尝试调用方传入的 token。若它是在排队等锁期间被前一个调用消费掉的，
+    // OpenAI 会明确返回 refresh_token_reused；此时才使用本进程最近成功轮换出的
+    // token 重试，避免把一次并发冲突扩大成账号失效，同时不影响重新登录后的新 rt。
+    let mut result = refresh_access_token(refresh_token).await;
+    if result
+        .as_ref()
+        .err()
+        .map(|e| e.to_lowercase().contains("refresh_token_reused"))
+        .unwrap_or(false)
+    {
+        if let Some(latest) =
+            latest_rotated_refresh_token(account_id).filter(|latest| latest != refresh_token)
+        {
+            result = refresh_access_token(&latest).await;
+        }
+    }
+    if let Ok(ref tokens) = result {
+        remember_rotated_refresh_token(account_id, tokens.refresh_token.as_ref());
+    }
+    result
 }
 
 /// store-aware 锁保护刷新：拿锁后**在锁内重新读取最新 rt**，而不是用调用方预先捕获的
@@ -156,10 +207,23 @@ pub async fn refresh_access_token_locked_fresh(
             .ok_or_else(|| "缺 refresh_token".to_string())?
     };
 
-    let res = refresh_access_token(&rt).await;
+    let mut res = refresh_access_token(&rt).await;
+    if res
+        .as_ref()
+        .err()
+        .map(|e| e.to_lowercase().contains("refresh_token_reused"))
+        .unwrap_or(false)
+    {
+        if let Some(latest) =
+            latest_rotated_refresh_token(account_id).filter(|latest| latest != &rt)
+        {
+            res = refresh_access_token(&latest).await;
+        }
+    }
 
     // 成功则锁内写回，串行化的下一个调用就能读到最新 rt
     if let Ok(ref tokens) = res {
+        remember_rotated_refresh_token(account_id, tokens.refresh_token.as_ref());
         if let Ok(mut s) = store.lock() {
             if let Some(acc) = s.accounts.get_mut(account_id) {
                 crate::account::AccountStore::apply_refreshed_tokens(
@@ -215,8 +279,7 @@ pub async fn refresh_access_token(refresh_token: &str) -> Result<TokenResponse, 
                 last_err = format!("刷新令牌失败: {}", e);
                 if attempt < 2 {
                     // 200ms / 600ms 退避，避开瞬时抖动
-                    tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 * 2 + 1)))
-                        .await;
+                    tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 * 2 + 1))).await;
                 }
             }
         }

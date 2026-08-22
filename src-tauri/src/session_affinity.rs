@@ -100,8 +100,7 @@ impl SessionAffinity {
                 }
                 e.hit_count = e.hit_count.saturating_add(1);
                 if cached_tokens > 0 {
-                    e.total_cached_tokens =
-                        e.total_cached_tokens.saturating_add(cached_tokens);
+                    e.total_cached_tokens = e.total_cached_tokens.saturating_add(cached_tokens);
                 }
             }
             _ => {

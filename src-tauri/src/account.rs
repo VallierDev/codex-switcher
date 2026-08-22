@@ -594,21 +594,26 @@ fn write_text_secure(path: &Path, content: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn codex_switcher_home_dir() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("CODEX_SWITCHER_TEST_HOME") {
+        return PathBuf::from(path);
+    }
+
+    dirs::home_dir().expect("无法获取用户目录")
+}
+
 impl AccountStore {
     /// 配置文件路径
     pub fn config_path() -> PathBuf {
-        dirs::home_dir()
-            .expect("无法获取用户目录")
+        codex_switcher_home_dir()
             .join(".codex-switcher")
             .join("accounts.json")
     }
 
     /// Codex auth.json 路径
     pub fn codex_auth_path() -> PathBuf {
-        dirs::home_dir()
-            .expect("无法获取用户目录")
-            .join(".codex")
-            .join("auth.json")
+        codex_switcher_home_dir().join(".codex").join("auth.json")
     }
 
     /// 加载账号存储
@@ -689,25 +694,105 @@ impl AccountStore {
         // 跟 src/data/relay_presets.ts 对齐，覆盖 0.5.30 之前可能没被标 Relay 的 preset。
         // 这里只填路由必要字段；详细的 model_map 留给运行时（UI 修过的也尊重）。
         const KNOWN_RELAY_PRESETS: &[(&str, &str, &str, &str)] = &[
-            ("deepseek_api", "https://api.deepseek.com/v1", "chat_completions", "deepseek-v4-pro"),
-            ("moonshot_kimi", "https://api.moonshot.cn/v1", "chat_completions", "kimi-k2-turbo-preview"),
-            ("minimax_api", "https://api.minimaxi.com/v1", "chat_completions", "MiniMax-M2"),
-            ("alibaba_dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1", "chat_completions", "qwen-max"),
-            ("tencent_hunyuan", "https://api.hunyuan.cloud.tencent.com/v1", "chat_completions", "hunyuan-large"),
-            ("baidu_qianfan", "https://qianfan.baidubce.com/v2", "chat_completions", "ernie-4.5-turbo-128k"),
-            ("fireworks_ai", "https://api.fireworks.ai/inference/v1", "chat_completions", "accounts/fireworks/models/kimi-k2-instruct"),
-            ("stepfun_step", "https://api.stepfun.com/v1", "chat_completions", "step-2-16k"),
-            ("openrouter", "https://openrouter.ai/api/v1", "chat_completions", "anthropic/claude-3.5-sonnet"),
-            ("volcengine_ark", "https://ark.cn-beijing.volces.com/api/v3", "chat_completions", "doubao-pro-32k"),
-            ("ucloud_modelverse", "https://api.modelverse.cn/v1", "chat_completions", "deepseek-v3.1"),
-            ("glm", "https://open.bigmodel.cn/api/paas/v4", "chat_completions", "glm-5.1"),
-            ("glm_coding", "https://open.bigmodel.cn/api/coding/paas/v4", "chat_completions", "glm-5.1"),
-            ("mimo_token_plan_sgp", "https://token-plan-sgp.xiaomimimo.com/v1", "chat_completions", "mimo-v2.5-pro"),
-            ("mimo_api_pay", "https://api.xiaomimimo.com/v1", "chat_completions", "mimo-v2.5-pro"),
+            (
+                "deepseek_api",
+                "https://api.deepseek.com/v1",
+                "chat_completions",
+                "deepseek-v4-pro",
+            ),
+            (
+                "moonshot_kimi",
+                "https://api.moonshot.cn/v1",
+                "chat_completions",
+                "kimi-k2-turbo-preview",
+            ),
+            (
+                "minimax_api",
+                "https://api.minimaxi.com/v1",
+                "chat_completions",
+                "MiniMax-M2",
+            ),
+            (
+                "alibaba_dashscope",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "chat_completions",
+                "qwen-max",
+            ),
+            (
+                "tencent_hunyuan",
+                "https://api.hunyuan.cloud.tencent.com/v1",
+                "chat_completions",
+                "hunyuan-large",
+            ),
+            (
+                "baidu_qianfan",
+                "https://qianfan.baidubce.com/v2",
+                "chat_completions",
+                "ernie-4.5-turbo-128k",
+            ),
+            (
+                "fireworks_ai",
+                "https://api.fireworks.ai/inference/v1",
+                "chat_completions",
+                "accounts/fireworks/models/kimi-k2-instruct",
+            ),
+            (
+                "stepfun_step",
+                "https://api.stepfun.com/v1",
+                "chat_completions",
+                "step-2-16k",
+            ),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "chat_completions",
+                "anthropic/claude-3.5-sonnet",
+            ),
+            (
+                "volcengine_ark",
+                "https://ark.cn-beijing.volces.com/api/v3",
+                "chat_completions",
+                "doubao-pro-32k",
+            ),
+            (
+                "ucloud_modelverse",
+                "https://api.modelverse.cn/v1",
+                "chat_completions",
+                "deepseek-v3.1",
+            ),
+            (
+                "glm",
+                "https://open.bigmodel.cn/api/paas/v4",
+                "chat_completions",
+                "glm-5.1",
+            ),
+            (
+                "glm_coding",
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "chat_completions",
+                "glm-5.1",
+            ),
+            (
+                "mimo_token_plan_sgp",
+                "https://token-plan-sgp.xiaomimimo.com/v1",
+                "chat_completions",
+                "mimo-v2.5-pro",
+            ),
+            (
+                "mimo_api_pay",
+                "https://api.xiaomimimo.com/v1",
+                "chat_completions",
+                "mimo-v2.5-pro",
+            ),
             ("generic_responses_relay", "", "responses", ""),
             ("aiberm", "", "responses", ""),
             ("whatai", "", "responses", ""),
-            ("modelscope", "https://api-inference.modelscope.cn/v1", "chat_completions", "Qwen/Qwen2.5-72B-Instruct"),
+            (
+                "modelscope",
+                "https://api-inference.modelscope.cn/v1",
+                "chat_completions",
+                "Qwen/Qwen2.5-72B-Instruct",
+            ),
             ("freemodel", "https://api.freemodel.dev", "responses", ""),
         ];
         let mut changed = false;
@@ -723,9 +808,8 @@ impl AccountStore {
                 .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_string())
                 .filter(|s| !s.is_empty());
             let Some(pid) = preset_id else { continue };
-            let Some((_, base, protocol, fallback)) = KNOWN_RELAY_PRESETS
-                .iter()
-                .find(|(id, _, _, _)| *id == pid)
+            let Some((_, base, protocol, fallback)) =
+                KNOWN_RELAY_PRESETS.iter().find(|(id, _, _, _)| *id == pid)
             else {
                 continue;
             };
@@ -801,7 +885,9 @@ impl AccountStore {
                 "coding_plan"
             } else {
                 match preset_id.as_deref() {
-                    Some("glm_coding") | Some("mimo_token_plan_sgp") | Some("volcengine_ark")
+                    Some("glm_coding")
+                    | Some("mimo_token_plan_sgp")
+                    | Some("volcengine_ark")
                     | Some("ucloud_modelverse") => "coding_plan",
                     Some("generic_responses_relay") | Some("freemodel") | Some("custom") => {
                         "aggregator"
@@ -1381,6 +1467,14 @@ impl AccountStore {
 /// 从 `tokens.access_token` (JWT) 解出 `exp` claim 并转 RFC3339。
 /// 用于 v0.7.1 退出兜底：OpenAI 给的 access_token JWT 真实寿命 ~240h，
 /// 远大于 OAuth response 里 `expires_in: 86400` 字段，所以单独走 JWT 解码。
+/// access_token JWT 距过期还剩多少秒（负数 = 已过期；None = 无 token / 解不出 exp）。
+/// 手机锚保活用：client 拉到锚 token 后据此判断要不要让 Server 强刷。
+pub fn access_token_ttl_secs(auth: &Value) -> Option<i64> {
+    let iso = extract_access_token_jwt_exp_iso(auth)?;
+    let exp = chrono::DateTime::parse_from_rfc3339(&iso).ok()?.timestamp();
+    Some(exp - Utc::now().timestamp())
+}
+
 fn extract_access_token_jwt_exp_iso(auth: &Value) -> Option<String> {
     use base64::Engine;
     let at = auth
@@ -1441,9 +1535,7 @@ impl AccountStore {
         let group: Vec<&Account> = self
             .accounts
             .values()
-            .filter(|a| {
-                Self::extract_openai_user_id(&a.auth_json).as_deref() == Some(uid.as_str())
-            })
+            .filter(|a| Self::extract_openai_user_id(&a.auth_json).as_deref() == Some(uid.as_str()))
             .collect();
         if group.len() <= 1 {
             return false;
@@ -1978,9 +2070,14 @@ mod tests {
     #[test]
     fn anchor_can_be_set_on_oauth_account() {
         let (mut store, pro_id, _free_id) = make_oauth_store();
-        assert!(store.session_anchor_id().is_none(), "新 store 默认无 anchor");
+        assert!(
+            store.session_anchor_id().is_none(),
+            "新 store 默认无 anchor"
+        );
 
-        store.set_session_anchor(&pro_id, true).expect("OAuth 号可以当 anchor");
+        store
+            .set_session_anchor(&pro_id, true)
+            .expect("OAuth 号可以当 anchor");
 
         assert_eq!(store.session_anchor_id().as_deref(), Some(pro_id.as_str()));
         assert!(store.accounts.get(&pro_id).unwrap().is_session_anchor);

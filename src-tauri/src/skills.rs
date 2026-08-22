@@ -1,7 +1,7 @@
 //! Skills 管理模块
 //!
 //! SSOT 目录: ~/.codex/skills/
-//! 同步到: ~/.claude/skills/, ~/.gemini/skills/, ~/.config/opencode/skills/, ~/.agents/skills/
+//! 同步到: ~/.claude/skills/, ~/.gemini/skills/, ~/.config/opencode/skills/, ~/.agents/skills/, ~/.grok/skills/, ~/.kimi-code/skills/, ~/.gemini/antigravity/.agents/skills/
 //! 数据存储: ~/.codex-switcher/skills.json
 
 use chrono::{DateTime, Utc};
@@ -20,6 +20,12 @@ pub struct SkillApps {
     pub opencode: bool,
     #[serde(default)]
     pub zcode: bool,
+    #[serde(default)]
+    pub grok: bool,
+    #[serde(default)]
+    pub kimi: bool,
+    #[serde(default)]
+    pub antigravity: bool,
 }
 
 impl Default for SkillApps {
@@ -30,6 +36,9 @@ impl Default for SkillApps {
             gemini: false,
             opencode: false,
             zcode: false,
+            grok: false,
+            kimi: false,
+            antigravity: false,
         }
     }
 }
@@ -121,6 +130,14 @@ fn app_skills_dir(app: &str) -> Option<PathBuf> {
         "claude" => Some(home.join(".claude").join("skills")),
         "gemini" => Some(home.join(".gemini").join("skills")),
         "zcode" => Some(home.join(".agents").join("skills")),
+        "grok" => Some(home.join(".grok").join("skills")),
+        "kimi" => Some(home.join(".kimi-code").join("skills")),
+        "antigravity" => Some(
+            home.join(".gemini")
+                .join("antigravity")
+                .join(".agents")
+                .join("skills"),
+        ),
         "opencode" => {
             // Windows: %APPDATA%\opencode\skills, Unix: ~/.config/opencode/skills
             #[cfg(windows)]
@@ -141,12 +158,9 @@ pub fn init_ssot() -> Result<(), String> {
     let ssot = ssot_dir();
     let codex_skills = dirs::home_dir().unwrap().join(".codex").join("skills");
 
-    // SSOT 已存在且 codex 已经是 symlink → 不需要迁移
-    if ssot.exists() && codex_skills.is_symlink() {
-        return Ok(());
-    }
-
-    // SSOT 不存在 → 需要创建
+    // SSOT 不存在 → 需要创建。
+    // 即使 SSOT 和 Codex 已经准备好，也不能在这里提前返回；其他 CLI
+    // （尤其是 Claude）的 skills 链接可能被外部工具删除，需要继续补齐。
     if !ssot.exists() {
         std::fs::create_dir_all(&ssot).map_err(|e| format!("创建 SSOT 目录失败: {}", e))?;
 
@@ -179,7 +193,16 @@ pub fn init_ssot() -> Result<(), String> {
     }
 
     // 确保各 CLI 的 skills 目录是指向 SSOT 的 symlink
-    let apps = ["codex", "claude", "gemini", "opencode", "zcode"];
+    let apps = [
+        "codex",
+        "claude",
+        "gemini",
+        "opencode",
+        "zcode",
+        "grok",
+        "kimi",
+        "antigravity",
+    ];
     for app in &apps {
         link_app_to_ssot(app)?;
     }
@@ -212,7 +235,7 @@ fn link_app_to_ssot(app: &str) -> Result<(), String> {
                 .unwrap_or(false);
             if is_empty {
                 let _ = std::fs::remove_dir(&target);
-            } else if app == "zcode" {
+            } else if should_migrate_existing_app_skills(app) {
                 migrate_existing_app_skills_to_ssot(app, &target, &ssot)?;
                 let _ = std::fs::remove_dir_all(&target);
             } else {
@@ -265,7 +288,11 @@ fn link_app_to_ssot(app: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// ZCode 的共享目录 ~/.agents/skills 可能已被独立安装过 skill。
+fn should_migrate_existing_app_skills(app: &str) -> bool {
+    matches!(app, "zcode" | "grok" | "kimi" | "antigravity")
+}
+
+/// 部分客户端的用户 skills 目录可能已被独立安装过 skill。
 /// 启用共享时先并入 SSOT，再把目录替换成 symlink，避免丢失原有内容。
 fn migrate_existing_app_skills_to_ssot(
     app: &str,
@@ -431,7 +458,16 @@ impl SkillStore {
         let mut status = std::collections::HashMap::new();
         let ssot = ssot_dir();
 
-        for app in &["codex", "claude", "gemini", "opencode", "zcode"] {
+        for app in &[
+            "codex",
+            "claude",
+            "gemini",
+            "opencode",
+            "zcode",
+            "grok",
+            "kimi",
+            "antigravity",
+        ] {
             let linked = if let Some(target) = app_skills_dir(app) {
                 if target.is_symlink() {
                     std::fs::read_link(&target)

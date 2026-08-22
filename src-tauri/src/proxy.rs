@@ -31,6 +31,7 @@ use tungstenite::client::IntoClientRequest;
 use crate::account::AccountStore;
 use crate::session_affinity::SessionAffinity;
 use crate::session_routes::SessionRoutesStore;
+use crate::sse_watchdog::{wrap_with_sse_watchdog, SseStreamDiagnostic};
 use crate::switch_log::{SwitchLogger, SwitchReason};
 use crate::token_tracker::TokenTracker;
 
@@ -114,7 +115,10 @@ async fn silent_refresh_current(state: &ProxyState) -> SilentRefreshOutcome {
     if matches!(remote_mode.as_str(), "client" | "solo") && !secret.is_empty() {
         match crate::remote_client::resolve_base_url(&primary, &fallback).await {
             Ok(base) => {
-                match crate::remote_client::fetch_token(&base, &secret, &current_id).await {
+                // 401 不能只 GET 旧 token：Server 可能还没把刚轮换的 token
+                // 写回到它的缓存。本机必须走 Server 的单刷新者端点，由 Server
+                // 在账号锁内重新读取/轮换 RT，并把最新 auth_json 返回。
+                match crate::remote_client::refresh_token_now(&base, &secret, &current_id).await {
                     Ok(t) => {
                         // 把 Server 的 auth_json 应用到本机 store + 写盘 auth.json
                         let token_str = AccountStore::extract_access_token(&t.auth_json);
@@ -158,22 +162,7 @@ async fn silent_refresh_current(state: &ProxyState) -> SilentRefreshOutcome {
         );
     }
 
-    let rt = {
-        let store = match state.store.lock() {
-            Ok(s) => s,
-            Err(_) => return SilentRefreshOutcome::OtherError("store lock 失败".into()),
-        };
-        match store
-            .accounts
-            .get(&current_id)
-            .and_then(|a| a.refresh_token.clone())
-        {
-            Some(rt) => rt,
-            None => return SilentRefreshOutcome::NoRefreshToken,
-        }
-    };
-
-    match crate::oauth::refresh_access_token_locked(&current_id, &rt).await {
+    match crate::oauth::refresh_access_token_locked_fresh(&state.store, &current_id).await {
         Ok(new_tokens) => {
             // apply 到 store
             let updated_auth = if let Ok(mut store) = state.store.lock() {
@@ -690,8 +679,13 @@ fn resolve_hard_route(
 ) -> Option<(String, String)> {
     // 显式 fallback：先按 codex 实际发的 session_id / thread_id header 直接抠，
     // 跟 session_affinity 模块兼容（`hdr:` 前缀）。
+    //
+    // `x-pod-worker-route` 单独排在最前面：它是纯本地路由 key，跟
+    // `session-id`/`thread-id` 这两个 pod-worker 也会发的"仿真展示"字段分开——
+    // 展示字段每次请求都是新随机 UUID，如果混进这个候选列表且排在路由 key 前面，
+    // 会先命中一个永远查不到路由的随机值，导致硬路由失效。
     let sk: Option<String> = (|| -> Option<String> {
-        for name in &["session_id", "session-id", "x-session-id", "thread_id"] {
+        for name in &["x-pod-worker-route", "session_id", "session-id", "x-session-id", "thread_id"] {
             if let Some(v) = headers.get(*name).and_then(|v| v.to_str().ok()) {
                 if !v.is_empty() {
                     return Some(format!("hdr:{v}"));
@@ -794,6 +788,49 @@ fn rewrite_model_in_body(
         }
     }
     body.clone()
+}
+
+/// Normalize standard OpenAI Responses options for ChatGPT's Codex backend.
+///
+/// Pi and other OpenAI-compatible SDKs legitimately send optional public API
+/// fields that `chatgpt.com/backend-api/codex/responses` does not currently
+/// accept. They are transport hints rather than prompt content, so dropping
+/// them keeps the request semantics and lets the backend apply its defaults.
+/// OpenAI-key and third-party Relay requests must bypass this function.
+fn normalize_chatgpt_responses_body(
+    body: &Bytes,
+    path_and_query: &str,
+    headers: &reqwest::header::HeaderMap,
+) -> Bytes {
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    let pi_compat = headers
+        .get("x-pi-agent-sdk")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    if !pi_compat || (path != "/v1/responses" && path != "/responses") {
+        return body.clone();
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body.clone();
+    };
+    let mut changed = false;
+    for key in [
+        "max_output_tokens",
+        "prompt_cache_retention",
+        "prompt_cache_options",
+    ] {
+        changed |= object.remove(key).is_some();
+    }
+    if !changed {
+        return body.clone();
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| body.clone())
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -1259,12 +1296,12 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
     };
 
     // 选供号：第一个非 relay 且 plan_type==pro 的账号（Spark 专属）。
-    let (token, account_id, name) = {
+    let (token, name) = {
         let store = match state.store.lock() {
             Ok(s) => s,
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
-        let mut picked: Option<(String, Option<String>, String)> = None;
+        let mut picked: Option<(String, String)> = None;
         for (_id, acc) in store.accounts.iter() {
             if acc.is_relay() {
                 continue;
@@ -1276,11 +1313,7 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
                 .unwrap_or_default();
             if plan == "pro" {
                 if let Some(tok) = AccountStore::extract_access_token(&acc.auth_json) {
-                    picked = Some((
-                        tok,
-                        AccountStore::extract_account_id(&acc.auth_json),
-                        acc.name.clone(),
-                    ));
+                    picked = Some((tok, acc.name.clone()));
                     break;
                 }
             }
@@ -1296,9 +1329,16 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
         }
     };
 
-    let want_stream = chat.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let want_stream = chat
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let default_model = "gpt-5.3-codex-spark";
-    let responses_body = crate::chat_inbound::chat_to_responses(&chat, default_model);
+    let mut responses_body = crate::chat_inbound::chat_to_responses(&chat, default_model);
+    let sid = uuid::Uuid::new_v4().to_string();
+    if responses_body.get("prompt_cache_key").is_none() {
+        responses_body["prompt_cache_key"] = serde_json::Value::String(sid.clone());
+    }
     let model = responses_body
         .get("model")
         .and_then(|m| m.as_str())
@@ -1306,37 +1346,57 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
         .to_string();
     println!("[ChatInbound] 账号={} model={}", name, model);
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-    {
-        Ok(c) => c,
+    let body_bytes = match serde_json::to_vec(&responses_body) {
+        Ok(v) => Bytes::from(v),
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::HOST,
+        reqwest::header::HeaderValue::from_static("chatgpt.com"),
+    );
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(crate::codex_ua::codex_user_agent()),
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("openai-beta"),
+        reqwest::header::HeaderValue::from_static("responses=experimental"),
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("originator"),
+        reqwest::header::HeaderValue::from_static(crate::codex_ua::CODEX_ORIGINATOR),
+    );
+    if let Ok(v) = reqwest::header::HeaderValue::from_str(&sid) {
+        headers.insert(reqwest::header::HeaderName::from_static("session_id"), v);
+    }
 
     // spark 偶尔"只 reasoning 不出 message"（空响应）—— 最多重试一次。
-    // 每次新 session_id，避免命中相同的空结果缓存。
+    // 这里复用同一个 prompt_cache_key，避免同一入站请求被拆成两个服务端缓存上下文。
     let mut chat_resp = serde_json::Value::Null;
     for attempt in 0..2 {
-        let sid = uuid::Uuid::new_v4().to_string();
-        let mut up = client
-            .post(format!("{}/responses", CHATGPT_ORIGIN))
-            .header("Authorization", format!("Bearer {}", token))
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
-            .header("User-Agent", crate::codex_ua::codex_user_agent())
-            .header("session_id", &sid)
-            .header("Accept", "text/event-stream")
-            .header("Content-Type", "application/json")
-            .json(&responses_body);
-        if let Some(aid) = account_id.as_deref() {
-            if !aid.is_empty() {
-                up = up.header("ChatGPT-Account-Id", aid);
-            }
-        }
-        let resp = match up.send().await {
+        let resp = match forward_with_token(
+            &state,
+            &hyper::Method::POST,
+            &format!("{}/responses", CHATGPT_ORIGIN),
+            &headers,
+            &body_bytes,
+            &token,
+        )
+        .await
+        {
             Ok(r) => r,
-            Err(e) => return error_response(StatusCode::BAD_GATEWAY, &format!("上游请求失败: {}", e)),
+            Err(e) => {
+                return error_response(StatusCode::BAD_GATEWAY, &format!("上游请求失败: {}", e))
+            }
         };
         let status = resp.status();
         let raw = resp.text().await.unwrap_or_default();
@@ -1405,12 +1465,20 @@ async fn handle_request(
     if is_websocket_upgrade(&req) {
         // DEBUG: dump 所有 upgrade headers，找 session_id 藏在哪
         {
+            let dump_all = std::env::var("PROXY_DEBUG_ALL_HEADERS").is_ok();
             println!("[Proxy DEBUG] WS upgrade headers:");
             for (name, value) in req.headers() {
-                let v = value.to_str().unwrap_or("(non-ascii)");
                 let lower = name.as_str().to_lowercase();
-                // 只 print session 相关的，避免日志爆
-                if lower.contains("session")
+                let v = if lower == "authorization" {
+                    "(redacted)"
+                } else {
+                    value.to_str().unwrap_or("(non-ascii)")
+                };
+                // 默认只 print session 相关的，避免日志爆；设
+                // PROXY_DEBUG_ALL_HEADERS=1 时打印真实客户端发的全部 header，
+                // 用来核对官方 codex 的完整 header 集合。
+                if dump_all
+                    || lower.contains("session")
                     || lower.contains("codex")
                     || lower.contains("turn")
                     || lower.contains("originator")
@@ -1535,7 +1603,12 @@ async fn handle_request(
     let (remote_mode, client_direct_upstream) = state
         .store
         .lock()
-        .map(|s| (s.settings.remote_mode.clone(), s.settings.client_direct_upstream))
+        .map(|s| {
+            (
+                s.settings.remote_mode.clone(),
+                s.settings.client_direct_upstream,
+            )
+        })
         .unwrap_or((String::new(), false));
 
     // client_direct_upstream=true：HTTP 也走"本机直连上游"（跟 WS 同路）；
@@ -1622,6 +1695,11 @@ async fn handle_request(
             Ok(t) => t,
             Err(e) => return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE, &e)),
         };
+    let body_bytes = if is_chatgpt {
+        normalize_chatgpt_responses_body(&body_bytes, &path_and_query, &req_headers)
+    } else {
+        body_bytes
+    };
     let session_affinity_ctx = match (session_key.clone(), used_account_id.clone()) {
         (Some(sk), Some(aid)) => Some(AffinityCtx {
             affinity: state.session_affinity.clone(),
@@ -1639,6 +1717,18 @@ async fn handle_request(
         get_upstream(is_chatgpt, relay_base_url.as_deref(), &path_and_query);
 
     // 3. 透明 Header 转发（官方 responses-api-proxy 逻辑）
+    if is_chatgpt && std::env::var("PROXY_DEBUG_ALL_HEADERS").is_ok() {
+        println!("[Proxy DEBUG] HTTP POST {} inbound headers:", path_and_query);
+        for (name, value) in &req_headers {
+            let lower = name.as_str().to_lowercase();
+            let v = if lower == "authorization" {
+                "(redacted)"
+            } else {
+                value.to_str().unwrap_or("(non-ascii)")
+            };
+            println!("[Proxy DEBUG]   {}: {}", name, v);
+        }
+    }
     let base_headers = build_upstream_headers(&req_headers, &upstream_host);
 
     // 5. 首次转发
@@ -1804,12 +1894,17 @@ async fn handle_request(
                     };
                     let log_tag = match &outcome {
                         SilentRefreshOutcome::LoggedOut => "账号已登出/RT 被轮换".to_string(),
-                        SilentRefreshOutcome::NoRefreshToken => "缺 refresh_token 无法刷新".to_string(),
+                        SilentRefreshOutcome::NoRefreshToken => {
+                            "缺 refresh_token 无法刷新".to_string()
+                        }
                         SilentRefreshOutcome::OtherError(e) => format!("瞬时刷新失败: {}", e),
                         _ => unreachable!(),
                     };
                     if let Some(field) = mark_field {
-                        println!("[Proxy] silent_refresh 不可恢复（{}），标记 + 切号", log_tag);
+                        println!(
+                            "[Proxy] silent_refresh 不可恢复（{}），标记 + 切号",
+                            log_tag
+                        );
                         if let Ok(mut store) = state.store.lock() {
                             if let Some(current_id) = store.current.clone() {
                                 if let Some(acc) = store.accounts.get_mut(&current_id) {
@@ -1865,11 +1960,17 @@ async fn handle_request(
         let body_bytes = serde_json::to_vec(&friendly).unwrap_or(resp_bytes.to_vec());
         eprintln!(
             "[Proxy] 401/403 链路完全失败，原始上游 body 前 200 字符: {}",
-            String::from_utf8_lossy(&resp_bytes).chars().take(200).collect::<String>()
+            String::from_utf8_lossy(&resp_bytes)
+                .chars()
+                .take(200)
+                .collect::<String>()
         );
         let _ = state.app_handle.emit(
             "proxy-account-failed",
-            &format!("账号「{}」401/限额耗尽，切号链失败", triggering_account_name),
+            &format!(
+                "账号「{}」401/限额耗尽，切号链失败",
+                triggering_account_name
+            ),
         );
         return Ok(Response::builder()
             .status(status_code.as_u16())
@@ -2457,7 +2558,10 @@ async fn adopt_remote_current(
     let auth_to_write = {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
         store.sync_account_from_auth_json(new_id, t.auth_json.clone());
-        let auth = store.accounts.get(new_id).map(|acc| acc.to_codex_auth_value());
+        let auth = store
+            .accounts
+            .get(new_id)
+            .map(|acc| acc.to_codex_auth_value());
         store.current = Some(new_id.to_string());
         let _ = store.save();
         auth
@@ -2718,7 +2822,9 @@ fn restore_current_if_flagged(state: &ProxyState, entry_id: Option<&str>) {
         } else {
             let _ = store.save();
             invalidate_remote_token_cache();
-            let _ = state.app_handle.emit("proxy-account-switched", &target_name);
+            let _ = state
+                .app_handle
+                .emit("proxy-account-switched", &target_name);
             let _ = state.app_handle.emit("accounts-updated", ());
         }
     } else {
@@ -2757,6 +2863,22 @@ fn build_upstream_headers(
     for (name, value) in req_headers {
         let lower = name.as_str().to_ascii_lowercase();
         if lower == "authorization" || lower == "host" || lower == "connection" {
+            continue;
+        }
+        // `session_id`（下划线）不是官方 codex 客户端会发的 header —— 真实客户端
+        // 用的是 `session-id`/`thread-id`（连字符）。它只被 resolve_hard_route
+        // 当作本地路由 key 使用，一旦透传给 chatgpt.com 就变成"同一账号上反复出现
+        // 的固定非标准 header"，是比随机值更显眼的自动化流量指纹。本地路由用完
+        // 就该在这里剥掉，不让它离开这台机器。
+        // `x-worker-id`/`x-task-id`：pod-worker 自己的任务追踪 header，同样
+        // 从不是官方客户端会发的字段，只对本地/日志有意义，不该离开这台机器。
+        // `x-pod-worker-route`：本地硬路由专用 key（见 resolve_hard_route），
+        // 同理只对本地有意义。
+        if lower == "session_id"
+            || lower == "x-worker-id"
+            || lower == "x-task-id"
+            || lower == "x-pod-worker-route"
+        {
             continue;
         }
         if let Ok(rn) = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
@@ -2964,8 +3086,7 @@ async fn forward_to_server_with_silent_retry(
 
         // 不限额，或最后一次尝试 —— 把 first_chunk 当 prefix，剩余 stream 续上
         let rest = stream.boxed();
-        let resp =
-            build_stream_response_from_parts(status, headers, first_chunk, rest, None, None);
+        let resp = build_stream_response_from_parts(status, headers, first_chunk, rest, None, None);
         if is_rate_limit {
             println!(
                 "[Proxy] silent_retry: max_retries={} 用完仍限额，把最后一次响应透回 codex",
@@ -3605,20 +3726,6 @@ fn make_affinity_ctx(state: &ProxyState, session_key: Option<&str>) -> Option<Af
     })
 }
 
-/// 给 ByteStream 套一层 SSE keep-alive：每 `interval` 没新 chunk 就 yield 一个 SSE 注释
-/// (": keep-alive\n\n")。这是 SSE 协议层的 no-op，浏览器/codex 都会忽略，但能让 TCP 写
-/// 操作有动作，避免 client 那头超时关连接。
-fn wrap_with_sse_heartbeat(inner: ByteStream, interval: std::time::Duration) -> ByteStream {
-    futures_util::stream::unfold(inner, move |mut s| async move {
-        match tokio::time::timeout(interval, s.next()).await {
-            Ok(Some(item)) => Some((item, s)),
-            Ok(None) => None,
-            Err(_) => Some((Ok(Bytes::from_static(b": keep-alive\n\n")), s)),
-        }
-    })
-    .boxed()
-}
-
 // ────────────────────────────────────────────────────────────────
 // Bootstrap-aware streaming response：返回 Response 后在 body stream 内部
 // 跑 bootstrap 嗅探 + 失败重试，期间向 client 发 SSE keep-alive 心跳。
@@ -4225,19 +4332,28 @@ fn build_stream_response_from_parts(
         futures_util::stream::once(async move { Ok(prefix) }).boxed()
     };
     // 仅 SSE 响应才套 keep-alive heartbeat。非 SSE（如 /compact 返回的 JSON）注入
-    // `: keep-alive\n\n` 会把 0x0A 控制字节塞进 JSON 字符串内，codex 解析时报
+    // `: keep-alive\n\n` 会把额外字节塞进 JSON body，导致 codex 解析失败。
     // `control character ( -) found while parsing a string` 直接挂掉。
     let is_sse = headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_lowercase().contains("event-stream"))
         .unwrap_or(false);
-    let rest_after_wrap: ByteStream = if is_sse {
-        wrap_with_sse_heartbeat(rest, std::time::Duration::from_secs(30))
+    let upstream_stream: ByteStream = prefix_stream.chain(rest).boxed();
+    let raw_stream: ByteStream = if is_sse {
+        wrap_with_sse_watchdog(
+            upstream_stream,
+            affinity_ctx
+                .as_ref()
+                .map(|ctx| SseStreamDiagnostic {
+                    session_key: ctx.session_key.clone(),
+                    initial_account_id: ctx.account_id.clone(),
+                })
+                .unwrap_or_default(),
+        )
     } else {
-        rest
+        upstream_stream
     };
-    let raw_stream: ByteStream = prefix_stream.chain(rest_after_wrap).boxed();
 
     let stream = raw_stream.map(move |result| match result {
         Ok(bytes) => {
@@ -4726,7 +4842,9 @@ async fn handle_websocket(
                 }
             } else if is_auth_err {
                 // ───── 3) auth（401/403）→ 原地刷新当前账号 token，不切号 ─────
-                println!("[Proxy] WebSocket 握手 401/403，原地 silent_refresh 当前账号（不切号）...");
+                println!(
+                    "[Proxy] WebSocket 握手 401/403，原地 silent_refresh 当前账号（不切号）..."
+                );
                 match silent_refresh_current(&state).await {
                     SilentRefreshOutcome::Refreshed(new_tok) => {
                         let new_chatgpt = new_tok.starts_with("eyJ");
@@ -4759,7 +4877,10 @@ async fn handle_websocket(
                 }
             } else {
                 // ───── 4) 纯网络层 / 502 / 504 / 未知 → 不切号，直接返回让 codex 重连 ─────
-                eprintln!("[Proxy] WebSocket 上游连接失败（网络层/非额度，不切号）: {}", e);
+                eprintln!(
+                    "[Proxy] WebSocket 上游连接失败（网络层/非额度，不切号）: {}",
+                    e
+                );
                 return Ok(error_response(
                     StatusCode::BAD_GATEWAY,
                     "WebSocket 上游连接失败",
@@ -5058,6 +5179,20 @@ fn detect_ws_rate_limit(msg: &tungstenite::Message) -> bool {
     false
 }
 
+/// 上游全局容量错误必须原样交给 Codex。Codex 能识别 `server_is_overloaded` / `slow_down`
+/// 并按 transient error 重试；如果代理静默吞掉错误帧只发 Close，remote compact 会把它包装成
+/// `502 Bad Gateway: Unknown error`，甚至被下面的断流兜底误合成为 completed。
+fn ws_is_global_capacity_only(msg: &tungstenite::Message) -> bool {
+    let tungstenite::Message::Text(text) = msg else {
+        return false;
+    };
+    let lower = text.to_lowercase();
+    matches_global_capacity(&lower)
+        && !PER_ACCOUNT_LIMIT_KEYWORDS
+            .iter()
+            .any(|kw| lower.contains(kw))
+}
+
 /// 封号关键词
 const BANNED_KEYWORDS: &[&str] = &[
     "deactivated",
@@ -5157,9 +5292,7 @@ async fn bridge_websockets<S1, S2>(
         while let Some(msg) = client_read.next().await {
             match msg {
                 Ok(msg) => {
-                    let cnt = c2u_count_b
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
+                    let cnt = c2u_count_b.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if cnt == 1 {
                         println!(
                             "[Proxy] WS bridge: 首帧 client→upstream ({})",
@@ -5230,12 +5363,11 @@ async fn bridge_websockets<S1, S2>(
         let mut response_id: Option<String> = None;
         let mut saw_completed = false;
         let mut has_function_call = false;
+        let mut forwarded_terminal_error = false;
         while let Some(msg) = upstream_read.next().await {
             match msg {
                 Ok(msg) => {
-                    let cnt = u2c_count_b
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
+                    let cnt = u2c_count_b.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if cnt == 1 {
                         println!(
                             "[Proxy] WS bridge: 首帧 upstream→client ({})",
@@ -5276,19 +5408,17 @@ async fn bridge_websockets<S1, S2>(
                     //     codex App 会自动重连，下一次握手如果还容量满就在握手层
                     //     进 backoff retry（同号），别浪费账号
                     if detect_ws_rate_limit(&msg) {
-                        let is_capacity_only = if let tungstenite::Message::Text(ref t) = msg {
-                            let lower = t.to_lowercase();
-                            matches_global_capacity(&lower)
-                                && !PER_ACCOUNT_LIMIT_KEYWORDS
-                                    .iter()
-                                    .any(|kw| lower.contains(kw))
-                        } else {
-                            false
-                        };
+                        let is_capacity_only = ws_is_global_capacity_only(&msg);
                         if is_capacity_only {
                             println!(
-                                "[Proxy] WebSocket 上游容量满（全局过载），关 WS 不切号 → 等 codex App 重连"
+                                "[Proxy] WebSocket 上游容量满（全局过载），原样透传错误后关 WS，不切号"
                             );
+                            // `remote_compaction_v2` 依赖原始 error.code 判断这是可重试的上游
+                            // 过载。必须先发 error frame，再发 Close；不能静默截断。
+                            if let Err(e) = client_write.send(msg).await {
+                                println!("[Proxy] WS 容量错误帧透传失败: {}", e);
+                            }
+                            forwarded_terminal_error = true;
                         } else if ws_is_spark_r.load(std::sync::atomic::Ordering::Relaxed) {
                             // Spark 模型 429 = Pro 子限额耗尽，与基础额度无关：不切号、不标耗尽，
                             // 只关这条 Spark WS，别把同账号上正常的 gpt-5.5 会话踢走。
@@ -5373,10 +5503,7 @@ async fn bridge_websockets<S1, S2>(
 
                     if msg.is_close() {
                         if let tungstenite::Message::Close(ref cf) = msg {
-                            println!(
-                                "[Proxy] WS bridge: upstream 发送 Close: {:?}",
-                                cf
-                            );
+                            println!("[Proxy] WS bridge: upstream 发送 Close: {:?}", cf);
                         }
                         let _ = client_write.send(msg).await;
                         break;
@@ -5399,12 +5526,12 @@ async fn bridge_websockets<S1, S2>(
             "[Proxy] WS bridge: upstream loop ended — frames={} response_id={:?} saw_completed={} has_function_call={}",
             frames, response_id, saw_completed, has_function_call
         );
-        if !saw_completed && !has_function_call && frames >= 20 {
+        if !forwarded_terminal_error && !saw_completed && !has_function_call && frames >= 20 {
             // 即使 response_id 没抓到，也合成一条（用 generated id）—— 反正 codex 看的是
             // type=response.completed 就当一轮 done，不会拒绝
-            let rid = response_id
-                .clone()
-                .unwrap_or_else(|| format!("resp_synthetic_{}", chrono::Utc::now().timestamp_millis()));
+            let rid = response_id.clone().unwrap_or_else(|| {
+                format!("resp_synthetic_{}", chrono::Utc::now().timestamp_millis())
+            });
             let synthetic = serde_json::json!({
                 "type": "response.completed",
                 "response": {
@@ -5427,6 +5554,10 @@ async fn bridge_websockets<S1, S2>(
                 .await;
             // 主动发 Close 让 codex 干净收尾（不会 reconnect）
             let _ = client_write.send(tungstenite::Message::Close(None)).await;
+        } else if forwarded_terminal_error {
+            println!(
+                "[Proxy] WS bridge: 已透传上游 terminal error，不合成 response.completed"
+            );
         } else if !saw_completed {
             println!(
                 "[Proxy] WS bridge: upstream 中途断（u→c={} 帧 has_fn_call={} → 不合成，codex 会 retry）",
@@ -5530,9 +5661,9 @@ fn normalize_chat_completions_error(
     let code = v
         .pointer("/error/code")
         .and_then(|v| {
-            v.as_str().map(String::from).or_else(|| {
-                v.as_i64().map(|n| n.to_string())
-            })
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
         })
         .unwrap_or_default();
     let hint = crate::provider_quirks::enhance_error_hint(provider, &msg);
@@ -5592,7 +5723,10 @@ fn normalize_chat_completions_error(
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
         let mut error_obj = original_obj.as_object().cloned().unwrap_or_default();
-        error_obj.insert("message".to_string(), serde_json::Value::String(with_hint(&original_msg)));
+        error_obj.insert(
+            "message".to_string(),
+            serde_json::Value::String(with_hint(&original_msg)),
+        );
         Some(serde_json::json!({"error": error_obj}))
     } else {
         None
@@ -5620,7 +5754,11 @@ fn normalize_chat_completions_error(
                 status.as_u16(),
                 new_status.as_u16(),
                 reason,
-                if hint.is_some() { ", with provider hint" } else { "" }
+                if hint.is_some() {
+                    ", with provider hint"
+                } else {
+                    ""
+                }
             );
             (new_status, Bytes::from(bytes))
         }
@@ -5668,8 +5806,15 @@ async fn handle_chat_completions_relay_websocket(
         )
         .await;
         println!("[Proxy] chat_completions Relay WS 适配器已连接");
-    { let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
-        .and_then(|mut f| std::io::Write::write_all(&mut f, b"[ENTRY] WS adapter connected\n")); }
+        {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/codex-relay-debug.log")
+                .and_then(|mut f| {
+                    std::io::Write::write_all(&mut f, b"[ENTRY] WS adapter connected\n")
+                });
+        }
 
         loop {
             // 同时监听：client 下一个消息 / 切号或路由变更触发的 ws_disconnect
@@ -5683,7 +5828,9 @@ async fn handle_chat_completions_relay_websocket(
                     break;
                 }
             };
-            let Some(msg) = next_msg else { break; };
+            let Some(msg) = next_msg else {
+                break;
+            };
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => {
@@ -5703,7 +5850,10 @@ async fn handle_chat_completions_relay_websocket(
             println!("[Proxy] chat relay WS 收到 client msg: {}", kind);
             match msg {
                 tungstenite::Message::Text(text) => {
-                    println!("[Proxy] chat relay WS Text preview: {}", &text[..text.len().min(180)]);
+                    println!(
+                        "[Proxy] chat relay WS Text preview: {}",
+                        &text[..text.len().min(180)]
+                    );
                     if let Err(e) = handle_chat_relay_ws_text(
                         &state,
                         &relay,
@@ -5792,7 +5942,10 @@ where
         crate::relay_translate::translate_request(&body_for_translate, &model)
             .map_err(|e| format!("translator 请求处理失败: {}", e))?;
 
-    eprintln!("[Proxy] chat relay WS 翻译后 body 前200字符: {}", String::from_utf8_lossy(&chat_body[..chat_body.len().min(200)]));
+    eprintln!(
+        "[Proxy] chat relay WS 翻译后 body 前200字符: {}",
+        String::from_utf8_lossy(&chat_body[..chat_body.len().min(200)])
+    );
 
     let base = relay
         .base_url
@@ -5825,15 +5978,30 @@ where
     );
     // DEBUG: dump request to log file
     {
-        let debug_line = format!("[WS] url={} model={} body_len={} webSearchEnabled_in_body={}\n",
-            upstream_url, translator_state.model, chat_body.len(),
-            String::from_utf8_lossy(&chat_body).contains("webSearchEnabled"));
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
+        let debug_line = format!(
+            "[WS] url={} model={} body_len={} webSearchEnabled_in_body={}\n",
+            upstream_url,
+            translator_state.model,
+            chat_body.len(),
+            String::from_utf8_lossy(&chat_body).contains("webSearchEnabled")
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/codex-relay-debug.log")
             .and_then(|mut f| std::io::Write::write_all(&mut f, debug_line.as_bytes()));
         // Dump first 500 chars of body
         let preview = String::from_utf8_lossy(&chat_body[..chat_body.len().min(500)]);
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
-            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("  body_preview: {}\n\n", preview).as_bytes()));
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/codex-relay-debug.log")
+            .and_then(|mut f| {
+                std::io::Write::write_all(
+                    &mut f,
+                    format!("  body_preview: {}\n\n", preview).as_bytes(),
+                )
+            });
     }
     let upstream_resp = state
         .client
@@ -5888,9 +6056,10 @@ where
                             break;
                         }
                         crate::relay_translate::ChatSseEvent::Data(payload) => {
-                            for translated in
-                                crate::relay_translate::handle_chunk(&mut translator_state, &payload)
-                            {
+                            for translated in crate::relay_translate::handle_chunk(
+                                &mut translator_state,
+                                &payload,
+                            ) {
                                 send_sse_events_as_ws_json(client_ws, translated).await?;
                             }
                         }
@@ -5998,8 +6167,23 @@ async fn handle_chat_completions_relay(
     }
 
     // DEBUG: log HTTP relay entry
-    { let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
-        .and_then(|mut f| std::io::Write::write_all(&mut f, format!("[HTTP-ENTRY] path={} body_len={}\n", path_and_query, body_bytes.len()).as_bytes())); }
+    {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/codex-relay-debug.log")
+            .and_then(|mut f| {
+                std::io::Write::write_all(
+                    &mut f,
+                    format!(
+                        "[HTTP-ENTRY] path={} body_len={}\n",
+                        path_and_query,
+                        body_bytes.len()
+                    )
+                    .as_bytes(),
+                )
+            });
+    }
     // 翻译请求体
     if body_bytes.is_empty() {
         eprintln!(
@@ -6023,7 +6207,11 @@ async fn handle_chat_completions_relay(
         Some("zstd") | Some("x-zstd") => match zstd::decode_all(body_bytes.as_ref()) {
             Ok(out) => Bytes::from(out),
             Err(e) => {
-                eprintln!("[Proxy] relay translate zstd 解压失败: {} body_len={}", e, body_bytes.len());
+                eprintln!(
+                    "[Proxy] relay translate zstd 解压失败: {} body_len={}",
+                    e,
+                    body_bytes.len()
+                );
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     &format!("translator: zstd decompress failed: {}", e),
@@ -6037,7 +6225,11 @@ async fn handle_chat_completions_relay(
             match decoder.read_to_end(&mut out) {
                 Ok(_) => Bytes::from(out),
                 Err(e) => {
-                    eprintln!("[Proxy] relay translate gzip 解压失败: {} body_len={}", e, body_bytes.len());
+                    eprintln!(
+                        "[Proxy] relay translate gzip 解压失败: {} body_len={}",
+                        e,
+                        body_bytes.len()
+                    );
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         &format!("translator: gzip decompress failed: {}", e),
@@ -6071,13 +6263,15 @@ async fn handle_chat_completions_relay(
         relay.model_fallback.as_deref(),
     );
     let model = extract_model_from_body(&body_for_translate);
-    let (mut chat_body, mut translator_state) =
-        match crate::relay_translate::translate_request(&body_for_translate, &model) {
-            Ok(x) => x,
-            Err(e) => {
-                let head_len = body_for_translate.len().min(160);
-                let head_str = String::from_utf8_lossy(&body_for_translate[..head_len]);
-                eprintln!(
+    let (mut chat_body, mut translator_state) = match crate::relay_translate::translate_request(
+        &body_for_translate,
+        &model,
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            let head_len = body_for_translate.len().min(160);
+            let head_str = String::from_utf8_lossy(&body_for_translate[..head_len]);
+            eprintln!(
                     "[Proxy] relay translate 请求失败: {} | method={} path={} encoding={:?} body_len={} body_head={:?}",
                     e,
                     method,
@@ -6086,12 +6280,12 @@ async fn handle_chat_completions_relay(
                     body_for_translate.len(),
                     head_str,
                 );
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("translator 请求处理失败: {}", e),
-                );
-            }
-        };
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("translator 请求处理失败: {}", e),
+            );
+        }
+    };
 
     let (upstream_url, upstream_host) = match build_chat_completions_url(base) {
         Some(x) => x,
@@ -6127,14 +6321,29 @@ async fn handle_chat_completions_relay(
     );
     // DEBUG: dump HTTP request to log file
     {
-        let debug_line = format!("[HTTP] url={} model={} body_len={} webSearchEnabled_in_body={}\n",
-            upstream_url, translator_state.model, body_bytes_chat.len(),
-            String::from_utf8_lossy(&body_bytes_chat).contains("webSearchEnabled"));
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
+        let debug_line = format!(
+            "[HTTP] url={} model={} body_len={} webSearchEnabled_in_body={}\n",
+            upstream_url,
+            translator_state.model,
+            body_bytes_chat.len(),
+            String::from_utf8_lossy(&body_bytes_chat).contains("webSearchEnabled")
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/codex-relay-debug.log")
             .and_then(|mut f| std::io::Write::write_all(&mut f, debug_line.as_bytes()));
         let preview = String::from_utf8_lossy(&body_bytes_chat[..body_bytes_chat.len().min(500)]);
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/codex-relay-debug.log")
-            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("  body_preview: {}\n\n", preview).as_bytes()));
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/codex-relay-debug.log")
+            .and_then(|mut f| {
+                std::io::Write::write_all(
+                    &mut f,
+                    format!("  body_preview: {}\n\n", preview).as_bytes(),
+                )
+            });
     }
 
     let upstream_resp = match state
@@ -6353,5 +6562,103 @@ mod tests {
         let (url, host) = get_upstream(true, Some("https://unity2.ai"), "/v1/responses");
         assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
         assert_eq!(host, "chatgpt.com");
+    }
+
+    #[test]
+    fn chatgpt_responses_drops_unsupported_pi_transport_hints() {
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-5.4-mini",
+                "input": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AA==",
+                        "detail": "auto"
+                    }]
+                }],
+                "stream": true,
+                "store": false,
+                "max_output_tokens": 16000,
+                "prompt_cache_key": "keep-me",
+                "prompt_cache_retention": "24h",
+                "prompt_cache_options": {"mode": "explicit"}
+            }))
+            .unwrap(),
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-pi-agent-sdk",
+            reqwest::header::HeaderValue::from_static("1"),
+        );
+        let normalized = normalize_chatgpt_responses_body(&body, "/v1/responses", &headers);
+        let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+        assert!(value.get("max_output_tokens").is_none());
+        assert!(value.get("prompt_cache_retention").is_none());
+        assert!(value.get("prompt_cache_options").is_none());
+        assert_eq!(value["prompt_cache_key"], "keep-me");
+        assert_eq!(value["input"][0]["content"][0]["detail"], "auto");
+    }
+
+    #[test]
+    fn non_responses_body_is_untouched() {
+        let body = Bytes::from_static(br#"{"max_output_tokens":42}"#);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-pi-agent-sdk",
+            reqwest::header::HeaderValue::from_static("1"),
+        );
+        assert_eq!(
+            normalize_chatgpt_responses_body(&body, "/v1/chat/completions", &headers),
+            body
+        );
+    }
+
+    #[test]
+    fn unmarked_codex_responses_body_is_byte_for_byte_untouched() {
+        let body = Bytes::from_static(br#"{ "model":"gpt-5.4-mini", "max_output_tokens":16000 }"#);
+        assert_eq!(
+            normalize_chatgpt_responses_body(
+                &body,
+                "/v1/responses",
+                &reqwest::header::HeaderMap::new(),
+            ),
+            body
+        );
+    }
+
+    #[test]
+    fn ws_global_overload_is_forwardable_terminal_error() {
+        let msg = tungstenite::Message::Text(
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "service_unavailable_error",
+                    "code": "server_is_overloaded",
+                    "message": "Our servers are currently overloaded. Please try again later."
+                }
+            })
+            .to_string()
+            .into(),
+        );
+        assert!(detect_ws_rate_limit(&msg));
+        assert!(ws_is_global_capacity_only(&msg));
+    }
+
+    #[test]
+    fn ws_per_account_limit_is_not_global_capacity_only() {
+        let msg = tungstenite::Message::Text(
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "code": "usage_limit_reached",
+                    "message": "You've hit your usage limit."
+                }
+            })
+            .to_string()
+            .into(),
+        );
+        assert!(detect_ws_rate_limit(&msg));
+        assert!(!ws_is_global_capacity_only(&msg));
     }
 }

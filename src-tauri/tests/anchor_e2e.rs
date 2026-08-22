@@ -1,7 +1,8 @@
 //! Anchor 端到端集成测试 (v0.7.1)
 //!
 //! 跑真实的 `AccountStore::switch_to` + `restore_disk_real_expiry_for_anchor`
-//! 流程，验证 `~/.codex/auth.json` 的实际内容。通过临时改 HOME 环境变量
+//! 流程，验证 `~/.codex/auth.json` 的实际内容。通过 debug-only 的
+//! `CODEX_SWITCHER_TEST_HOME` 环境变量
 //! 把磁盘路径重定向到 tempdir，不污染用户真实状态。
 //!
 //! 一个进程内多次 setenv 不安全（其他线程同时读会 race），所以本文件全部
@@ -14,17 +15,26 @@ use codex_switcher_lib::account::AccountStore;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// HOME 重定向 RAII 守卫：drop 时还原原值。
-struct HomeGuard {
+fn lock_test_home() -> MutexGuard<'static, ()> {
+    static TEST_HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_HOME_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 测试 home 重定向 RAII 守卫：drop 时还原原值。
+struct TestHomeGuard {
     original: Option<String>,
     _tmp: PathBuf,
 }
 
-impl HomeGuard {
+impl TestHomeGuard {
     fn redirect_to(tmp: PathBuf) -> Self {
-        let original = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp);
+        let original = std::env::var("CODEX_SWITCHER_TEST_HOME").ok();
+        std::env::set_var("CODEX_SWITCHER_TEST_HOME", &tmp);
         Self {
             original,
             _tmp: tmp,
@@ -32,11 +42,11 @@ impl HomeGuard {
     }
 }
 
-impl Drop for HomeGuard {
+impl Drop for TestHomeGuard {
     fn drop(&mut self) {
         match self.original.take() {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
+            Some(v) => std::env::set_var("CODEX_SWITCHER_TEST_HOME", v),
+            None => std::env::remove_var("CODEX_SWITCHER_TEST_HOME"),
         }
     }
 }
@@ -68,7 +78,8 @@ fn jwt_with_exp(exp_secs_from_now: i64) -> String {
 }
 
 fn make_oauth_auth(email: &str, account_id: &str, refresh_token: &str, at_exp_secs: i64) -> Value {
-    let id_token_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+    let id_token_header =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
     let id_token_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
         r#"{{"email":"{}","https://api.openai.com/auth":{{"chatgpt_account_id":"{}"}}}}"#,
         email, account_id
@@ -107,8 +118,9 @@ fn account_id_of(auth: &Value) -> Option<&str> {
 ///   4. 退出兜底 → disk expires_at 切到 JWT 真实 exp（不是 OAuth 字段值）
 #[test]
 fn anchor_e2e_disk_routing() {
+    let _test_home_lock = lock_test_home();
     let tmp = make_tmpdir("disk-routing");
-    let _guard = HomeGuard::redirect_to(tmp.clone());
+    let _guard = TestHomeGuard::redirect_to(tmp.clone());
 
     let mut store = AccountStore::default();
     let pro_id = store
@@ -140,14 +152,8 @@ fn anchor_e2e_disk_routing() {
         .set_session_anchor(&pro_id, true)
         .expect("set anchor ok");
     // 先把 disk 强制写成 pro 的（模拟"设 anchor 时立刻落盘"那一步）
-    AccountStore::write_codex_auth(
-        &store
-            .accounts
-            .get(&pro_id)
-            .unwrap()
-            .to_codex_auth_value(),
-    )
-    .expect("seed disk with anchor");
+    AccountStore::write_codex_auth(&store.accounts.get(&pro_id).unwrap().to_codex_auth_value())
+        .expect("seed disk with anchor");
     let disk_before = read_disk_auth(&tmp).expect("disk has anchor seed");
     assert_eq!(account_id_of(&disk_before), Some("acct-pro"));
 
@@ -167,10 +173,7 @@ fn anchor_e2e_disk_routing() {
         !store.should_write_disk_for(&other_id),
         "non-anchor target 不允许写盘"
     );
-    assert!(
-        store.should_write_disk_for(&pro_id),
-        "anchor 自己仍可写盘"
-    );
+    assert!(store.should_write_disk_for(&pro_id), "anchor 自己仍可写盘");
 
     // ---- 场景 3: 切回 anchor → disk 应被更新（即便内容跟 disk 已有的一样） ----
     let before_mtime = fs::metadata(tmp.join(".codex/auth.json"))
@@ -233,8 +236,9 @@ fn anchor_e2e_disk_routing() {
 /// 非 OAuth 账号被拒绝当 anchor，且不污染 store 状态。
 #[test]
 fn anchor_rejected_on_non_oauth_does_not_corrupt_state() {
+    let _test_home_lock = lock_test_home();
     let tmp = make_tmpdir("relay-reject");
-    let _guard = HomeGuard::redirect_to(tmp);
+    let _guard = TestHomeGuard::redirect_to(tmp);
 
     let mut store = AccountStore::default();
     let relay = store.add_relay_account(

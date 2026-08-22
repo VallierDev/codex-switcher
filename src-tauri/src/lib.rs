@@ -26,6 +26,7 @@ mod session_affinity;
 mod session_import;
 mod session_routes;
 mod skills;
+mod sse_watchdog;
 mod switch_log;
 mod token_tracker;
 mod tray;
@@ -67,13 +68,12 @@ fn detect_sync_conflict_for_current(
 
     // 如果官方 Token 存在且与本地不同（通常是更新了），则视为冲突
     if official_rt.is_some() && official_rt != local_rt {
-        let disk_email =
-            AccountStore::extract_email(disk_auth).unwrap_or_else(|| "未知账号".to_string());
-        if disk_email == account.name {
-            return Some(account.name.clone());
-        } else {
-            return Some(format!("{} ({})", account.name, disk_email));
+        if let Some(disk_email) = AccountStore::extract_email(disk_auth) {
+            if disk_email != account.name {
+                return Some(format!("{} ({})", account.name, disk_email));
+            }
         }
+        return Some(account.name.clone());
     }
 
     None
@@ -81,9 +81,8 @@ fn detect_sync_conflict_for_current(
 
 /// 全局 store 句柄，供 panic_hook / 退出兜底使用（panic hook 拿不到 Tauri 的
 /// `State`，所以只能借这条侧通道）。在 `AppState::new()` 里写一次。
-static GLOBAL_STORE_FOR_EXIT: std::sync::OnceLock<
-    std::sync::Arc<std::sync::Mutex<AccountStore>>,
-> = std::sync::OnceLock::new();
+static GLOBAL_STORE_FOR_EXIT: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<AccountStore>>> =
+    std::sync::OnceLock::new();
 
 /// 应用状态
 pub struct AppState {
@@ -586,11 +585,7 @@ fn set_account_inactive_refresh_enabled(
 ///
 /// 后台 scheduler 的 anchor refresh tick 会接管之后的 token 保活。
 #[tauri::command]
-fn set_session_anchor(
-    state: State<AppState>,
-    id: String,
-    enabled: bool,
-) -> Result<(), String> {
+fn set_session_anchor(state: State<AppState>, id: String, enabled: bool) -> Result<(), String> {
     let (disk_auth, anchor_after, action) = {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
         store.set_session_anchor(&id, enabled)?;
@@ -617,10 +612,7 @@ fn set_session_anchor(
 
     if let Some(auth) = disk_auth {
         AccountStore::write_codex_auth(&auth)?;
-        println!(
-            "[Anchor] {} 完成；当前 anchor = {:?}",
-            action, anchor_after
-        );
+        println!("[Anchor] {} 完成；当前 anchor = {:?}", action, anchor_after);
     } else {
         println!("[Anchor] {} 完成，但无可写盘的候选账号", action);
     }
@@ -1785,6 +1777,10 @@ async fn solo_try_align_current(
 /// 同时顺带做"store/disk 不一致"的自愈：磁盘上的 sub 和 store.current 的 sub 不匹配时，
 /// 用 Server 拉到的覆写。
 /// 仅在 client 模式 + 配置了 secret 时生效。返回 true 表示真的写盘了，false 表示跳过/失败。
+/// 手机锚 disk token 的强刷阈值：拉到的锚 token 剩余寿命低于这个值(2h)就请 Server
+/// 就地强刷。锚 token 一次刷新可用 ~240h，所以每个到期周期只会触发一次强刷。
+const ANCHOR_DISK_REFRESH_TTL_THRESHOLD_SECS: i64 = 2 * 3600;
+
 pub async fn do_one_fast_auth_sync(store: &std::sync::Arc<std::sync::Mutex<AccountStore>>) -> bool {
     let (mode, primary, fallback, secret, current_id) = {
         let s = match store.lock() {
@@ -1829,36 +1825,90 @@ pub async fn do_one_fast_auth_sync(store: &std::sync::Arc<std::sync::Mutex<Accou
         return false;
     };
 
-    // 2) 拉 cid 的最新 token 写盘
-    match remote_client::fetch_token(&base, &secret, &cid).await {
+    // 2) 拉 cid（current）的最新 token，同步进 store 并对齐本机 current
+    let cur_token = match remote_client::fetch_token(&base, &secret, &cid).await {
         Ok(t) => {
-            let allow_disk = {
-                let mut s = match store.lock() {
-                    Ok(g) => g,
-                    Err(_) => return false,
-                };
-                s.sync_account_from_auth_json(&cid, t.auth_json.clone());
-                // 把本机 current 也对齐上（如果之前不一致）
-                s.current = Some(cid.clone());
-                let _ = s.save();
-                s.should_write_disk_for(&cid)
+            let mut s = match store.lock() {
+                Ok(g) => g,
+                Err(_) => return false,
             };
-            if !allow_disk {
-                println!("[FastAuthSync] 手机锚生效，跳过写 ~/.codex/auth.json（current != anchor）");
-                crate::proxy::invalidate_remote_token_cache();
-                return true;
-            }
-            // 扩展 expires_at 到 +24h，codex CLI 看到"很新鲜"就不会自己 refresh，
-            // 真过期时 proxy 这边接管处理
-            if let Err(e) = AccountStore::write_codex_auth_extended_expiry(&t.auth_json) {
-                eprintln!("[FastAuthSync] 写 ~/.codex/auth.json 失败: {}", e);
-                return false;
-            }
-            crate::proxy::invalidate_remote_token_cache();
-            true
+            s.sync_account_from_auth_json(&cid, t.auth_json.clone());
+            s.current = Some(cid.clone());
+            let _ = s.save();
+            t
         }
-        Err(_) => false,
+        Err(_) => return false,
+    };
+
+    // 3) 决定 disk 归属号：有手机锚 = 锚，无锚 = current。
+    // 这是本次修复的核心 —— 过去只写 current，锚≠current 时锚的 disk 永远不更新 →
+    // 悄悄烂过期(codex 掉登录)。现在 disk 始终跟随「锚(若有)」的最新 token。
+    let anchor_id = match store.lock() {
+        Ok(s) => s.session_anchor_id(),
+        Err(_) => return false,
+    };
+    let disk_owner = anchor_id.unwrap_or_else(|| cid.clone());
+
+    // 3a) disk 归属就是 current（无锚 或 锚==current）：直接写 current 的 token
+    if disk_owner == cid {
+        if let Err(e) = AccountStore::write_codex_auth_extended_expiry(&cur_token.auth_json) {
+            eprintln!("[FastAuthSync] 写 ~/.codex/auth.json 失败: {}", e);
+            return false;
+        }
+        crate::proxy::invalidate_remote_token_cache();
+        return true;
     }
+
+    // 3b) 锚 ≠ current：把「锚」的 disk 保持新鲜（方案 A 核心）
+    // 先拉锚的最新 token；若快过期(<2h)或解不出 exp，就请 Server 就地强刷一次
+    // (单刷新者 locked_fresh 路径，不新增 reused 源)；再同步进 store 并写盘。
+    let mut anchor_token = match remote_client::fetch_token(&base, &secret, &disk_owner).await {
+        Ok(t) => t,
+        Err(e) => {
+            // 拉不到锚 token（网络/Server 抖动）→ 不动 disk（保留旧镜像），下轮再试
+            eprintln!(
+                "[FastAuthSync] 拉锚 {} token 失败: {}，保留旧 disk",
+                disk_owner, e
+            );
+            return false;
+        }
+    };
+    let ttl = crate::account::access_token_ttl_secs(&anchor_token.auth_json);
+    if ttl
+        .map(|s| s < ANCHOR_DISK_REFRESH_TTL_THRESHOLD_SECS)
+        .unwrap_or(true)
+    {
+        match remote_client::refresh_token_now(&base, &secret, &disk_owner).await {
+            Ok(fresh) => {
+                println!(
+                    "[FastAuthSync] 锚 {} token 剩 {:?}s(<{}s)，已请 Server 强刷",
+                    disk_owner, ttl, ANCHOR_DISK_REFRESH_TTL_THRESHOLD_SECS
+                );
+                anchor_token = fresh;
+            }
+            Err(e) => {
+                // 强刷失败：用刚拉到的（可能仍有效，只是快过期）先写盘兜底，别让 disk 空着
+                eprintln!(
+                    "[FastAuthSync] 锚 {} 强刷失败: {}，先用现有 token 兜底",
+                    disk_owner, e
+                );
+            }
+        }
+    }
+    {
+        let mut s = match store.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        s.sync_account_from_auth_json(&disk_owner, anchor_token.auth_json.clone());
+        let _ = s.save();
+    }
+    if let Err(e) = AccountStore::write_codex_auth_extended_expiry(&anchor_token.auth_json) {
+        eprintln!("[FastAuthSync] 写锚 disk 失败: {}", e);
+        return false;
+    }
+    crate::proxy::invalidate_remote_token_cache();
+    true
 }
 
 /// 快速 auth.json 同步循环（仅 client 模式）：每 30s 拉一次 Server 上 current 的最新 token
@@ -1884,7 +1934,16 @@ pub fn start_quota_refresh(
         println!("[QuotaRefresh] 定时额度刷新已启动");
 
         loop {
-            let (enabled, interval_minutes, batch_size, remote_mode, primary, fallback, secret, client_owns_current) = {
+            let (
+                enabled,
+                interval_minutes,
+                batch_size,
+                remote_mode,
+                primary,
+                fallback,
+                secret,
+                client_owns_current,
+            ) = {
                 let s = store.lock().unwrap();
                 (
                     s.settings.quota_refresh_enabled,
@@ -1953,8 +2012,7 @@ pub fn start_quota_refresh(
                                                 cand.id, cand.name, outcome.upserted
                                             );
                                             remote_ids.insert(cand.id.clone());
-                                            if outcome.upserted == "merged"
-                                                && outcome.id != cand.id
+                                            if outcome.upserted == "merged" && outcome.id != cand.id
                                             {
                                                 remote_ids.insert(outcome.id.clone());
                                             }
@@ -2046,45 +2104,47 @@ pub fn start_quota_refresh(
                                 //    client_owns_current=true（旧 solo 迁过来的）：本机 codex
                                 //    直接跑，current 由本机用户决定，不被 Server 反向同步。
                                 if remote_mode == "client" && !client_owns_current {
-                                  if let Ok(cur) =
-                                    crate::remote_client::get_current(&base, &secret).await
-                                {
-                                    if let Some(cid) = cur.current.clone() {
-                                        let exists_locally = {
-                                            if let Ok(s) = store.lock() {
-                                                s.accounts.contains_key(&cid)
-                                            } else {
-                                                false
-                                            }
-                                        };
-                                        if exists_locally {
-                                            match crate::remote_client::fetch_token(
-                                                &base, &secret, &cid,
-                                            )
-                                            .await
-                                            {
-                                                Ok(t) => {
-                                                    let allow_disk = if let Ok(mut s) = store.lock() {
-                                                        s.sync_account_from_auth_json(
-                                                            &cid,
-                                                            t.auth_json.clone(),
-                                                        );
-                                                        let prev_current = s.current.clone();
-                                                        s.current = Some(cid.clone());
-                                                        let _ = s.save();
-                                                        if prev_current.as_deref()
-                                                            != Some(cid.as_str())
+                                    if let Ok(cur) =
+                                        crate::remote_client::get_current(&base, &secret).await
+                                    {
+                                        if let Some(cid) = cur.current.clone() {
+                                            let exists_locally = {
+                                                if let Ok(s) = store.lock() {
+                                                    s.accounts.contains_key(&cid)
+                                                } else {
+                                                    false
+                                                }
+                                            };
+                                            if exists_locally {
+                                                match crate::remote_client::fetch_token(
+                                                    &base, &secret, &cid,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(t) => {
+                                                        let allow_disk = if let Ok(mut s) =
+                                                            store.lock()
                                                         {
-                                                            println!(
+                                                            s.sync_account_from_auth_json(
+                                                                &cid,
+                                                                t.auth_json.clone(),
+                                                            );
+                                                            let prev_current = s.current.clone();
+                                                            s.current = Some(cid.clone());
+                                                            let _ = s.save();
+                                                            if prev_current.as_deref()
+                                                                != Some(cid.as_str())
+                                                            {
+                                                                println!(
                                                                 "[QuotaRefresh] client 对齐 current → {}",
                                                                 cur.name.clone().unwrap_or_default()
                                                             );
-                                                        }
-                                                        s.should_write_disk_for(&cid)
-                                                    } else {
-                                                        true
-                                                    };
-                                                    if !allow_disk {
+                                                            }
+                                                            s.should_write_disk_for(&cid)
+                                                        } else {
+                                                            true
+                                                        };
+                                                        if !allow_disk {
                                                         println!(
                                                             "[QuotaRefresh] 手机锚生效，跳过写 ~/.codex/auth.json（{} != anchor）",
                                                             cur.name.clone().unwrap_or_default()
@@ -2105,19 +2165,20 @@ pub fn start_quota_refresh(
                                                             cur.name.unwrap_or_default()
                                                         );
                                                     }
-                                                    // 切号后清掉 proxy 端的远端 token 缓存
-                                                    crate::proxy::invalidate_remote_token_cache();
-                                                }
-                                                Err(e) => {
-                                                    eprintln!(
+                                                        // 切号后清掉 proxy 端的远端 token 缓存
+                                                        crate::proxy::invalidate_remote_token_cache(
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!(
                                                         "[QuotaRefresh] 拉 Server current token 失败: {}",
                                                         e
                                                     );
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                }
                                 } // end: if remote_mode == "client" && !client_owns_current
                                 println!(
                                     "[QuotaRefresh] {} 从 Server 同步 {} 个额度，删除本地残留 {} 个",
@@ -2175,20 +2236,21 @@ pub fn start_quota_refresh(
                         let weekly_reset = cq.and_then(|q| q.weekly_reset_at).unwrap_or(0);
                         let updated_ts = updated.timestamp();
                         // expired = reset_at 已过 AND 缓存抓取早于 reset_at
-                        let five_expired = five_reset > 0
-                            && five_reset <= now_ts
-                            && updated_ts < five_reset;
-                        let weekly_expired = weekly_reset > 0
-                            && weekly_reset <= now_ts
-                            && updated_ts < weekly_reset;
+                        let five_expired =
+                            five_reset > 0 && five_reset <= now_ts && updated_ts < five_reset;
+                        let weekly_expired =
+                            weekly_reset > 0 && weekly_reset <= now_ts && updated_ts < weekly_reset;
                         let expired = five_expired || weekly_expired;
                         (a.id.clone(), a.name.clone(), updated, expired)
                     })
                     .collect();
 
                 // 1) expired 全部入选（不受 batch_size 限制 — reset 后必须及时刷）
-                let mut expired: Vec<_> =
-                    candidates.iter().filter(|(_, _, _, e)| *e).cloned().collect();
+                let mut expired: Vec<_> = candidates
+                    .iter()
+                    .filter(|(_, _, _, e)| *e)
+                    .cloned()
+                    .collect();
                 expired.sort_by_key(|(_, _, t, _)| *t);
 
                 // 2) 剩下的按 updated_at 最旧排序，取 batch_size 个
@@ -2271,7 +2333,15 @@ pub fn start_quota_refresh(
                     }
                 };
 
-                match usage::UsageFetcher::fetch_usage_direct(access_token, aid, rt, false, Some(id.to_string())).await {
+                match usage::UsageFetcher::fetch_usage_direct(
+                    access_token,
+                    aid,
+                    rt,
+                    false,
+                    Some(id.to_string()),
+                )
+                .await
+                {
                     Ok((usage, _)) => {
                         let email_for_snap = if let Ok(s) = store.lock() {
                             s.accounts
@@ -2308,6 +2378,7 @@ pub fn start_quota_refresh(
                                 // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
                                 acc.is_token_invalid = false;
                                 acc.is_logged_out = false;
+                                scheduler::clear_recovered_reused_error(acc);
                                 let _ = s.save();
                             }
                         }
@@ -2554,8 +2625,7 @@ async fn get_quota_internal(state: &AppState, id: String) -> Result<UsageDisplay
         let at = AccountStore::extract_access_token(&account.auth_json);
         let aid = AccountStore::extract_account_id(&account.auth_json);
         let rt = account.refresh_token.clone();
-        let solo_or_client =
-            matches!(store.settings.remote_mode.as_str(), "client" | "solo");
+        let solo_or_client = matches!(store.settings.remote_mode.as_str(), "client" | "solo");
         (at, aid, rt, solo_or_client)
     };
 
@@ -2588,15 +2658,29 @@ async fn get_quota_internal(state: &AppState, id: String) -> Result<UsageDisplay
                 }
                 token_res.access_token
             }
-            Err(e) => return Err(format!("TOKEN_INVALID:刷新 token 失败: {}", e)),
+            Err(e) => {
+                if crate::scheduler::is_logged_out_error(&e) {
+                    return Err("ACCOUNT_LOGGED_OUT:登录已失效，refresh_token 已过期或被撤销，请重新登录".to_string());
+                }
+                if crate::scheduler::is_revoked_error(&e) {
+                    return Err(format!("TOKEN_INVALID:刷新 token 失败: {}", e));
+                }
+                return Err(format!("TOKEN_REFRESH_TRANSIENT:刷新请求失败，暂未判定账号失效: {}", e));
+            }
         }
     } else {
         return Err("TOKEN_INVALID:无 access_token 且无 refresh_token".to_string());
     };
 
     // client/solo 模式禁止 fetch_usage_direct 内部本地 rt 刷新（usage.rs:102）
-    let result =
-        UsageFetcher::fetch_usage_direct(access_token, account_id, refresh_token, !is_client_or_solo, Some(id.to_string())).await;
+    let result = UsageFetcher::fetch_usage_direct(
+        access_token,
+        account_id,
+        refresh_token,
+        !is_client_or_solo,
+        Some(id.to_string()),
+    )
+    .await;
 
     // 检测封号/失效：分开标记
     if let Err(ref e) = result {
@@ -2665,6 +2749,7 @@ async fn get_quota_internal(state: &AppState, id: String) -> Result<UsageDisplay
             // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
             account.is_token_invalid = false;
             account.is_logged_out = false;
+            scheduler::clear_recovered_reused_error(account);
             if let Err(e) = store.save() {
                 eprintln!("[Store] 保存失败: {}", e);
             }
@@ -2832,23 +2917,23 @@ async fn send_codex_wakeup(
     .await
 }
 
-/// 主动重置：消耗一次该账号的「主动重置次数」(rate_limit_reset_credits)，
-/// 立即重置已耗尽的限额窗口。POST /backend-api/wham/rate-limit-reset-credits/consume。
-/// 复用账号自身 token，走 quota 同一条出口（Pro 号同 IP 约束见 usage::consume_reset_credit）。
-#[tauri::command]
-async fn consume_reset_credit(
-    state: tauri::State<'_, AppState>,
-    id: String,
-) -> Result<usage::ResetCreditResult, String> {
-    // 取该账号 token / account_id（逻辑与 send_codex_wakeup 一致）
+/// 取某账号的 `(access_token, account_id)`：优先用现成 access_token；缺失时按
+/// remote_mode 决定能否本机 rt 刷新（client/solo 禁止，须从 Server 同步）。
+/// 主动重置的查询/消耗共用——逻辑与 send_codex_wakeup 一致。
+/// `relay_err` 是该账号为中转站号时返回的错误文案。
+async fn resolve_account_access_token(
+    state: &tauri::State<'_, AppState>,
+    id: &str,
+    relay_err: &str,
+) -> Result<(String, Option<String>), String> {
     let (access_token_opt, account_id, refresh_token, is_client_or_solo) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let account = store
             .accounts
-            .get(&id)
+            .get(id)
             .ok_or_else(|| format!("账号 {} 不存在", id))?;
         if account.is_relay() {
-            return Err("RELAY_ACCOUNT:中转站账号不支持主动重置".to_string());
+            return Err(relay_err.to_string());
         }
         let at = AccountStore::extract_access_token(&account.auth_json);
         let aid = AccountStore::extract_account_id(&account.auth_json);
@@ -2867,10 +2952,10 @@ async fn consume_reset_credit(
             "TOKEN_INVALID:client/solo 模式禁止本机 rt 刷新；请确认账号已同步到 Server".to_string(),
         );
     } else if let Some(ref rt) = refresh_token {
-        match crate::oauth::refresh_access_token_locked(&id, rt).await {
+        match crate::oauth::refresh_access_token_locked(id, rt).await {
             Ok(token_res) => {
                 let mut store = state.store.lock().map_err(|e| e.to_string())?;
-                if let Some(account) = store.accounts.get_mut(&id) {
+                if let Some(account) = store.accounts.get_mut(id) {
                     AccountStore::apply_refreshed_tokens(
                         account,
                         token_res.access_token.clone(),
@@ -2888,6 +2973,33 @@ async fn consume_reset_credit(
         return Err("TOKEN_INVALID:无 access_token 且无 refresh_token".to_string());
     };
 
+    Ok((access_token, account_id))
+}
+
+/// 列出该账号所有「可用」的主动重置次数（含各自到期时间/来源），按到期升序。
+/// GET /backend-api/wham/rate-limit-reset-credits（只读、不消耗）。
+/// 前端消耗前先弹窗展示——消耗哪条由服务端定，客户端选不了。
+#[tauri::command]
+async fn list_reset_credits(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<Vec<usage::ResetCreditItem>, String> {
+    let (access_token, account_id) =
+        resolve_account_access_token(&state, &id, "RELAY_ACCOUNT:中转站账号没有主动重置次数")
+            .await?;
+    usage::list_reset_credits(&access_token, account_id.as_deref()).await
+}
+
+/// 主动重置：消耗一次该账号的「主动重置次数」(rate_limit_reset_credits)，
+/// 立即重置已耗尽的限额窗口。POST /backend-api/wham/rate-limit-reset-credits/consume。
+/// 复用账号自身 token，走 quota 同一条出口（Pro 号同 IP 约束见 usage::consume_reset_credit）。
+#[tauri::command]
+async fn consume_reset_credit(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<usage::ResetCreditResult, String> {
+    let (access_token, account_id) =
+        resolve_account_access_token(&state, &id, "RELAY_ACCOUNT:中转站账号不支持主动重置").await?;
     usage::consume_reset_credit(&access_token, account_id.as_deref()).await
 }
 
@@ -2920,7 +3032,11 @@ fn open_codex_terminal(state: State<AppState>, id: String) -> Result<String, Str
     if !auth.is_object() {
         return Err("账号 auth_json 结构异常".to_string());
     }
-    if auth.get("tokens").and_then(|t| t.get("access_token")).is_none() {
+    if auth
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .is_none()
+    {
         return Err("账号缺少 codex tokens，无法启动".to_string());
     }
     if let Some(obj) = auth.as_object_mut() {
@@ -2946,13 +3062,19 @@ fn open_codex_terminal(state: State<AppState>, id: String) -> Result<String, Str
         .map_err(|e| format!("写 config.toml 失败: {}", e))?;
 
     // 开 Terminal.app 跑 codex（登录 shell 有 PATH，能找到 codex）
-    let home_str = home.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let home_str = home
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     let inner = format!(
         "export CODEX_HOME=\\\"{}\\\"; clear; echo '账号: {} — 在下面直接发一句 你好 即可触发 referral 兑现'; codex",
         home_str,
         name.replace('\'', "")
     );
-    let script = format!("tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell", inner);
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+        inner
+    );
     Command::new("osascript")
         .arg("-e")
         .arg(&script)
@@ -3066,8 +3188,7 @@ async fn get_quota_by_id(
             .refresh_token
             .clone()
             .or_else(|| AccountStore::extract_refresh_token(&account.auth_json));
-        let solo_or_client =
-            matches!(store.settings.remote_mode.as_str(), "client" | "solo");
+        let solo_or_client = matches!(store.settings.remote_mode.as_str(), "client" | "solo");
 
         (at, aid, rt, solo_or_client)
     };
@@ -3220,6 +3341,7 @@ async fn get_quota_by_id(
             // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
             account.is_token_invalid = false;
             account.is_logged_out = false;
+            scheduler::clear_recovered_reused_error(account);
         }
         store.save()?;
     } else {
@@ -3244,6 +3366,7 @@ async fn get_quota_by_id(
             // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
             account.is_token_invalid = false;
             account.is_logged_out = false;
+            scheduler::clear_recovered_reused_error(account);
         }
         store.save()?;
     }
@@ -3365,9 +3488,7 @@ struct AccountTokenHistory {
 }
 
 #[tauri::command]
-fn get_account_token_history(
-    state: State<AppState>,
-) -> Result<Vec<AccountTokenHistory>, String> {
+fn get_account_token_history(state: State<AppState>) -> Result<Vec<AccountTokenHistory>, String> {
     let history = token_tracker::TokenTracker::get_history(30);
     let snapshots = quota_snapshot::read_all();
     let switches = state.switch_logger.get_history(30);
@@ -3387,20 +3508,15 @@ fn get_account_token_history(
             Some(q) => q,
             None => continue,
         };
-        let email = AccountStore::extract_email(&acc.auth_json)
-            .unwrap_or_else(|| acc.name.clone());
+        let email = AccountStore::extract_email(&acc.auth_json).unwrap_or_else(|| acc.name.clone());
 
         // 该号的所有 entry / snapshot / switch（按时间排）
-        let mut my_entries: Vec<&token_tracker::TokenHistoryEntry> = history
-            .iter()
-            .filter(|e| e.account_id == *id)
-            .collect();
+        let mut my_entries: Vec<&token_tracker::TokenHistoryEntry> =
+            history.iter().filter(|e| e.account_id == *id).collect();
         my_entries.sort_by_key(|e| e.timestamp.timestamp());
 
-        let mut my_snaps: Vec<&quota_snapshot::QuotaSnapshot> = snapshots
-            .iter()
-            .filter(|s| s.account_id == *id)
-            .collect();
+        let mut my_snaps: Vec<&quota_snapshot::QuotaSnapshot> =
+            snapshots.iter().filter(|s| s.account_id == *id).collect();
         my_snaps.sort_by_key(|s| s.ts.timestamp());
 
         let cycles_5h = build_cycles(
@@ -3603,8 +3719,7 @@ fn build_cycles(
                     }
                 }
                 if tokens_up_to_snap > 0 {
-                    let cap =
-                        (tokens_up_to_snap as f64 / used_pct as f64 * 100.0).round() as i64;
+                    let cap = (tokens_up_to_snap as f64 / used_pct as f64 * 100.0).round() as i64;
                     cycle.estimated_capacity = Some(cap);
                     cycle.estimate_used_pct = Some(used_pct);
                 }
@@ -3732,8 +3847,7 @@ fn get_quota_cycles(state: State<AppState>) -> Result<Vec<QuotaCycle>, String> {
             None => continue, // 没拉过 quota 没法对齐窗口锚点
         };
 
-        let email = AccountStore::extract_email(&acc.auth_json)
-            .unwrap_or_else(|| acc.name.clone());
+        let email = AccountStore::extract_email(&acc.auth_json).unwrap_or_else(|| acc.name.clone());
         let ts = entry.timestamp.timestamp();
 
         for (kind, window_size, reset_at_opt) in [
@@ -3819,8 +3933,7 @@ fn get_quota_cycles(state: State<AppState>) -> Result<Vec<QuotaCycle>, String> {
             );
             let is_ban = matches!(
                 sw.reason,
-                switch_log::SwitchReason::InStreamBanned
-                    | switch_log::SwitchReason::BannedDetected
+                switch_log::SwitchReason::InStreamBanned | switch_log::SwitchReason::BannedDetected
             );
             if is_limit {
                 cycle.limit_hit = true;
@@ -3876,8 +3989,7 @@ fn get_plan_capacity_estimates() -> Result<Vec<PlanCapacityEstimate>, String> {
 
     use std::collections::HashMap;
     // key: (account_id, window_type, reset_at, plan_type) → [(ts, used_pct), ...]
-    let mut by_window: HashMap<(String, String, i64, String), Vec<(i64, i32)>> =
-        HashMap::new();
+    let mut by_window: HashMap<(String, String, i64, String), Vec<(i64, i32)>> = HashMap::new();
     for s in &snapshots {
         let ts = s.ts.timestamp();
         if let Some(reset) = s.five_hour_reset_at {
@@ -4030,10 +4142,7 @@ async fn add_session_route(
 
 /// 删除一条 session 硬路由
 #[tauri::command]
-async fn delete_session_route(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+async fn delete_session_route(state: State<'_, AppState>, id: String) -> Result<(), String> {
     {
         let mut store = state
             .session_routes
@@ -4933,7 +5042,10 @@ async fn remote_pull_all_tokens(
                     store.current = Some(cid.clone());
                     let _ = store.save();
                 }
-                println!("[RemotePull] 手机锚生效，跳过写 ~/.codex/auth.json（current={} != anchor）", cid);
+                println!(
+                    "[RemotePull] 手机锚生效，跳过写 ~/.codex/auth.json（current={} != anchor）",
+                    cid
+                );
             } else if let Err(e) = account::AccountStore::write_codex_auth(&auth) {
                 errors.push((cid.clone(), format!("写 auth.json 失败: {}", e)));
             } else {
@@ -4988,6 +5100,7 @@ async fn remote_refresh_account_quota(
                     acc.is_banned = false;
                     acc.is_token_invalid = false;
                     acc.is_logged_out = false;
+                    scheduler::clear_recovered_reused_error(acc);
                     let _ = store.save();
                 }
             }
@@ -5003,6 +5116,17 @@ async fn remote_refresh_account_quota(
                 || lower.contains("404")
                 || lower.contains("account") && lower.contains("not");
             if !is_missing {
+                // Server 可能已经更新了 is_logged_out/is_token_invalid；同步回本机，
+                // 避免前端只看到错误 toast，账号行仍停留在旧状态。
+                if let Ok(remote_accounts) = remote_client::list_accounts(&url, &secret).await {
+                    if let Some(remote_account) = remote_accounts.into_iter().find(|a| a.id == id) {
+                        if let Ok(mut store) = state.store.lock() {
+                            store.accounts.insert(id.clone(), remote_account);
+                            let _ = store.save();
+                        }
+                        let _ = app.emit("accounts-updated", ());
+                    }
+                }
                 return Err(e);
             }
             println!(
@@ -5201,6 +5325,26 @@ pub fn run() {
 
             // 启动后台调度器（仅在设置开启时）
             let state = app.state::<AppState>();
+            // 无论后台保活是否开启，都先修正旧版本已经落盘的明确 refresh-token
+            // 终态错误。client/server 两端重启后会得到一致的“需重新登录”状态。
+            let reconciled = state
+                .store
+                .lock()
+                .map(|mut store| {
+                    let changed = scheduler::reconcile_persisted_auth_failures(&mut store);
+                    if changed > 0 {
+                        let _ = store.save();
+                    }
+                    changed
+                })
+                .unwrap_or(0);
+            if reconciled > 0 {
+                println!(
+                    "[Startup] 回填 {} 个明确 refresh token 失效账号为需重新登录",
+                    reconciled
+                );
+                let _ = app.handle().emit("accounts-updated", ());
+            }
             let should_start = state
                 .store
                 .lock()
@@ -5442,6 +5586,7 @@ pub fn run() {
             send_codex_invite,
             send_codex_wakeup,
             consume_reset_credit,
+            list_reset_credits,
             open_codex_terminal,
             oauth_server::start_oauth_login,
             oauth_server::submit_oauth_callback,
@@ -5602,6 +5747,19 @@ mod tests {
         assert_eq!(
             detect_sync_conflict_for_current(&current, &disk_auth),
             Some("current".to_string())
+        );
+    }
+
+    #[test]
+    fn sync_conflict_includes_different_disk_email() {
+        let current = test_account("current", "acct-1", "rt-local");
+        let mut disk_auth = test_auth("acct-1", "rt-new");
+        disk_auth["tokens"]["id_token"] =
+            serde_json::Value::String("e30.eyJlbWFpbCI6ImRpc2tAZXhhbXBsZS5jb20ifQ.sig".into());
+
+        assert_eq!(
+            detect_sync_conflict_for_current(&current, &disk_auth),
+            Some("current (disk@example.com)".to_string())
         );
     }
 

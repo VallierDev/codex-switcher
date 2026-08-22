@@ -9,6 +9,9 @@ use std::time::Duration;
 
 /// 进程级共享 reqwest::Client — 整个 quota 刷新链路共用一个连接池，
 /// 不再每个账号都跑一次 TLS 握手。30 秒空闲回收，最多 8 个 keep-alive。
+///
+/// `wham/usage` 不在应用层指定代理，由系统网络层（Clash/TUN、250 透明
+/// 接管或环境变量代理）决定实际出口。
 fn usage_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -110,12 +113,55 @@ impl UsageFetcher {
             req
         };
 
-        let mut response = build_request(&current_token, &account_id)
-            .send()
-            .await
-            .map_err(|e| format!("网络请求失败: {}", e))?;
-
-        let mut status = response.status();
+        // 上游 429/5xx 是瞬时熔断（biscuit_baker_circuit_open / connection reset），
+        // 不是账号坏了。最多再试 2 次（共 3 次），指数退避 1s/2s。
+        let mut response = None;
+        let mut status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
+        let mut last_net_err: Option<String> = None;
+        for attempt in 0..3u32 {
+            match build_request(&current_token, &account_id).send().await {
+                Ok(resp) => {
+                    status = resp.status();
+                    // 瞬时上游错误：读掉 body 后退避重试（401/403 留给下面鉴权分支）
+                    let transient = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
+                    if transient && attempt < 2 {
+                        let _ = resp.text().await;
+                        let wait_ms = 1000u64 * (1u64 << attempt);
+                        eprintln!(
+                            "[Usage] wham/usage HTTP {}，{}ms 后重试 ({}/3)",
+                            status.as_u16(),
+                            wait_ms,
+                            attempt + 2
+                        );
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                        continue;
+                    }
+                    response = Some(resp);
+                    break;
+                }
+                Err(e) => {
+                    last_net_err = Some(format!("网络请求失败: {}", e));
+                    if attempt < 2 {
+                        let wait_ms = 1000u64 * (1u64 << attempt);
+                        eprintln!(
+                            "[Usage] wham/usage 网络错误，{}ms 后重试 ({}/3): {}",
+                            wait_ms,
+                            attempt + 2,
+                            e
+                        );
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                        continue;
+                    }
+                }
+            }
+        }
+        let mut response = match response {
+            Some(r) => r,
+            None => {
+                return Err(last_net_err.unwrap_or_else(|| "wham/usage 请求失败".to_string()));
+            }
+        };
+        status = response.status();
 
         // 如果允许本地刷新，且 401/403 且有 refresh_token，尝试刷新
         // 注意：rt 旋转走 _locked 串行化，同账号并发自动排队不撞 race
@@ -136,11 +182,37 @@ impl UsageFetcher {
                         current_token = token_res.access_token.clone();
                         new_tokens = Some(token_res);
 
-                        // 重试请求
-                        response = build_request(&current_token, &account_id)
-                            .send()
-                            .await
-                            .map_err(|e| format!("刷新后重试失败: {}", e))?;
+                        // 重试请求（同样带 5xx 退避）
+                        let mut retried = None;
+                        for attempt in 0..3u32 {
+                            match build_request(&current_token, &account_id).send().await {
+                                Ok(resp) => {
+                                    status = resp.status();
+                                    let transient =
+                                        matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
+                                    if transient && attempt < 2 {
+                                        let _ = resp.text().await;
+                                        tokio::time::sleep(Duration::from_millis(
+                                            1000u64 * (1u64 << attempt),
+                                        ))
+                                        .await;
+                                        continue;
+                                    }
+                                    retried = Some(resp);
+                                    break;
+                                }
+                                Err(e) => {
+                                    if attempt == 2 {
+                                        return Err(format!("刷新后重试失败: {}", e));
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(
+                                        1000u64 * (1u64 << attempt),
+                                    ))
+                                    .await;
+                                }
+                            }
+                        }
+                        response = retried.ok_or_else(|| "刷新后重试失败".to_string())?;
                         status = response.status();
                     }
                     Err(e) => {
@@ -195,6 +267,33 @@ impl UsageFetcher {
             .await
             .map_err(|e| format!("读取响应失败: {}", e))?;
 
+        // 非 2xx 绝不能当成功：OpenAI 间歇 429/500/503 时 body 仍是 JSON
+        // （如 {"error":{"code":"biscuit_baker_service_me_circuit_open"},"status":503}），
+        // 旧逻辑会落到 parse_usage_response → plan_type=unknown / 剩余 100% / 重置「未知」，
+        // 再经 Mini Mac remote refresh 写回 cached_quota，把好额度盖成假数据。
+        if !status.is_success() {
+            let preview: String = text.chars().take(240).collect();
+            let code = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|j| {
+                    j.pointer("/error/code")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            j.get("status")
+                                .and_then(|s| s.as_u64())
+                                .map(|n| n.to_string())
+                        })
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(format!(
+                "USAGE_UPSTREAM_HTTP_{}: wham/usage 上游异常 (code={}): {}",
+                status.as_u16(),
+                code,
+                preview
+            ));
+        }
+
         let json: Value =
             serde_json::from_str(&text).map_err(|e| format!("解析 JSON 失败: {}", e))?;
 
@@ -212,6 +311,24 @@ impl UsageFetcher {
                 println!("[Usage] 检测到账号停用: detail.code={}", detail_code);
                 return Err("ACCOUNT_BANNED:该账号已被封禁(workspace 已停用)".to_string());
             }
+        }
+
+        // 200 但其实是错误壳（偶发 CDN/网关把 error 包成 200）
+        if json.get("plan_type").and_then(|v| v.as_str()).is_none()
+            && json.get("rate_limit").is_none()
+        {
+            if let Some(err) = json.get("error") {
+                let preview: String = err.to_string().chars().take(200).collect();
+                return Err(format!(
+                    "USAGE_UPSTREAM_ERROR_BODY: wham/usage 返回错误体且无额度字段: {}",
+                    preview
+                ));
+            }
+            let preview: String = text.chars().take(200).collect();
+            return Err(format!(
+                "USAGE_EMPTY_BODY: wham/usage 200 但缺少 plan_type/rate_limit: {}",
+                preview
+            ));
         }
 
         let display = Self::parse_usage_response(&json)?;
@@ -559,7 +676,10 @@ impl UsageFetcher {
                 .await
                 .map(|s| s.chars().take(200).collect::<String>())
                 .unwrap_or_default();
-            return Err(format!("HTTP {} @ {} → {}", "subscription", sub_url, body_preview));
+            return Err(format!(
+                "HTTP {} @ {} → {}",
+                "subscription", sub_url, body_preview
+            ));
         }
         let sub_body: Value = sub_resp
             .json()
@@ -584,7 +704,9 @@ impl UsageFetcher {
                 .json()
                 .await
                 .map_err(|e| format!("usage JSON 解析失败: {}", e))?;
-            body.get("total_usage").and_then(|v| v.as_f64()).unwrap_or(0.0)
+            body.get("total_usage")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
         } else {
             0.0
         };
@@ -1027,7 +1149,10 @@ pub async fn send_referral_invite(
         }
     }
 
-    let resp = req.send().await.map_err(|e| format!("网络请求失败: {}", e))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("网络请求失败: {}", e))?;
     let status = resp.status();
     let raw = resp.text().await.unwrap_or_default();
 
@@ -1089,8 +1214,160 @@ pub struct ResetCreditResult {
     pub windows_reset: i64,
     /// 翻成人话的提示文案
     pub message: String,
+    /// 上游回传「实际被消耗的那条 credit id」（成功时 `credit.id`）。
+    /// 客户端无法定向消耗——烧哪条由服务端决定，这里仅用于回显「烧掉的是哪条」。
+    pub consumed_credit_id: Option<String>,
     /// 上游原始响应（成功/失败都带上，方便前端兜底）
     pub upstream_raw: String,
+}
+
+/// 一条可用的「主动重置次数」。来自 `GET wham/rate-limit-reset-credits` 的
+/// `credits[]`（只取 `status == "available"`）。所有 credit 功能等价（都是
+/// 「Full reset (Weekly + 5 hr)」），唯一区别是到期时间——不用就作废。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetCreditItem {
+    /// 上游唯一 id；仅用于回显「实际消耗的是哪条」，不能用于定向消耗。
+    pub id: String,
+    /// 到期时间（Unix 秒）。None = 上游没给/解析失败。
+    pub expires_at: Option<i64>,
+    /// 获得时间（Unix 秒）。
+    pub granted_at: Option<i64>,
+    /// 标题，如 "Full reset (Weekly + 5 hr)"。
+    pub title: String,
+    /// 来源人话，如 "邀请 amazing8078 获得" / "Codex 赠送"。
+    pub source: String,
+}
+
+/// 把 ISO8601 / RFC3339（如 `2026-07-18T00:34:00.259879Z`）转成 Unix 秒。
+fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+/// 把一条 credit 的来源翻成人话。优先从 description 抽出被邀请邮箱，
+/// 否则按 profile_user_id（"Codex Team" / "@handle"）兜底。
+fn reset_credit_source(profile_user_id: &str, description: &str) -> String {
+    // 邀请获得：description 形如 "...for inviting amazing8078@gmail.com"
+    if let Some(idx) = description.find("for inviting ") {
+        let rest = &description[idx + "for inviting ".len()..];
+        let token = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('.');
+        let handle = token.split('@').next().unwrap_or(token);
+        if !handle.is_empty() {
+            return format!("邀请 {} 获得", handle);
+        }
+    }
+    if profile_user_id.eq_ignore_ascii_case("Codex Team") {
+        return "Codex 赠送".to_string();
+    }
+    if let Some(h) = profile_user_id.strip_prefix('@') {
+        if !h.is_empty() {
+            return format!("邀请 {} 获得", h);
+        }
+    }
+    if !profile_user_id.is_empty() {
+        return profile_user_id.to_string();
+    }
+    "未知来源".to_string()
+}
+
+/// 拉取该账号所有「可用」的主动重置次数，按到期时间升序（最早在前）返回。
+/// `GET /backend-api/wham/rate-limit-reset-credits`（只读、不消耗）。
+/// 走 quota 同一条出口（codex UA + originator + ChatGPT-Account-Id）。
+pub async fn list_reset_credits(
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<Vec<ResetCreditItem>, String> {
+    let client = usage_client();
+    let mut req = client
+        .get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("User-Agent", crate::codex_ua::codex_user_agent())
+        .header("originator", crate::codex_ua::CODEX_ORIGINATOR)
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(30));
+    if let Some(id) = account_id {
+        if !id.is_empty() {
+            req = req.header("ChatGPT-Account-Id", id);
+        }
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("网络请求失败: {}", e))?;
+    let status = resp.status();
+    let raw = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(match status.as_u16() {
+            401 => "token 失效（401），请刷新或重新登录".to_string(),
+            403 => "需要验证（403）".to_string(),
+            429 => "请求过于频繁（429），稍后再试".to_string(),
+            c => format!("上游返回 HTTP {}", c),
+        });
+    }
+
+    let json: Value = serde_json::from_str(&raw).map_err(|_| "上游返回非 JSON".to_string())?;
+    let mut items: Vec<ResetCreditItem> = json
+        .get("credits")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|c| {
+                    c.get("status")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s == "available")
+                        .unwrap_or(false)
+                })
+                .map(|c| {
+                    let id = c
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let expires_at = c
+                        .get("expires_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_iso8601_to_unix);
+                    let granted_at = c
+                        .get("granted_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_iso8601_to_unix);
+                    let title = c
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Rate limit reset")
+                        .to_string();
+                    let profile = c
+                        .get("profile_user_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let desc = c.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    ResetCreditItem {
+                        id,
+                        expires_at,
+                        granted_at,
+                        title,
+                        source: reset_credit_source(profile, desc),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 最早到期在前（无到期时间的沉底）——服务端通常按这个顺序消耗。
+    items.sort_by(|a, b| match (a.expires_at, b.expires_at) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+
+    Ok(items)
 }
 
 /// 消耗一次「主动重置次数」立即重置已耗尽的限额窗口：
@@ -1125,7 +1402,10 @@ pub async fn consume_reset_credit(
         }
     }
 
-    let resp = req.send().await.map_err(|e| format!("网络请求失败: {}", e))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("网络请求失败: {}", e))?;
     let status = resp.status();
     let raw = resp.text().await.unwrap_or_default();
     let parsed = serde_json::from_str::<Value>(&raw).ok();
@@ -1154,6 +1434,7 @@ pub async fn consume_reset_credit(
             code: "http_error".to_string(),
             windows_reset: 0,
             message,
+            consumed_credit_id: None,
             upstream_raw: raw,
         });
     }
@@ -1169,6 +1450,13 @@ pub async fn consume_reset_credit(
         .and_then(|v| v.get("windows_reset"))
         .and_then(|w| w.as_i64())
         .unwrap_or(0);
+    // 上游回传实际烧掉的那条 credit id（`credit.id`）——客户端选不了，只能回显。
+    let consumed_credit_id = parsed
+        .as_ref()
+        .and_then(|v| v.get("credit"))
+        .and_then(|c| c.get("id"))
+        .and_then(|i| i.as_str())
+        .map(|s| s.to_string());
     let ok = code == "reset";
     let message = match code.as_str() {
         "reset" => format!("已重置 {} 个限额窗口", windows_reset),
@@ -1184,6 +1472,7 @@ pub async fn consume_reset_credit(
         code,
         windows_reset,
         message,
+        consumed_credit_id,
         upstream_raw: raw,
     })
 }
@@ -1217,8 +1506,16 @@ pub async fn send_wakeup(
     prompt: &str,
     model: &str,
 ) -> Result<WakeupResult, String> {
-    let prompt = if prompt.trim().is_empty() { "你好" } else { prompt.trim() };
-    let model = if model.trim().is_empty() { DEFAULT_WAKEUP_MODEL } else { model.trim() };
+    let prompt = if prompt.trim().is_empty() {
+        "你好"
+    } else {
+        prompt.trim()
+    };
+    let model = if model.trim().is_empty() {
+        DEFAULT_WAKEUP_MODEL
+    } else {
+        model.trim()
+    };
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let body = serde_json::json!({
@@ -1257,7 +1554,10 @@ pub async fn send_wakeup(
         }
     }
 
-    let resp = req.send().await.map_err(|e| format!("网络请求失败: {}", e))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("网络请求失败: {}", e))?;
     let status = resp.status();
     let raw = resp.text().await.unwrap_or_default();
 
@@ -1296,7 +1596,9 @@ fn parse_wakeup_reply(sse: &str) -> String {
         if payload.is_empty() || payload == "[DONE]" {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<Value>(payload) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
         match v.get("type").and_then(|t| t.as_str()) {
             Some("response.output_text.delta") => {
                 if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
@@ -1481,7 +1783,7 @@ mod tests {
     fn mimo_period_end_parser_reads_console_timestamp() {
         assert_eq!(
             UsageFetcher::parse_mimo_period_end("2026-05-04 23:59:59"),
-            Some(1_778_025_599)
+            Some(1_777_939_199)
         );
     }
 }
