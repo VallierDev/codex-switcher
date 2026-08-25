@@ -12,13 +12,22 @@ Codex Switcher 是一个面向 Codex CLI / Codex App 多账号工作流的桌面
 
 **一句话：当前账号限额了，前端任务不用停，Codex Switcher 在代理层自动换号、切换中转站或接入 Coding Plan，并自动重发请求。Coding Plan 目前已支持 GLM 和 Xiaomi MiMo Token Plan，其他平台待实测。**
 
-[下载最新版](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [配合 glance 使用](https://github.com/xtftbwvfp/glance)
+[下载最新版](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [上游项目 VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher) · [配合 glance 使用](https://github.com/xtftbwvfp/glance)
+
+> [!NOTE]
+> 本仓库是在 [VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher) 基础上维护的个人增强分支。通用功能、安装方式和许可证沿用上游；本分支额外包含双 Mac 远程账号池、长期运行调优以及 Codex Desktop 工作区兼容修复。
+
+> [!IMPORTANT]
+> **Codex Desktop 的 Team / Business 登录可以保留。** 部分 macOS Codex Desktop 版本存在打开任务后账号设置接口返回 401、随后被全局退出登录的回归，详见 [openai/codex#39162](https://github.com/openai/codex/issues/39162)。如果个人 Plus / Pro 登录会循环退出，而 Team / Business 工作区可以稳定启动，请让 Desktop 继续登录 Team；菜单里 Team 的 `0%` 只代表 Desktop 当前工作区，不代表 Codex Switcher 实际选中账号的额度。
+>
+> 本分支在最终 HTTP / WebSocket 出站前会删除 Desktop 带入的旧工作区身份，并按实际选中的账号重新绑定 `Authorization` 与 `chatgpt-account-id`。因此 Desktop 可以用 Team 维持壳层登录，代理请求仍使用 Codex Switcher 当前选择的 Plus / Pro / Team / Relay 账号；切号、重试和远程 Server 转发也遵循同一规则。
 
 ## 亮点
 
 - **手机锚（v0.7.0 新增）**：Codex.app 26.513+ 加了"手机远程连接"功能（手机/Codex.app 桌面端通过 ChatGPT 后端 bridge），但 bridge 鉴权绑死 `auth.json` 的 `chatgpt_account_id`，每次切号必断。手机锚把 disk 锁定在指定订阅号 —— 切到非锚账号时**磁盘不动 / proxy 出口照切**，让 Codex.app 仍以锚账号身份在线，手机端不掉线，而你的 codex CLI 实际跑在切走的那个号上。后台 4 min 独立 tick 保活锚号 token，rt 单写者保持是 Codex Switcher。详见[安装节][#手机锚phone-anchorv070]。
 - **会话路由（v0.6.0 新增）**：UI 一键把 codex 的"当前活跃会话"硬绑到指定账号 —— 这个对话强制走 GLM Coding Plan、那个对话强制走 MiMo、剩下走 ChatGPT。**绑完立刻生效**，不需要关 codex tab、不需要重启 Codex Switcher；底层用 `ws_disconnect` 踢断长连接、让 codex 自动重连进新路由。
 - **无损切号**：限额、封禁、401、全局容量不足时，代理层自动换号并重发请求，前端软件无感知。401 / 429 / 上下文超限 / token 失效 / RT 被轮换都已闭环。
+- **Desktop 工作区与代理账号隔离**：Codex Desktop 可以固定登录 Team / Business 保持应用稳定；每个代理请求会把 bearer token 和 `chatgpt-account-id` 作为同一账号的身份对重建，避免“新 token + 旧 Team workspace”造成假 401、假限额和切号风暴。
 - **三类账号统一调度**：订阅 (ChatGPT OAuth/API Key) · 中转 (PinCC/PackyCode/CLIProxyAPI 等聚合 reseller) · Coding Plan (GLM/MiMo/火山/UCloud 等厂商订阅) · 三方 (DeepSeek/Kimi/MiniMax/通义/Fireworks/OpenRouter 等按量付费)。可分别独立过滤、独立挑号策略。
 - **17 个内置 Relay preset**：除 GLM 和 MiMo 外，新增 DeepSeek / Moonshot / MiniMax / 通义千问 / 火山方舟 / 腾讯混元 / 百度千帆 / UCloud / Fireworks / Stepfun / OpenRouter + 一个适配所有 new-api/sub2api/CLIProxyAPI 兼容站的通用 Responses 中转。
 - **GLM Coding Plan 兼容**：把 Codex `/v1/responses` 实时翻译成 OpenAI `/chat/completions`，让 GLM Coding Plan 也能跑 Codex 请求。
@@ -670,12 +679,21 @@ Codex Switcher is a desktop app for multi-account Codex CLI / Codex App workflow
 
 **In one line: when the current account hits quota, your frontend task does not need to stop. Codex Switcher can switch accounts, switch relay endpoints, or route through a Coding Plan, then replay the request automatically. Coding Plan support is currently tested with GLM and Xiaomi MiMo Token Plan.**
 
-[Download the latest release](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [Use with glance](https://github.com/xtftbwvfp/glance)
+[Download the latest release](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [Upstream: VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher) · [Use with glance](https://github.com/xtftbwvfp/glance)
+
+> [!NOTE]
+> This repository is a personally maintained enhancement fork of [VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher). General features, installation instructions, and licensing come from upstream; this fork adds a two-Mac remote account pool, long-running deployment tuning, and Codex Desktop workspace compatibility fixes.
+
+> [!IMPORTANT]
+> **You can keep Codex Desktop signed in to a Team / Business workspace.** Some macOS Codex Desktop builds have an authentication regression where opening a task causes the account-settings request to return 401 and the app to drop the global login; see [openai/codex#39162](https://github.com/openai/codex/issues/39162). If personal Plus / Pro login loops but Team / Business keeps the app stable, leave Desktop on Team. A `0%` value in the Desktop workspace menu is not the quota of the account currently selected by Codex Switcher.
+>
+> Before every final HTTP or WebSocket hop, this fork removes the workspace identity inherited from Desktop and rebuilds `Authorization` plus `chatgpt-account-id` from the account actually selected by the proxy. Desktop can therefore use Team as its shell login while proxy traffic uses the selected Plus / Pro / Team / Relay account. Account switches, retries, and remote Server forwarding follow the same rule.
 
 ## Highlights
 
 - **Phone anchor (v0.7.0)**: Codex.app 26.513+ ships a phone↔Mac remote-control bridge whose handshake is bound to `auth.json`'s `chatgpt_account_id`. Anchoring a ChatGPT subscription account freezes the on-disk `auth.json` to that account while the proxy still routes traffic for whatever account is currently selected — your phone keeps showing the desktop online, your CLI runs on the switched account. A dedicated 4-min refresh tick keeps the anchor's token alive, and an exit/panic hook restores the access-token JWT's real `exp` (≈240h) so Codex.app can self-refresh if the switcher dies. Subscription accounts only — relay / API key cannot anchor.
 - **Lossless account switching**: quota, ban, 401, and global-capacity failures can trigger proxy-level account switching and request replay.
+- **Desktop workspace isolation**: Codex Desktop may stay pinned to Team / Business for app stability, while each proxy request rebuilds the bearer token and `chatgpt-account-id` as one identity pair. This prevents stale Team workspace headers from causing false 401s, false quota exhaustion, and switch loops.
 - **GLM Coding Plan support**: translates Codex `/v1/responses` traffic into OpenAI `/chat/completions` for GLM Coding Plan.
 - **Xiaomi MiMo Token Plan support**: built-in MiMo-V2.5 Token Plan preset with `tp-` keys, Singapore endpoint, and Chat Completions translation.
 - **Multi-account pool**: manages Codex OAuth accounts, OpenAI API keys, relay/API-key accounts, and remote account pools.
@@ -781,11 +799,18 @@ Codex Switcher — это настольное приложение для ра�
 
 **Коротко: если текущий аккаунт уперся в лимит, задача во фронтенд-инструменте не должна останавливаться. Codex Switcher может автоматически сменить аккаунт, переключить промежуточный сервер или отправить запрос через Coding Plan, а затем повторить запрос. Поддержка Coding Plan сейчас проверена с GLM и Xiaomi MiMo Token Plan.**
 
-[Скачать последнюю версию](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [Использовать вместе с glance](https://github.com/xtftbwvfp/glance)
+[Скачать последнюю версию](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [Upstream: VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher) · [Использовать вместе с glance](https://github.com/xtftbwvfp/glance)
+
+> [!NOTE]
+> Этот репозиторий — персонально поддерживаемая расширенная версия [VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher). Общие функции, установка и лицензия основаны на upstream; эта версия также содержит режим удаленного пула для двух Mac и исправления совместимости с workspace в Codex Desktop.
+
+> [!IMPORTANT]
+> Codex Desktop можно оставить авторизованным в Team / Business, если личный Plus / Pro попадает в цикл выхода из системы; см. [openai/codex#39162](https://github.com/openai/codex/issues/39162). Показатель `0%` в меню Team относится к workspace Desktop, а не обязательно к аккаунту, выбранному в Codex Switcher. Перед HTTP / WebSocket запросом прокси заново связывает `Authorization` и `chatgpt-account-id` с одним фактически выбранным аккаунтом.
 
 ## Основные Возможности
 
 - **Переключение без потери запроса**: лимиты, блокировки, 401 и ошибки глобальной емкости могут обрабатываться на уровне прокси с повторной отправкой запроса.
+- **Изоляция workspace Desktop**: Desktop может оставаться в Team / Business, а прокси использует согласованную пару bearer token + `chatgpt-account-id` выбранного аккаунта, не наследуя устаревший Team workspace.
 - **Поддержка GLM Coding Plan**: трафик Codex `/v1/responses` переводится в OpenAI `/chat/completions`.
 - **Поддержка Xiaomi MiMo Token Plan**: встроенный preset для MiMo-V2.5 Token Plan, `tp-` key, Singapore endpoint и перевод в Chat Completions.
 - **Пул аккаунтов**: Codex OAuth, OpenAI API keys, relay/API-key аккаунты и удаленные пулы.
