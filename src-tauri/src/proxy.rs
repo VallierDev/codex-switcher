@@ -35,6 +35,8 @@ use crate::sse_watchdog::{wrap_with_sse_watchdog, SseStreamDiagnostic};
 use crate::switch_log::{SwitchLogger, SwitchReason};
 use crate::token_tracker::TokenTracker;
 
+const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
+
 /// 待注入的切号通知消息
 static PENDING_INJECT_MSG: std::sync::LazyLock<Mutex<Option<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
@@ -2854,6 +2856,77 @@ fn headers_without_turn_state(base: &reqwest::header::HeaderMap) -> reqwest::hea
     h
 }
 
+/// 找到本次 bearer token 对应的 ChatGPT workspace account id。
+///
+/// 优先检查 current，兼容普通切号；再按 token 精确查找，兼容 session affinity / hard route
+/// 在不修改 current 的情况下临时使用其它账号。只有 ChatGPT OAuth 账号才返回 account id，
+/// OpenAI API key / Relay 必须移除客户端遗留的 `chatgpt-account-id`。
+fn chatgpt_account_id_for_token(state: &ProxyState, token: &str) -> Option<String> {
+    let store = state.store.lock().ok()?;
+
+    let matches_token = |account: &crate::account::Account| {
+        account.is_chatgpt_oauth()
+            && AccountStore::extract_access_token(&account.auth_json).as_deref() == Some(token)
+    };
+
+    if let Some(current) = store
+        .current
+        .as_deref()
+        .and_then(|id| store.accounts.get(id))
+    {
+        if matches_token(current) {
+            return AccountStore::extract_account_id(&current.auth_json);
+        }
+    }
+
+    store
+        .accounts
+        .values()
+        .find(|account| matches_token(account))
+        .and_then(|account| AccountStore::extract_account_id(&account.auth_json))
+}
+
+/// 最终出站前原子绑定 bearer token 与其 ChatGPT workspace account id。
+/// 先删除任何客户端/桌面壳传入的旧 account id，再按本次实际选择的 token 重建。
+fn bind_reqwest_upstream_identity(
+    headers: &mut reqwest::header::HeaderMap,
+    token: &str,
+    chatgpt_account_id: Option<&str>,
+) {
+    headers.remove(reqwest::header::AUTHORIZATION);
+    headers.remove(CHATGPT_ACCOUNT_ID_HEADER);
+
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    if let Some(account_id) = chatgpt_account_id {
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(account_id) {
+            headers.insert(
+                reqwest::header::HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+                value,
+            );
+        }
+    }
+}
+
+fn bind_websocket_upstream_identity(
+    headers: &mut tungstenite::http::HeaderMap,
+    token: &str,
+    chatgpt_account_id: Option<&str>,
+) {
+    headers.remove(hyper::header::AUTHORIZATION);
+    headers.remove(CHATGPT_ACCOUNT_ID_HEADER);
+
+    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", token)) {
+        headers.insert(hyper::header::AUTHORIZATION, value);
+    }
+    if let Some(account_id) = chatgpt_account_id {
+        if let Ok(value) = HeaderValue::from_str(account_id) {
+            headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
+        }
+    }
+}
+
 /// 构造上游请求的透明转发 header（剔除 host/authorization/connection，注入上游 Host）
 fn build_upstream_headers(
     req_headers: &hyper::HeaderMap,
@@ -2862,7 +2935,11 @@ fn build_upstream_headers(
     let mut h = reqwest::header::HeaderMap::new();
     for (name, value) in req_headers {
         let lower = name.as_str().to_ascii_lowercase();
-        if lower == "authorization" || lower == "host" || lower == "connection" {
+        if lower == "authorization"
+            || lower == CHATGPT_ACCOUNT_ID_HEADER
+            || lower == "host"
+            || lower == "connection"
+        {
             continue;
         }
         // `session_id`（下划线）不是官方 codex 客户端会发的 header —— 真实客户端
@@ -2946,7 +3023,11 @@ async fn forward_to_server_parts(
     let mut fwd_headers = reqwest::header::HeaderMap::new();
     for (name, value) in req_headers {
         let lower = name.as_str().to_ascii_lowercase();
-        if lower == "host" || lower == "authorization" || lower == "connection" {
+        if lower == "host"
+            || lower == "authorization"
+            || lower == CHATGPT_ACCOUNT_ID_HEADER
+            || lower == "connection"
+        {
             continue;
         }
         if let Ok(rn) = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
@@ -3272,9 +3353,8 @@ async fn forward_with_token(
     token: &str,
 ) -> Result<reqwest::Response, String> {
     let mut headers = base_headers.clone();
-    if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
-        headers.insert(reqwest::header::AUTHORIZATION, v);
-    }
+    let chatgpt_account_id = chatgpt_account_id_for_token(state, token);
+    bind_reqwest_upstream_identity(&mut headers, token, chatgpt_account_id.as_deref());
 
     println!("[Proxy] → upstream: {} {}", method, upstream_url);
 
@@ -4646,6 +4726,7 @@ async fn handle_websocket(
         if matches!(
             lower.as_str(),
             "authorization"
+                | CHATGPT_ACCOUNT_ID_HEADER
                 | "host"
                 | "upgrade"
                 | "connection"
@@ -4660,12 +4741,13 @@ async fn handle_websocket(
             .insert(name.clone(), value.clone());
     }
 
-    // 注入 token
-    if let Ok(auth_val) = HeaderValue::from_str(&format!("Bearer {}", token)) {
-        upstream_req
-            .headers_mut()
-            .insert(hyper::header::AUTHORIZATION, auth_val);
-    }
+    // 注入本次实际选择账号的 token + workspace account id（不可沿用 Desktop 入站值）
+    let chatgpt_account_id = chatgpt_account_id_for_token(&state, &token);
+    bind_websocket_upstream_identity(
+        upstream_req.headers_mut(),
+        &token,
+        chatgpt_account_id.as_deref(),
+    );
 
     // 3. 连接上游 WebSocket（认证失败时自动切号重连）
     let connect_result = tokio_tungstenite::connect_async(upstream_req).await;
@@ -4707,6 +4789,7 @@ async fn handle_websocket(
                     if matches!(
                         lower.as_str(),
                         "authorization"
+                            | CHATGPT_ACCOUNT_ID_HEADER
                             | "host"
                             | "upgrade"
                             | "connection"
@@ -4718,9 +4801,12 @@ async fn handle_websocket(
                     }
                     r.headers_mut().insert(name.clone(), value.clone());
                 }
-                if let Ok(av) = HeaderValue::from_str(&format!("Bearer {}", tok)) {
-                    r.headers_mut().insert(hyper::header::AUTHORIZATION, av);
-                }
+                let chatgpt_account_id = chatgpt_account_id_for_token(&state, tok);
+                bind_websocket_upstream_identity(
+                    r.headers_mut(),
+                    tok,
+                    chatgpt_account_id.as_deref(),
+                );
                 Some(r)
             };
 
@@ -4752,6 +4838,7 @@ async fn handle_websocket(
                             if matches!(
                                 l.as_str(),
                                 "authorization"
+                                    | CHATGPT_ACCOUNT_ID_HEADER
                                     | "host"
                                     | "upgrade"
                                     | "connection"
@@ -4763,9 +4850,12 @@ async fn handle_websocket(
                             }
                             r.headers_mut().insert(n.clone(), v.clone());
                         }
-                        if let Ok(av) = HeaderValue::from_str(&format!("Bearer {}", cur_token)) {
-                            r.headers_mut().insert(hyper::header::AUTHORIZATION, av);
-                        }
+                        let chatgpt_account_id = chatgpt_account_id_for_token(&state, &cur_token);
+                        bind_websocket_upstream_identity(
+                            r.headers_mut(),
+                            &cur_token,
+                            chatgpt_account_id.as_deref(),
+                        );
                         if let Ok(c) = tokio_tungstenite::connect_async(r).await {
                             println!("[Proxy] 容量满同号 retry 第 {} 次成功", attempt);
                             same_account_retry = Some(c);
@@ -6519,6 +6609,98 @@ fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_headers_strip_desktop_chatgpt_identity() {
+        let mut inbound = hyper::HeaderMap::new();
+        inbound.insert(
+            HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+            HeaderValue::from_static("team-workspace-from-desktop"),
+        );
+        inbound.insert(
+            hyper::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer desktop-token"),
+        );
+
+        let outbound = build_upstream_headers(&inbound, "chatgpt.com");
+        assert!(outbound.get(CHATGPT_ACCOUNT_ID_HEADER).is_none());
+        assert!(outbound.get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn reqwest_identity_replaces_stale_workspace_atomically() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+            reqwest::header::HeaderValue::from_static("stale-team-workspace"),
+        );
+
+        bind_reqwest_upstream_identity(
+            &mut headers,
+            "selected-personal-token",
+            Some("selected-personal-workspace"),
+        );
+
+        assert_eq!(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer selected-personal-token")
+        );
+        assert_eq!(
+            headers
+                .get(CHATGPT_ACCOUNT_ID_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("selected-personal-workspace")
+        );
+    }
+
+    #[test]
+    fn non_chatgpt_identity_removes_stale_workspace() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+            reqwest::header::HeaderValue::from_static("stale-team-workspace"),
+        );
+
+        bind_reqwest_upstream_identity(&mut headers, "sk-relay-token", None);
+
+        assert!(headers.get(CHATGPT_ACCOUNT_ID_HEADER).is_none());
+        assert_eq!(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer sk-relay-token")
+        );
+    }
+
+    #[test]
+    fn websocket_identity_replaces_stale_workspace_atomically() {
+        let mut headers = tungstenite::http::HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+            HeaderValue::from_static("stale-team-workspace"),
+        );
+
+        bind_websocket_upstream_identity(
+            &mut headers,
+            "selected-personal-token",
+            Some("selected-personal-workspace"),
+        );
+
+        assert_eq!(
+            headers
+                .get(hyper::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer selected-personal-token")
+        );
+        assert_eq!(
+            headers
+                .get(CHATGPT_ACCOUNT_ID_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("selected-personal-workspace")
+        );
+    }
 
     #[test]
     fn upstream_chatgpt_strips_v1_prefix() {
