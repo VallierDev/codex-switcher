@@ -527,6 +527,18 @@
     cursor: help;
 }
 
+.badge.account-expiry.soon {
+    background: rgba(245, 158, 11, 0.18);
+    color: #fbbf24;
+    cursor: pointer;
+}
+
+.badge.account-expiry.expired {
+    background: rgba(239, 68, 68, 0.18);
+    color: #f87171;
+    cursor: pointer;
+}
+
 /* 手机锚 badge：与 .current 区分开但同样醒目 */
 .badge.anchor {
     background: linear-gradient(135deg, rgba(56, 189, 248, 0.25) 0%, rgba(99, 102, 241, 0.25) 100%);
@@ -708,7 +720,7 @@
 
 
 .col-time {
-    width: 125px;
+    width: 170px;
     flex-shrink: 0;
     font-size: 10px;
     color: var(--text-muted);
@@ -745,6 +757,153 @@
 
 .time-item.refresh .time-val {
     opacity: 0.8;
+}
+
+.account-expiry-row {
+    gap: 6px;
+}
+
+.account-expiry-value {
+    min-width: 0;
+    padding: 1px 4px;
+    overflow: hidden;
+    color: var(--text-secondary);
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    background: transparent;
+    border: 1px dashed transparent;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.account-expiry-value:hover {
+    color: #7dd3fc;
+    border-color: rgba(56, 189, 248, 0.45);
+    background: rgba(56, 189, 248, 0.08);
+}
+
+.account-expiry-value.unset {
+    color: var(--text-muted);
+}
+
+.account-expiry-value.soon {
+    color: #fbbf24;
+}
+
+.account-expiry-value.expired {
+    color: #f87171;
+    font-weight: 700;
+}
+
+.account-expiry-modal {
+    width: min(420px, calc(100vw - 32px));
+    padding: 0;
+    overflow: hidden;
+}
+
+.account-expiry-modal-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    padding: 20px 22px 14px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.account-expiry-modal-header h2 {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: 18px;
+}
+
+.account-expiry-modal-header p {
+    margin: 5px 0 0;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.account-expiry-modal-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 18px 22px;
+}
+
+.account-expiry-modal-body label {
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.account-expiry-modal-body input[type='date'] {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    color: var(--text-primary);
+    color-scheme: dark;
+    background: var(--input-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    outline: none;
+}
+
+.account-expiry-modal-body input[type='date']:focus {
+    border-color: rgba(56, 189, 248, 0.7);
+    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.12);
+}
+
+.account-expiry-help,
+.account-expiry-error {
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.account-expiry-help {
+    color: var(--text-muted);
+}
+
+.account-expiry-error {
+    color: #f87171;
+}
+
+.account-expiry-modal-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 22px 20px;
+}
+
+.account-expiry-modal-actions-right {
+    display: flex;
+    gap: 8px;
+}
+
+.account-expiry-modal-actions .primary-btn,
+.account-expiry-modal-actions .secondary-btn {
+    padding: 8px 14px;
+    font: inherit;
+    font-size: 12px;
+    border-radius: 7px;
+    cursor: pointer;
+}
+
+.account-expiry-modal-actions .primary-btn {
+    color: #fff;
+    background: #2563eb;
+    border: 1px solid #3b82f6;
+}
+
+.account-expiry-modal-actions .secondary-btn {
+    color: var(--text-secondary);
+    background: var(--input-bg);
+    border: 1px solid var(--border-color);
+}
+
+.account-expiry-modal-actions button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 .col-actions {

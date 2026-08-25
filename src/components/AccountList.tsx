@@ -41,6 +41,46 @@ function daysLeft(ts?: number | null): number | null {
     return Math.max(0, Math.floor((ts - Math.floor(Date.now() / 1000)) / 86400));
 }
 
+type AccountExpiryInfo = {
+    text: string;
+    badge: string | null;
+    tone: 'unset' | 'normal' | 'soon' | 'expired';
+    title: string;
+};
+
+/** 手工账号到期日按本地自然日计算；到期当天仍显示“今天到期”。 */
+function accountExpiryInfo(value?: string | null): AccountExpiryInfo {
+    if (!value) {
+        return { text: '未设置', badge: null, tone: 'unset', title: '点击设置账号到期日' };
+    }
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) {
+        return { text: value, badge: '日期异常', tone: 'expired', title: '日期格式异常，点击修正' };
+    }
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const parsed = new Date(Date.UTC(year, month - 1, day));
+    if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) {
+        return { text: value, badge: '日期异常', tone: 'expired', title: '日期内容异常，点击修正' };
+    }
+    const now = new Date();
+    const todayUtc = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+    const expiryUtc = parsed.getTime();
+    const remainingDays = Math.round((expiryUtc - todayUtc) / 86_400_000);
+
+    if (remainingDays < 0) {
+        return { text: `${value} · 已过期`, badge: '账号已到期', tone: 'expired', title: `账号于 ${value} 到期，点击修改` };
+    }
+    if (remainingDays === 0) {
+        return { text: `${value} · 今天`, badge: '今天到期', tone: 'soon', title: '账号今天到期，点击修改' };
+    }
+    if (remainingDays <= 7) {
+        return { text: `${value} · ${remainingDays}天`, badge: `${remainingDays}天到期`, tone: 'soon', title: `账号还有 ${remainingDays} 天到期，点击修改` };
+    }
+    return { text: value, badge: null, tone: 'normal', title: `账号到期日 ${value}，点击修改` };
+}
+
 /** 把上游英文邀请提示翻成人话 */
 function friendlyInviteMessage(raw: string | null | undefined): string {
     const m = (raw || '').trim();
@@ -121,6 +161,7 @@ interface AccountListProps {
     settings: AppSettings;
     onSwitch: (id: string) => void | Promise<void>;
     onDelete: (id: string) => void;
+    onUpdateAccount: (id: string, name?: string, notes?: string, accountExpiresAt?: string) => Promise<void>;
     onUpdateSettings: (settings: AppSettings) => void;
     onRefreshComplete?: () => void;
     onAddAccount?: () => void;
@@ -139,6 +180,7 @@ export function AccountList({
     onRefreshUsage,
     usageLoading,
     onDelete,
+    onUpdateAccount,
     onUpdateSettings,
     onRefreshComplete,
 }: AccountListProps) {
@@ -173,9 +215,35 @@ export function AccountList({
     const [resetList, setResetList] = useState<ResetCreditItem[] | null>(null);
     const [resetListLoading, setResetListLoading] = useState(false);
     const [resetListError, setResetListError] = useState<string | null>(null);
+    // 月抛账号到期日：手工维护，与 OAuth token 的 expires_at 完全分开。
+    const [expiryEditor, setExpiryEditor] = useState<{ id: string; name: string; value: string } | null>(null);
+    const [savingExpiry, setSavingExpiry] = useState(false);
+    const [expiryError, setExpiryError] = useState<string | null>(null);
 
     const autoReload = settings.auto_reload_ide;
     const setAutoReload = (val: boolean) => onUpdateSettings({ ...settings, auto_reload_ide: val });
+
+    const saveAccountExpiry = async () => {
+        if (!expiryEditor || savingExpiry) return;
+        setSavingExpiry(true);
+        setExpiryError(null);
+        try {
+            await onUpdateAccount(expiryEditor.id, undefined, undefined, expiryEditor.value);
+            if (settings.remote_mode === 'client' || settings.remote_mode === 'solo') {
+                try {
+                    await invoke('remote_push_account', { id: expiryEditor.id });
+                } catch (err) {
+                    throw new Error(`本地已保存，但同步 Server 失败：${String(err)}`);
+                }
+            }
+            onRefreshComplete?.();
+            setExpiryEditor(null);
+        } catch (err) {
+            setExpiryError(String(err));
+        } finally {
+            setSavingExpiry(false);
+        }
+    };
 
     const handleCopy = (id: string, text: string) => {
         navigator.clipboard.writeText(text).then(() => {
@@ -803,6 +871,7 @@ export function AccountList({
                         const isLoggedOut = acc.is_logged_out;
                         const isCurrent = acc.id === currentId;
                         const isRefreshing = refreshingIds.has(acc.id);
+                        const expiry = accountExpiryInfo(acc.account_expires_at);
 
                         return (
                             <div key={acc.id} className={`account-row ${isCurrent ? 'current' : ''} ${selectedIds.has(acc.id) ? 'selected' : ''} ${isBanned ? 'banned' : isLoggedOut ? 'logged-out' : isInvalid ? 'expired' : ''}`}>
@@ -860,6 +929,7 @@ export function AccountList({
                                             >📱 手机锚</span>
                                         )}
                                         {isBanned ? <span className="badge banned" title="该账号已被 OpenAI 封禁">封号</span> : isLoggedOut ? <span className="badge logged-out" title="登录已失效，可能是 refresh_token 过期、被撤销或会话在其他设备结束">需重新登录</span> : isInvalid && <span className="badge expired" title="该账号 Token 已过期或失效">过期</span>}
+                                        {expiry.badge && <span className={`badge account-expiry ${expiry.tone}`} title={expiry.title}>📅 {expiry.badge}</span>}
                                         {usage?.plan_type && <span className="badge plan">{usage.plan_type.toUpperCase()}</span>}
                                         {usage?.reset_credits != null && (
                                             usage.reset_credits > 0 ? (
@@ -901,6 +971,17 @@ export function AccountList({
                                     <div className="time-item refresh">
                                         <span className="time-label">刷新:</span>
                                         <span className="time-val">{formatDate(acc.cached_quota?.updated_at)}</span>
+                                    </div>
+                                    <div className="time-item account-expiry-row">
+                                        <span className="time-label">到期:</span>
+                                        <button
+                                            className={`time-val account-expiry-value ${expiry.tone}`}
+                                            title={expiry.title}
+                                            onClick={() => {
+                                                setExpiryError(null);
+                                                setExpiryEditor({ id: acc.id, name: acc.name, value: acc.account_expires_at ?? '' });
+                                            }}
+                                        >{expiry.text}</button>
                                     </div>
                                     {effectiveKind(acc) !== 'relay' && (
                                         <div className="wakeup-row">
@@ -964,6 +1045,45 @@ export function AccountList({
                 }}
                 onCancel={() => setAccountToDelete(null)}
             />
+
+            {expiryEditor && (
+                <div className="modal-overlay" onClick={() => !savingExpiry && setExpiryEditor(null)}>
+                    <div className="modal-content account-expiry-modal" onClick={e => e.stopPropagation()}>
+                        <div className="account-expiry-modal-header">
+                            <div>
+                                <h2>账号到期日</h2>
+                                <p>{expiryEditor.name}</p>
+                            </div>
+                            <button className="close-btn" onClick={() => setExpiryEditor(null)} disabled={savingExpiry}>×</button>
+                        </div>
+                        <div className="account-expiry-modal-body">
+                            <label htmlFor="account-expiry-date">到期日期</label>
+                            <input
+                                id="account-expiry-date"
+                                type="date"
+                                value={expiryEditor.value}
+                                onChange={e => setExpiryEditor({ ...expiryEditor, value: e.target.value })}
+                                disabled={savingExpiry}
+                            />
+                            <p className="account-expiry-help">ChatGPT / Codex 目前没有提供可靠的订阅到期日接口，因此这里由你手工维护。它不会修改登录 Token、不会当作额度重置时间，也不会触发自动切号。留空保存可清除日期。</p>
+                            {expiryError && <p className="account-expiry-error">{expiryError}</p>}
+                        </div>
+                        <div className="account-expiry-modal-actions">
+                            <button
+                                className="secondary-btn"
+                                onClick={() => setExpiryEditor({ ...expiryEditor, value: '' })}
+                                disabled={savingExpiry || !expiryEditor.value}
+                            >清除日期</button>
+                            <div className="account-expiry-modal-actions-right">
+                                <button className="secondary-btn" onClick={() => setExpiryEditor(null)} disabled={savingExpiry}>取消</button>
+                                <button className="primary-btn" onClick={saveAccountExpiry} disabled={savingExpiry}>
+                                    {savingExpiry ? '保存中…' : '保存'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {resetModal && (
                 <div className="modal-overlay" onClick={closeResetModal}>

@@ -538,10 +538,11 @@ fn update_account(
     id: String,
     name: Option<String>,
     notes: Option<String>,
+    account_expires_at: Option<String>,
 ) -> Result<(), String> {
     {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
-        store.update_account(&id, name, notes)?;
+        store.update_account(&id, name, notes, account_expires_at)?;
         store.save()?;
     }
     crate::tray::update_tray_menu(&app);
@@ -5706,6 +5707,7 @@ mod tests {
             created_at: Utc::now(),
             last_used: None,
             notes: None,
+            account_expires_at: None,
             cached_quota: None,
             keepalive: account::KeepaliveState::default(),
             is_banned: false,

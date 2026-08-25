@@ -329,6 +329,11 @@ pub struct Account {
     pub last_used: Option<DateTime<Utc>>,
     /// 备注
     pub notes: Option<String>,
+
+    /// 用户手工维护的账号/订阅到期日（YYYY-MM-DD）。
+    /// 与 OAuth access_token 的 expires_at 无关，主要用于月抛账号管理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_expires_at: Option<String>,
     /// 缓存的配额信息
     #[serde(default)]
     pub cached_quota: Option<CachedQuota>,
@@ -1119,6 +1124,7 @@ impl AccountStore {
             created_at: Utc::now(),
             last_used: None,
             notes,
+            account_expires_at: None,
             cached_quota: None,
             keepalive: KeepaliveState::default(),
             is_banned: false,
@@ -1184,6 +1190,7 @@ impl AccountStore {
             created_at: Utc::now(),
             last_used: None,
             notes,
+            account_expires_at: None,
             cached_quota: None,
             keepalive: KeepaliveState::default(),
             is_banned: false,
@@ -1367,7 +1374,23 @@ impl AccountStore {
         id: &str,
         name: Option<String>,
         notes: Option<String>,
+        account_expires_at: Option<String>,
     ) -> Result<(), String> {
+        // 先校验再修改账号，避免日期无效时 name/notes 已经被部分写入。
+        let normalized_expiry = match account_expires_at {
+            Some(raw) => {
+                let value = raw.trim();
+                if value.is_empty() {
+                    Some(None)
+                } else {
+                    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                        .map_err(|_| "账号到期日格式必须是 YYYY-MM-DD".to_string())?;
+                    Some(Some(value.to_string()))
+                }
+            }
+            None => None,
+        };
+
         let account = self
             .accounts
             .get_mut(id)
@@ -1378,6 +1401,9 @@ impl AccountStore {
         }
         if notes.is_some() {
             account.notes = notes;
+        }
+        if let Some(value) = normalized_expiry {
+            account.account_expires_at = value;
         }
 
         Ok(())
@@ -1938,6 +1964,67 @@ mod tests {
 
         assert_eq!(store.accounts.len(), 1);
         assert_eq!(store.current, Some(account.id));
+    }
+
+    #[test]
+    fn account_expiry_date_can_be_set_and_cleared() {
+        let mut store = AccountStore::default();
+        let account = store.add_account(
+            "月抛账号".to_string(),
+            serde_json::json!({"token": "test"}),
+            None,
+        );
+
+        store
+            .update_account(&account.id, None, None, Some("2026-09-30".to_string()))
+            .unwrap();
+        assert_eq!(
+            store.accounts[&account.id].account_expires_at.as_deref(),
+            Some("2026-09-30")
+        );
+
+        store
+            .update_account(&account.id, None, None, Some(String::new()))
+            .unwrap();
+        assert!(store.accounts[&account.id].account_expires_at.is_none());
+    }
+
+    #[test]
+    fn account_expiry_date_rejects_invalid_format_without_overwriting() {
+        let mut store = AccountStore::default();
+        let account = store.add_account(
+            "月抛账号".to_string(),
+            serde_json::json!({"token": "test"}),
+            None,
+        );
+
+        let err = store
+            .update_account(
+                &account.id,
+                Some("不应写入".to_string()),
+                Some("不应写入".to_string()),
+                Some("2026-02-30".to_string()),
+            )
+            .expect_err("不存在的日期必须被拒绝");
+        assert!(err.contains("YYYY-MM-DD"));
+        assert_eq!(store.accounts[&account.id].name, "月抛账号");
+        assert!(store.accounts[&account.id].notes.is_none());
+        assert!(store.accounts[&account.id].account_expires_at.is_none());
+    }
+
+    #[test]
+    fn old_account_json_defaults_expiry_to_none() {
+        let mut store = AccountStore::default();
+        let account = store.add_account(
+            "兼容旧数据".to_string(),
+            serde_json::json!({"token": "test"}),
+            None,
+        );
+        let mut value = serde_json::to_value(&account).unwrap();
+        value.as_object_mut().unwrap().remove("account_expires_at");
+
+        let decoded: Account = serde_json::from_value(value).unwrap();
+        assert!(decoded.account_expires_at.is_none());
     }
 
     #[test]

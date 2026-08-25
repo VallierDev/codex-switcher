@@ -12,15 +12,12 @@ Codex Switcher 是一个面向 Codex CLI / Codex App 多账号工作流的桌面
 
 **一句话：当前账号限额了，前端任务不用停，Codex Switcher 在代理层自动换号、切换中转站或接入 Coding Plan，并自动重发请求。Coding Plan 目前已支持 GLM 和 Xiaomi MiMo Token Plan，其他平台待实测。**
 
-[下载最新版](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [上游项目 VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher) · [配合 glance 使用](https://github.com/xtftbwvfp/glance)
-
-> [!NOTE]
-> 本仓库是在 [VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher) 基础上维护的个人增强分支。通用功能、安装方式和许可证沿用上游；本分支额外包含双 Mac 远程账号池、长期运行调优以及 Codex Desktop 工作区兼容修复。
+[下载最新版](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [配合 glance 使用](https://github.com/xtftbwvfp/glance)
 
 > [!IMPORTANT]
 > **Codex Desktop 的 Team / Business 登录可以保留。** 部分 macOS Codex Desktop 版本存在打开任务后账号设置接口返回 401、随后被全局退出登录的回归，详见 [openai/codex#39162](https://github.com/openai/codex/issues/39162)。如果个人 Plus / Pro 登录会循环退出，而 Team / Business 工作区可以稳定启动，请让 Desktop 继续登录 Team；菜单里 Team 的 `0%` 只代表 Desktop 当前工作区，不代表 Codex Switcher 实际选中账号的额度。
 >
-> 本分支在最终 HTTP / WebSocket 出站前会删除 Desktop 带入的旧工作区身份，并按实际选中的账号重新绑定 `Authorization` 与 `chatgpt-account-id`。因此 Desktop 可以用 Team 维持壳层登录，代理请求仍使用 Codex Switcher 当前选择的 Plus / Pro / Team / Relay 账号；切号、重试和远程 Server 转发也遵循同一规则。
+> 本项目在最终 HTTP / WebSocket 出站前会删除 Desktop 带入的旧工作区身份，并按实际选中的账号重新绑定 `Authorization` 与 `chatgpt-account-id`。因此 Desktop 可以用 Team 维持壳层登录，代理请求仍使用 Codex Switcher 当前选择的 Plus / Pro / Team / Relay 账号；切号、重试和远程 Server 转发也遵循同一规则。
 
 ## 亮点
 
@@ -36,6 +33,7 @@ Codex Switcher 是一个面向 Codex CLI / Codex App 多账号工作流的桌面
 - **上下文超限自动 compact**：上游（GLM 1261 等）拒收时，代理把错误归一化成 OpenAI `context_length_exceeded`，codex CLI 收到后自动触发 compact 而不是退出。
 - **余额接口自动探测**：第一次刷新中转账号余额时按顺序 probe `/v1/dashboard/billing/*`（new-api 系）→ `/v1/usage`（sub2api / OpenAI 兼容）→ 都不通则不拉。探测结果落库，下次直接走对应 fetcher。
 - **可观测配额**：5 小时/周配额、token、成本、cache savings、切号原因、周期历史都能看。
+- **月抛账号到期提醒**：可为每个账号手工记录订阅到期日，列表直接显示日期，并对 7 天内到期和已过期账号醒目标记。ChatGPT / Codex 当前没有提供可信的订阅到期日接口，因此该日期与 OAuth token 到期、额度重置时间严格分开，不参与自动切号判断。
 - **长期开发友好**：session affinity 保住 prompt cache，`prompt_cache_key` 按账号隔离，减少切号后的缓存污染。
 - **跨工具 Skills**：把 Codex/Claude/Gemini/OpenCode 的 Skills 统一发现、安装、同步。
 
@@ -679,15 +677,12 @@ Codex Switcher is a desktop app for multi-account Codex CLI / Codex App workflow
 
 **In one line: when the current account hits quota, your frontend task does not need to stop. Codex Switcher can switch accounts, switch relay endpoints, or route through a Coding Plan, then replay the request automatically. Coding Plan support is currently tested with GLM and Xiaomi MiMo Token Plan.**
 
-[Download the latest release](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [Upstream: VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher) · [Use with glance](https://github.com/xtftbwvfp/glance)
-
-> [!NOTE]
-> This repository is a personally maintained enhancement fork of [VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher). General features, installation instructions, and licensing come from upstream; this fork adds a two-Mac remote account pool, long-running deployment tuning, and Codex Desktop workspace compatibility fixes.
+[Download the latest release](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [Use with glance](https://github.com/xtftbwvfp/glance)
 
 > [!IMPORTANT]
 > **You can keep Codex Desktop signed in to a Team / Business workspace.** Some macOS Codex Desktop builds have an authentication regression where opening a task causes the account-settings request to return 401 and the app to drop the global login; see [openai/codex#39162](https://github.com/openai/codex/issues/39162). If personal Plus / Pro login loops but Team / Business keeps the app stable, leave Desktop on Team. A `0%` value in the Desktop workspace menu is not the quota of the account currently selected by Codex Switcher.
 >
-> Before every final HTTP or WebSocket hop, this fork removes the workspace identity inherited from Desktop and rebuilds `Authorization` plus `chatgpt-account-id` from the account actually selected by the proxy. Desktop can therefore use Team as its shell login while proxy traffic uses the selected Plus / Pro / Team / Relay account. Account switches, retries, and remote Server forwarding follow the same rule.
+> Before every final HTTP or WebSocket hop, Codex Switcher removes the workspace identity inherited from Desktop and rebuilds `Authorization` plus `chatgpt-account-id` from the account actually selected by the proxy. Desktop can therefore use Team as its shell login while proxy traffic uses the selected Plus / Pro / Team / Relay account. Account switches, retries, and remote Server forwarding follow the same rule.
 
 ## Highlights
 
@@ -698,6 +693,7 @@ Codex Switcher is a desktop app for multi-account Codex CLI / Codex App workflow
 - **Xiaomi MiMo Token Plan support**: built-in MiMo-V2.5 Token Plan preset with `tp-` keys, Singapore endpoint, and Chat Completions translation.
 - **Multi-account pool**: manages Codex OAuth accounts, OpenAI API keys, relay/API-key accounts, and remote account pools.
 - **Quota visibility**: tracks 5-hour and weekly quota, token usage, costs, cache savings, switch reasons, and quota cycles.
+- **Disposable-account expiry reminders**: stores a manually managed subscription-expiry date per account, shows it in the account list, and highlights dates within 7 days or already expired. ChatGPT / Codex currently exposes no trustworthy subscription-expiry API, so this value stays separate from OAuth token expiry and quota reset windows and never drives automatic switching.
 - **Long-session friendly**: session affinity and per-account `prompt_cache_key` isolation help preserve prompt-cache benefits.
 - **Cross-tool Skills**: discover, install, sync, and link Skills across Codex, Claude, Gemini, and OpenCode-style directories.
 
@@ -799,10 +795,7 @@ Codex Switcher — это настольное приложение для ра�
 
 **Коротко: если текущий аккаунт уперся в лимит, задача во фронтенд-инструменте не должна останавливаться. Codex Switcher может автоматически сменить аккаунт, переключить промежуточный сервер или отправить запрос через Coding Plan, а затем повторить запрос. Поддержка Coding Plan сейчас проверена с GLM и Xiaomi MiMo Token Plan.**
 
-[Скачать последнюю версию](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [Upstream: VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher) · [Использовать вместе с glance](https://github.com/xtftbwvfp/glance)
-
-> [!NOTE]
-> Этот репозиторий — персонально поддерживаемая расширенная версия [VallierDev/codex-switcher](https://github.com/VallierDev/codex-switcher). Общие функции, установка и лицензия основаны на upstream; эта версия также содержит режим удаленного пула для двух Mac и исправления совместимости с workspace в Codex Desktop.
+[Скачать последнюю версию](https://github.com/xtftbwvfp/codex-switcher/releases/latest) · [Использовать вместе с glance](https://github.com/xtftbwvfp/glance)
 
 > [!IMPORTANT]
 > Codex Desktop можно оставить авторизованным в Team / Business, если личный Plus / Pro попадает в цикл выхода из системы; см. [openai/codex#39162](https://github.com/openai/codex/issues/39162). Показатель `0%` в меню Team относится к workspace Desktop, а не обязательно к аккаунту, выбранному в Codex Switcher. Перед HTTP / WebSocket запросом прокси заново связывает `Authorization` и `chatgpt-account-id` с одним фактически выбранным аккаунтом.
@@ -815,6 +808,7 @@ Codex Switcher — это настольное приложение для ра�
 - **Поддержка Xiaomi MiMo Token Plan**: встроенный preset для MiMo-V2.5 Token Plan, `tp-` key, Singapore endpoint и перевод в Chat Completions.
 - **Пул аккаунтов**: Codex OAuth, OpenAI API keys, relay/API-key аккаунты и удаленные пулы.
 - **Наблюдаемость квот**: 5-часовые и недельные квоты, токены, стоимость, cache savings, причины переключений и история циклов.
+- **Напоминания об окончании подписки**: для каждого аккаунта можно вручную указать дату окончания подписки; даты в пределах 7 дней и уже истекшие выделяются в списке. ChatGPT / Codex сейчас не предоставляет надежное API этой даты, поэтому она хранится отдельно от срока OAuth-токена и окон сброса квот и не влияет на автоматическое переключение.
 - **Поддержка длинных сессий**: session affinity и изоляция `prompt_cache_key` по аккаунтам помогают сохранить пользу prompt cache.
 - **Skills для разных инструментов**: поиск, установка, синхронизация и symlink-распределение Skills для Codex, Claude, Gemini и OpenCode-подобных инструментов.
 

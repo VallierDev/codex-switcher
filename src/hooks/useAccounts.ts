@@ -71,6 +71,8 @@ export interface Account {
     created_at: string;
     last_used: string | null;
     notes: string | null;
+    /** 用户手工维护的账号/订阅到期日（YYYY-MM-DD），不是 access token 到期时间。 */
+    account_expires_at?: string | null;
     cached_quota: CachedQuota | null;
     keepalive: KeepaliveState;
     is_banned: boolean;
@@ -222,10 +224,15 @@ export function useAccounts() {
     }, [loadData, currentId]);
 
     // 更新账号
-    const updateAccount = useCallback(async (id: string, name?: string, notes?: string) => {
+    const updateAccount = useCallback(async (
+        id: string,
+        name?: string,
+        notes?: string,
+        accountExpiresAt?: string,
+    ) => {
         try {
             setError(null);
-            await invoke('update_account', { id, name, notes });
+            await invoke('update_account', { id, name, notes, accountExpiresAt });
             await loadData();
         } catch (err) {
             setError(String(err));

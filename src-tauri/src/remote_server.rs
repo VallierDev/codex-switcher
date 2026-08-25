@@ -409,6 +409,9 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
                 if to_write.notes.is_none() {
                     to_write.notes = old.notes.clone();
                 }
+                if to_write.account_expires_at.is_none() {
+                    to_write.account_expires_at = old.account_expires_at.clone();
+                }
             }
         }
         if let Err(e) = upsert_account(&mut store, to_write) {
