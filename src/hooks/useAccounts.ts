@@ -5,10 +5,12 @@ export interface CachedQuota {
     five_hour_left: number;
     five_hour_reset: string;
     five_hour_reset_at?: number;
+    primary_window_seconds?: number | null;
     five_hour_label?: string;
     weekly_left: number;
     weekly_reset: string;
     weekly_reset_at?: number;
+    secondary_window_seconds?: number | null;
     weekly_label?: string;
     plan_type: string;
     is_valid_for_cli?: boolean;
@@ -47,6 +49,17 @@ export interface KeepaliveState {
     last_error: string | null;
 }
 
+export interface WindowPrimingState {
+    configured?: boolean;
+    five_hour_enabled: boolean;
+    weekly_enabled: boolean;
+    last_five_hour_reset_at?: number | null;
+    last_weekly_reset_at?: number | null;
+    last_attempt_at?: string | null;
+    last_success_at?: string | null;
+    last_error?: string | null;
+}
+
 export interface SyncStatus {
     is_synced: boolean;
     disk_email: string | null;
@@ -73,6 +86,8 @@ export interface Account {
     notes: string | null;
     /** 用户手工维护的账号/订阅到期日（YYYY-MM-DD），不是 access token 到期时间。 */
     account_expires_at?: string | null;
+    /** 窗口 reset 后用该账号发一次最小 Codex 请求，主动开始新的滚动倒计时。 */
+    window_priming?: WindowPrimingState;
     cached_quota: CachedQuota | null;
     keepalive: KeepaliveState;
     is_banned: boolean;

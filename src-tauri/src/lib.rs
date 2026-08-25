@@ -289,7 +289,6 @@ fn update_settings(
         prev_proxy_enabled,
         prev_proxy_port,
         prev_proxy_allow_lan,
-        prev_quota_refresh,
         prev_remote_mode,
     ) = {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
@@ -298,7 +297,6 @@ fn update_settings(
             store.settings.proxy_enabled,
             store.settings.proxy_port,
             store.settings.proxy_allow_lan,
-            store.settings.quota_refresh_enabled,
             store.settings.remote_mode.clone(),
         );
         store.settings = settings.clone();
@@ -380,34 +378,20 @@ fn update_settings(
         _ => {}
     }
 
-    // 定时额度刷新生命周期
-    // - 非 client 模式：遵循 quota_refresh_enabled
-    // - client 模式：无条件运行（它同时承担 Server 状态同步的职责）
+    // 额度循环常驻但自门控：普通轮询关闭且没有周期保鲜账号时只做低频 sleep。
+    // 常驻是为了让 Server 在运行中收到带 window_priming 的远程账号后无需重启即可生效。
     let mut qr_handle = state
         .quota_refresh_handle
         .lock()
         .map_err(|e| e.to_string())?;
-    let is_client = settings.remote_mode == "client";
-    let prev_should_run = prev_quota_refresh; // 旧语义里 client 模式被强制 false，所以这里就是 enabled
-    let next_should_run = settings.quota_refresh_enabled || is_client;
-    match (prev_should_run, next_should_run) {
-        (false, true) => {
-            if qr_handle.is_none() {
-                let handle = start_quota_refresh(state.store.clone(), app.clone());
-                *qr_handle = Some(handle);
-                println!(
-                    "[QuotaRefresh] 循环已启动（enabled={} client={}）",
-                    settings.quota_refresh_enabled, is_client
-                );
-            }
-        }
-        (true, false) => {
-            if let Some(handle) = qr_handle.take() {
-                handle.abort();
-                println!("[QuotaRefresh] 循环已停止");
-            }
-        }
-        _ => {}
+    if qr_handle.is_none() {
+        let handle = start_quota_refresh(state.store.clone(), app.clone());
+        *qr_handle = Some(handle);
+        println!(
+            "[QuotaRefresh] 常驻循环已启动（enabled={} client={}）",
+            settings.quota_refresh_enabled,
+            settings.remote_mode == "client"
+        );
     }
 
     // solo 心跳循环生命周期：remote_mode 进/出 "solo" 时启停
@@ -546,6 +530,49 @@ fn update_account(
         store.save()?;
     }
     crate::tray::update_tray_menu(&app);
+    Ok(())
+}
+
+/// 为单个 ChatGPT 订阅账号配置 5h / 7d「周期保鲜」。
+/// 真正请求由常驻 quota loop 在 reset_at 到点后执行；client/solo 只保存并由前端推到 Server。
+#[tauri::command]
+fn set_account_window_priming(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    id: String,
+    five_hour_enabled: bool,
+    weekly_enabled: bool,
+) -> Result<(), String> {
+    {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        let account = store
+            .accounts
+            .get_mut(&id)
+            .ok_or_else(|| format!("账号不存在: {}", id))?;
+        if (five_hour_enabled || weekly_enabled) && !account.is_chatgpt_oauth() {
+            return Err("仅 ChatGPT OAuth 订阅账号支持周期保鲜".to_string());
+        }
+        // 主窗口语义完全服从 wham/usage 返回的时长；不把套餐名称写死。
+        // 兼容短暂存在过的双开关客户端：任一开关开启都解释为“启用该套餐主窗口”，
+        // 落库时收敛为唯一正确的语义开关。
+        let requested_enabled = five_hour_enabled || weekly_enabled;
+        let weekly_mode = account_uses_weekly_priming(account);
+        let five_hour_enabled = requested_enabled && !weekly_mode;
+        let weekly_enabled = requested_enabled && weekly_mode;
+        let five_newly_enabled = five_hour_enabled && !account.window_priming.five_hour_enabled;
+        let weekly_newly_enabled = weekly_enabled && !account.window_priming.weekly_enabled;
+        if five_newly_enabled || weekly_newly_enabled {
+            // 百分比会取整，极小请求后仍可能显示 100%；动态 reset_at 也不能证明已激活。
+            // 因此每次从关闭→开启都生成一个唯一启动事件，无条件且最多发送一次。
+            account.window_priming.bootstrap_request_id = Some(uuid::Uuid::new_v4().to_string());
+        }
+        account.window_priming.five_hour_enabled = five_hour_enabled;
+        account.window_priming.weekly_enabled = weekly_enabled;
+        account.window_priming.configured = true;
+        account.window_priming.last_error = None;
+        store.save()?;
+    }
+    let _ = app.emit("accounts-updated", ());
     Ok(())
 }
 
@@ -1499,10 +1526,12 @@ async fn switch_account(
                         five_hour_left: usage.five_hour_left as f64,
                         five_hour_reset: usage.five_hour_reset.clone(),
                         five_hour_reset_at: usage.five_hour_reset_at,
+                        primary_window_seconds: usage.primary_window_seconds,
                         five_hour_label: usage.five_hour_label.clone(),
                         weekly_left: usage.weekly_left as f64,
                         weekly_reset: usage.weekly_reset.clone(),
                         weekly_reset_at: usage.weekly_reset_at,
+                        secondary_window_seconds: usage.secondary_window_seconds,
                         weekly_label: usage.weekly_label.clone(),
                         plan_type: usage.plan_type.clone(),
                         is_valid_for_cli: usage.is_valid_for_cli,
@@ -1927,6 +1956,251 @@ pub fn start_fast_auth_sync(
     })
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WindowPrimeDue {
+    five_hour_reset_at: Option<i64>,
+    weekly_reset_at: Option<i64>,
+    bootstrap_request_id: Option<String>,
+}
+
+impl WindowPrimeDue {
+    fn any(&self) -> bool {
+        self.five_hour_reset_at.is_some()
+            || self.weekly_reset_at.is_some()
+            || self.bootstrap_request_id.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QuotaRefreshTarget {
+    id: String,
+    name: String,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    window_expired: bool,
+    prime_due: WindowPrimeDue,
+}
+
+fn quota_label_is_weekly(label: &str) -> bool {
+    let normalized = label.trim().to_ascii_lowercase();
+    normalized.contains("周")
+        || normalized.contains("weekly")
+        || normalized.contains("7d")
+        || normalized.contains("7 d")
+}
+
+fn window_seconds_is_weekly(seconds: i64) -> bool {
+    // 当前 OpenAI 主窗口常见 5h / 7d；用实际时长分类，>= 24h 归为长窗口。
+    // 标签仅用于旧缓存缺少 seconds 时的兼容回退。
+    seconds >= 24 * 60 * 60
+}
+
+fn primary_window_is_weekly(quota: &account::CachedQuota) -> bool {
+    quota
+        .primary_window_seconds
+        .map(window_seconds_is_weekly)
+        .unwrap_or_else(|| quota_label_is_weekly(&quota.five_hour_label))
+}
+
+fn secondary_window_is_weekly(quota: &account::CachedQuota) -> bool {
+    quota
+        .secondary_window_seconds
+        .map(window_seconds_is_weekly)
+        .unwrap_or_else(|| quota_label_is_weekly(&quota.weekly_label))
+}
+
+fn account_uses_weekly_priming(account: &Account) -> bool {
+    account
+        .cached_quota
+        .as_ref()
+        .map(primary_window_is_weekly)
+        .unwrap_or(false)
+}
+
+/// OpenAI 的 `primary_window` 并不保证是 5H：Pro / Team 的主窗口可能直接是 7D。
+/// 历史数据结构仍叫 five_hour_*，因此必须用服务端 label 判定语义，不能按槽位名。
+fn semantic_window_reset_at(quota: &account::CachedQuota, weekly: bool) -> Option<i64> {
+    let primary_is_weekly = primary_window_is_weekly(quota);
+    let secondary_is_weekly = secondary_window_is_weekly(quota);
+    if weekly {
+        if primary_is_weekly {
+            quota.five_hour_reset_at
+        } else if secondary_is_weekly {
+            quota.weekly_reset_at
+        } else {
+            quota.weekly_reset_at
+        }
+    } else if !primary_is_weekly {
+        quota.five_hour_reset_at
+    } else if !secondary_is_weekly {
+        quota.weekly_reset_at
+    } else {
+        None
+    }
+}
+
+fn semantic_window_left(quota: &account::CachedQuota, weekly: bool) -> Option<f64> {
+    let primary_is_weekly = primary_window_is_weekly(quota);
+    let secondary_is_weekly = secondary_window_is_weekly(quota);
+    if weekly {
+        if primary_is_weekly {
+            Some(quota.five_hour_left)
+        } else if secondary_is_weekly {
+            Some(quota.weekly_left)
+        } else {
+            Some(quota.weekly_left)
+        }
+    } else if !primary_is_weekly {
+        Some(quota.five_hour_left)
+    } else if !secondary_is_weekly {
+        Some(quota.weekly_left)
+    } else {
+        None
+    }
+}
+
+/// 未显式配置的订阅号默认自动管理。低于 100% 能证明窗口已经被真实请求激活；
+/// 100% 既可能未激活，也可能只是极小消耗被取整，因此保守地产生一次 bootstrap。
+fn apply_automatic_window_priming_defaults(store: &mut AccountStore) -> bool {
+    let mut changed = false;
+    for account in store.accounts.values_mut() {
+        if !account.is_chatgpt_oauth() || account.window_priming.configured {
+            continue;
+        }
+
+        let weekly_mode = account_uses_weekly_priming(account);
+        if account.window_priming.five_hour_enabled == weekly_mode
+            || account.window_priming.weekly_enabled != weekly_mode
+        {
+            account.window_priming.five_hour_enabled = !weekly_mode;
+            account.window_priming.weekly_enabled = weekly_mode;
+            changed = true;
+        }
+
+        let already_has_bootstrap = account.window_priming.bootstrap_request_id.is_some()
+            || account
+                .window_priming
+                .last_bootstrap_request_id
+                .is_some()
+            || account.window_priming.last_attempt_at.is_some();
+        let definitely_active = account
+            .cached_quota
+            .as_ref()
+            .and_then(|q| semantic_window_left(q, weekly_mode))
+            .is_some_and(|left| left < 100.0);
+        if !already_has_bootstrap && !definitely_active {
+            account.window_priming.bootstrap_request_id = Some(uuid::Uuid::new_v4().to_string());
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// 只在“缓存抓取早于 reset_at，而当前时间已经跨过 reset_at”时触发。
+/// `last_*_reset_at` 跨重启去重，确保同一个旧窗口最多成功开一次。
+fn window_prime_due(account: &Account, now_ts: i64) -> WindowPrimeDue {
+    if !account.is_chatgpt_oauth() {
+        return WindowPrimeDue::default();
+    }
+    let prime = &account.window_priming;
+    let bootstrap_request_id = prime.bootstrap_request_id.clone().filter(|request_id| {
+        prime.enabled() && prime.last_bootstrap_request_id.as_ref() != Some(request_id)
+    });
+    let Some(quota) = account.cached_quota.as_ref() else {
+        return WindowPrimeDue {
+            bootstrap_request_id,
+            ..WindowPrimeDue::default()
+        };
+    };
+    let updated_ts = quota.updated_at.timestamp();
+
+    let five_hour_reset_at = semantic_window_reset_at(quota, false).filter(|reset_at| {
+        prime.five_hour_enabled
+            && *reset_at > 0
+            && *reset_at <= now_ts
+            && updated_ts < *reset_at
+            && prime.last_five_hour_reset_at != Some(*reset_at)
+    });
+    let weekly_reset_at = semantic_window_reset_at(quota, true).filter(|reset_at| {
+        prime.weekly_enabled
+            && *reset_at > 0
+            && *reset_at <= now_ts
+            && updated_ts < *reset_at
+            && prime.last_weekly_reset_at != Some(*reset_at)
+    });
+    WindowPrimeDue {
+        five_hour_reset_at,
+        weekly_reset_at,
+        bootstrap_request_id,
+    }
+}
+
+fn cached_quota_from_usage(usage: &usage::UsageDisplay) -> account::CachedQuota {
+    account::CachedQuota {
+        five_hour_left: usage.five_hour_left as f64,
+        five_hour_reset: usage.five_hour_reset.clone(),
+        five_hour_reset_at: usage.five_hour_reset_at,
+        primary_window_seconds: usage.primary_window_seconds,
+        five_hour_label: usage.five_hour_label.clone(),
+        weekly_left: usage.weekly_left as f64,
+        weekly_reset: usage.weekly_reset.clone(),
+        weekly_reset_at: usage.weekly_reset_at,
+        secondary_window_seconds: usage.secondary_window_seconds,
+        weekly_label: usage.weekly_label.clone(),
+        plan_type: usage.plan_type.clone(),
+        is_valid_for_cli: usage.is_valid_for_cli,
+        reset_credits: usage.reset_credits,
+        spark: usage.spark.clone(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+fn record_window_prime_result(
+    account: &mut Account,
+    due: &WindowPrimeDue,
+    handled: bool,
+    success: bool,
+    error: Option<String>,
+) {
+    let now = chrono::Utc::now();
+    account.window_priming.last_attempt_at = Some(now);
+    if handled {
+        if let Some(reset_at) = due.five_hour_reset_at {
+            account.window_priming.last_five_hour_reset_at = Some(reset_at);
+        }
+        if let Some(reset_at) = due.weekly_reset_at {
+            account.window_priming.last_weekly_reset_at = Some(reset_at);
+        }
+        if let Some(request_id) = due.bootstrap_request_id.as_ref() {
+            account.window_priming.last_bootstrap_request_id = Some(request_id.clone());
+        }
+    }
+    if success {
+        account.window_priming.last_success_at = Some(now);
+        account.window_priming.last_error = None;
+    } else {
+        account.window_priming.last_error = error;
+    }
+}
+
+/// 在真实模型请求之前持久化占位。返回 false 表示该 reset_at 已经被本进程处理过。
+/// 这是“最多一次”门：即使请求超时（无法判断上游是否已消费），也绝不自动重发。
+fn reserve_window_prime_attempt(account: &mut Account, due: &WindowPrimeDue) -> bool {
+    let five_already_reserved = due
+        .five_hour_reset_at
+        .is_none_or(|reset_at| account.window_priming.last_five_hour_reset_at == Some(reset_at));
+    let weekly_already_reserved = due
+        .weekly_reset_at
+        .is_none_or(|reset_at| account.window_priming.last_weekly_reset_at == Some(reset_at));
+    let bootstrap_already_reserved = due.bootstrap_request_id.as_ref().is_none_or(|request_id| {
+        account.window_priming.last_bootstrap_request_id.as_ref() == Some(request_id)
+    });
+    if five_already_reserved && weekly_already_reserved && bootstrap_already_reserved {
+        return false;
+    }
+    record_window_prime_result(account, due, true, false, None);
+    true
+}
+
 pub fn start_quota_refresh(
     store: std::sync::Arc<std::sync::Mutex<AccountStore>>,
     app_handle: tauri::AppHandle,
@@ -1944,17 +2218,26 @@ pub fn start_quota_refresh(
                 fallback,
                 secret,
                 client_owns_current,
+                any_window_priming,
             ) = {
-                let s = store.lock().unwrap();
+                let mut s = store.lock().unwrap();
+                let mode = s.settings.remote_mode.clone();
+                if !matches!(mode.as_str(), "client" | "solo")
+                    && apply_automatic_window_priming_defaults(&mut s)
+                {
+                    let _ = s.save();
+                    println!("[WindowPrime] 已应用订阅账号自动管理默认值");
+                }
                 (
                     s.settings.quota_refresh_enabled,
                     s.settings.quota_refresh_interval.max(1),
                     s.settings.quota_refresh_batch.max(1),
-                    s.settings.remote_mode.clone(),
+                    mode,
                     s.settings.remote_server_url.clone(),
                     s.settings.remote_server_url_fallback.clone(),
                     s.settings.remote_shared_secret.clone(),
                     s.settings.client_owns_current,
+                    s.accounts.values().any(|a| a.window_priming.enabled()),
                 )
             };
 
@@ -2049,6 +2332,9 @@ pub fn start_quota_refresh(
                                                 if let Some(q) = e.cached_quota.clone() {
                                                     acc.cached_quota = Some(q);
                                                     updated += 1;
+                                                }
+                                                if let Some(priming) = e.window_priming.clone() {
+                                                    acc.window_priming = priming;
                                                 }
                                                 if !acc.is_relay() {
                                                     acc.is_banned = e.is_banned;
@@ -2197,8 +2483,9 @@ pub fn start_quota_refresh(
                 continue;
             }
 
-            // 非 client 模式才尊重 enabled 开关
-            if !enabled {
+            // 非 client 模式：普通额度轮询遵循 enabled；但只要有账号启用了周期保鲜，
+            // 循环仍需运行以观察 reset_at。没有到点时不会发模型请求。
+            if !enabled && !any_window_priming {
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                 continue;
             }
@@ -2219,7 +2506,7 @@ pub fn start_quota_refresh(
             // 用户视角是「到点了也不刷新」。这里把 expired 账号集合优先取，再用普通
             // batch 兜底，保证窗口刚 reset 的账号最迟下一个 5min 周期就被刷上。
             // Relay 账号的 quota 通过专属 fetcher 拉取，这里跳过避免无谓打 OpenAI usage API
-            let targets: Vec<(String, String)> = {
+            let targets: Vec<QuotaRefreshTarget> = {
                 let s = store.lock().unwrap();
                 let now_ts = chrono::Utc::now().timestamp();
                 let candidates: Vec<_> = s
@@ -2242,25 +2529,52 @@ pub fn start_quota_refresh(
                         let weekly_expired =
                             weekly_reset > 0 && weekly_reset <= now_ts && updated_ts < weekly_reset;
                         let expired = five_expired || weekly_expired;
-                        (a.id.clone(), a.name.clone(), updated, expired)
+                        QuotaRefreshTarget {
+                            id: a.id.clone(),
+                            name: a.name.clone(),
+                            updated_at: updated,
+                            window_expired: expired,
+                            prime_due: window_prime_due(a, now_ts),
+                        }
                     })
                     .collect();
 
-                // 1) expired 全部入选（不受 batch_size 限制 — reset 后必须及时刷）
+                // 1) 到点账号全部入选：普通额度刷新开启时沿用原来的 expired 优先；
+                //    普通刷新关闭时只选真正启用了周期保鲜的 due 账号。
+                //    新启用但还没有缓存的账号也先抓一次 baseline，不能凭空猜 reset_at。
                 let mut expired: Vec<_> = candidates
                     .iter()
-                    .filter(|(_, _, _, e)| *e)
+                    .filter(|target| target.prime_due.any() || (enabled && target.window_expired))
                     .cloned()
                     .collect();
-                expired.sort_by_key(|(_, _, t, _)| *t);
+                expired.sort_by_key(|target| target.updated_at);
+
+                let mut bootstrap: Vec<_> = candidates
+                    .iter()
+                    .filter(|target| {
+                        target.updated_at == chrono::DateTime::<chrono::Utc>::MIN_UTC
+                            && s.accounts
+                                .get(&target.id)
+                                .map(|a| a.window_priming.enabled())
+                                .unwrap_or(false)
+                    })
+                    .filter(|target| !expired.iter().any(|e| e.id == target.id))
+                    .cloned()
+                    .collect();
+                bootstrap.sort_by_key(|target| target.updated_at);
 
                 // 2) 剩下的按 updated_at 最旧排序，取 batch_size 个
                 let mut rest: Vec<_> = candidates
                     .iter()
-                    .filter(|(_, _, _, e)| !*e)
+                    .filter(|target| {
+                        enabled
+                            && !target.window_expired
+                            && !expired.iter().any(|e| e.id == target.id)
+                            && !bootstrap.iter().any(|e| e.id == target.id)
+                    })
                     .cloned()
                     .collect();
-                rest.sort_by_key(|(_, _, t, _)| *t);
+                rest.sort_by_key(|target| target.updated_at);
 
                 if !expired.is_empty() {
                     println!(
@@ -2271,12 +2585,14 @@ pub fn start_quota_refresh(
 
                 expired
                     .into_iter()
+                    .chain(bootstrap.into_iter())
                     .chain(rest.into_iter().take(batch_size as usize))
-                    .map(|(id, name, _, _)| (id, name))
                     .collect()
             };
 
-            for (id, name) in &targets {
+            for target in &targets {
+                let id = &target.id;
+                let name = &target.name;
                 println!("[QuotaRefresh] 刷新 {} ...", name);
 
                 let (at, aid, rt, is_uid_dup) = {
@@ -2335,15 +2651,171 @@ pub fn start_quota_refresh(
                 };
 
                 match usage::UsageFetcher::fetch_usage_direct(
-                    access_token,
-                    aid,
-                    rt,
+                    access_token.clone(),
+                    aid.clone(),
+                    rt.clone(),
                     false,
                     Some(id.to_string()),
                 )
                 .await
                 {
-                    Ok((usage, _)) => {
+                    Ok((usage_before_prime, _)) => {
+                        let mut usage = usage_before_prime;
+                        if target.prime_due.any() {
+                            let quota_available = usage.five_hour_left > 0 && usage.weekly_left > 0;
+                            if quota_available {
+                                println!(
+                                    "[WindowPrime] {} 到点，发送一次最小 Codex 请求（5h={} weekly={} bootstrap={}）",
+                                    name,
+                                    target.prime_due.five_hour_reset_at.is_some(),
+                                    target.prime_due.weekly_reset_at.is_some(),
+                                    target.prime_due.bootstrap_request_id.is_some()
+                                );
+                                // 先持久化 reset_at 占位，再发真实请求。保存失败或已被另一轮
+                                // 抢先占位时都不发送，保证同一窗口最多一次。
+                                let reserved = if let Ok(mut s) = store.lock() {
+                                    let reserved = s
+                                        .accounts
+                                        .get_mut(id)
+                                        .map(|acc| {
+                                            reserve_window_prime_attempt(acc, &target.prime_due)
+                                        })
+                                        .unwrap_or(false);
+                                    if reserved {
+                                        match s.save() {
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[WindowPrime] {} 保存防重占位失败，取消请求: {}",
+                                                    name, e
+                                                );
+                                                false
+                                            }
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+                                if !reserved {
+                                    println!(
+                                        "[WindowPrime] {} 同一 reset_at 已尝试或无法持久化，跳过",
+                                        name
+                                    );
+                                } else {
+                                    match usage::send_wakeup(
+                                        &access_token,
+                                        aid.as_deref(),
+                                        "Reply exactly OK.",
+                                        usage::DEFAULT_WAKEUP_MODEL,
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) if result.ok => {
+                                            println!("[WindowPrime] ✅ {} 周期保鲜成功", name);
+                                            if let Ok(mut s) = store.lock() {
+                                                if let Some(acc) = s.accounts.get_mut(id) {
+                                                    record_window_prime_result(
+                                                        acc,
+                                                        &target.prime_due,
+                                                        true,
+                                                        true,
+                                                        None,
+                                                    );
+                                                    let _ = s.save();
+                                                }
+                                            }
+
+                                            // 开窗后立刻重拉一次，把新产生的 reset_at 写回 UI。
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                                300,
+                                            ))
+                                            .await;
+                                            match usage::UsageFetcher::fetch_usage_direct(
+                                                access_token.clone(),
+                                                aid.clone(),
+                                                rt.clone(),
+                                                false,
+                                                Some(id.to_string()),
+                                            )
+                                            .await
+                                            {
+                                                Ok((fresh_usage, _)) => usage = fresh_usage,
+                                                Err(e) => println!(
+                                                    "[WindowPrime] {} 周期保鲜成功，但重拉额度失败: {}",
+                                                    name, e
+                                                ),
+                                            }
+                                        }
+                                        Ok(result) => {
+                                            let error = result.error.unwrap_or_else(|| {
+                                                format!("HTTP {}", result.status_code)
+                                            });
+                                            println!(
+                                                "[WindowPrime] {} 周期保鲜失败 ({}): {}",
+                                                name, result.status_code, error
+                                            );
+                                            if let Ok(mut s) = store.lock() {
+                                                if let Some(acc) = s.accounts.get_mut(id) {
+                                                    record_window_prime_result(
+                                                        acc,
+                                                        &target.prime_due,
+                                                        true,
+                                                        false,
+                                                        Some(error),
+                                                    );
+                                                    if result.status_code == 401 {
+                                                        acc.is_token_invalid = true;
+                                                    }
+                                                    let _ = s.save();
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            // 请求是否到达上游不可判定，因此保留“已尝试”占位，绝不自动重发。
+                                            println!(
+                                                "[WindowPrime] {} 周期保鲜网络失败（不会自动重试）: {}",
+                                                name, error
+                                            );
+                                            if let Ok(mut s) = store.lock() {
+                                                if let Some(acc) = s.accounts.get_mut(id) {
+                                                    record_window_prime_result(
+                                                        acc,
+                                                        &target.prime_due,
+                                                        true,
+                                                        false,
+                                                        Some(error),
+                                                    );
+                                                    let _ = s.save();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                // 例如 5h 到点但周额度仍为 0：当前请求必然 429，不浪费调用。
+                                // 该 reset 视为已处理；周窗口真正到点时会由自己的 reset_at 再触发。
+                                let reason = format!(
+                                    "额度不可用，跳过周期保鲜（5h={}%, weekly={}%)",
+                                    usage.five_hour_left, usage.weekly_left
+                                );
+                                println!("[WindowPrime] {} {}", name, reason);
+                                if let Ok(mut s) = store.lock() {
+                                    if let Some(acc) = s.accounts.get_mut(id) {
+                                        record_window_prime_result(
+                                            acc,
+                                            &target.prime_due,
+                                            true,
+                                            false,
+                                            Some(reason),
+                                        );
+                                        let _ = s.save();
+                                    }
+                                }
+                            }
+                        }
+
                         let email_for_snap = if let Ok(s) = store.lock() {
                             s.accounts
                                 .get(id)
@@ -2361,21 +2833,7 @@ pub fn start_quota_refresh(
                         );
                         if let Ok(mut s) = store.lock() {
                             if let Some(acc) = s.accounts.get_mut(id) {
-                                acc.cached_quota = Some(account::CachedQuota {
-                                    five_hour_left: usage.five_hour_left as f64,
-                                    five_hour_reset: usage.five_hour_reset.clone(),
-                                    five_hour_reset_at: usage.five_hour_reset_at,
-                                    five_hour_label: usage.five_hour_label.clone(),
-                                    weekly_left: usage.weekly_left as f64,
-                                    weekly_reset: usage.weekly_reset.clone(),
-                                    weekly_reset_at: usage.weekly_reset_at,
-                                    weekly_label: usage.weekly_label.clone(),
-                                    plan_type: usage.plan_type.clone(),
-                                    is_valid_for_cli: usage.is_valid_for_cli,
-                                    reset_credits: usage.reset_credits,
-                                    spark: usage.spark.clone(),
-                                    updated_at: chrono::Utc::now(),
-                                });
+                                acc.cached_quota = Some(cached_quota_from_usage(&usage));
                                 // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
                                 acc.is_token_invalid = false;
                                 acc.is_logged_out = false;
@@ -2765,10 +3223,12 @@ fn usage_to_cached(u: &UsageDisplay) -> crate::account::CachedQuota {
         five_hour_left: u.five_hour_left as f64,
         five_hour_reset: u.five_hour_reset.clone(),
         five_hour_reset_at: u.five_hour_reset_at,
+        primary_window_seconds: u.primary_window_seconds,
         five_hour_label: u.five_hour_label.clone(),
         weekly_left: u.weekly_left as f64,
         weekly_reset: u.weekly_reset.clone(),
         weekly_reset_at: u.weekly_reset_at,
+        secondary_window_seconds: u.secondary_window_seconds,
         weekly_label: u.weekly_label.clone(),
         plan_type: u.plan_type.clone(),
         is_valid_for_cli: u.is_valid_for_cli,
@@ -2868,8 +3328,8 @@ async fn send_codex_wakeup(
             .accounts
             .get(&id)
             .ok_or_else(|| format!("账号 {} 不存在", id))?;
-        if account.is_relay() {
-            return Err("RELAY_ACCOUNT:中转站账号不支持 Codex 唤醒".to_string());
+        if !account.is_chatgpt_oauth() {
+            return Err("UNSUPPORTED_ACCOUNT:仅 ChatGPT OAuth 订阅账号支持 Codex 唤醒".to_string());
         }
         let at = AccountStore::extract_access_token(&account.auth_json);
         let aid = AccountStore::extract_account_id(&account.auth_json);
@@ -3328,10 +3788,12 @@ async fn get_quota_by_id(
                 five_hour_left: usage.five_hour_left as f64,
                 five_hour_reset: usage.five_hour_reset.clone(),
                 five_hour_reset_at: usage.five_hour_reset_at,
+                primary_window_seconds: usage.primary_window_seconds,
                 five_hour_label: usage.five_hour_label.clone(),
                 weekly_left: usage.weekly_left as f64,
                 weekly_reset: usage.weekly_reset.clone(),
                 weekly_reset_at: usage.weekly_reset_at,
+                secondary_window_seconds: usage.secondary_window_seconds,
                 weekly_label: usage.weekly_label.clone(),
                 plan_type: usage.plan_type.clone(),
                 is_valid_for_cli: usage.is_valid_for_cli,
@@ -3353,10 +3815,12 @@ async fn get_quota_by_id(
                 five_hour_left: usage.five_hour_left as f64,
                 five_hour_reset: usage.five_hour_reset.clone(),
                 five_hour_reset_at: usage.five_hour_reset_at,
+                primary_window_seconds: usage.primary_window_seconds,
                 five_hour_label: usage.five_hour_label.clone(),
                 weekly_left: usage.weekly_left as f64,
                 weekly_reset: usage.weekly_reset.clone(),
                 weekly_reset_at: usage.weekly_reset_at,
+                secondary_window_seconds: usage.secondary_window_seconds,
                 weekly_label: usage.weekly_label.clone(),
                 plan_type: usage.plan_type.clone(),
                 is_valid_for_cli: usage.is_valid_for_cli,
@@ -5428,18 +5892,12 @@ pub fn run() {
                 println!("[RemoteServer] Remote Mode 未启用（mode={}）", remote_mode);
             }
 
-            // 启动定时额度刷新（client 模式无条件启动，它承担 Server 状态同步）
-            let should_run_quota_loop = state
-                .store
-                .lock()
-                .map(|s| s.settings.quota_refresh_enabled || s.settings.remote_mode == "client")
-                .unwrap_or(false);
-            if should_run_quota_loop {
-                let handle = start_quota_refresh(state.store.clone(), app.handle().clone());
-                let mut qr = state.quota_refresh_handle.lock().unwrap();
-                *qr = Some(handle);
-                println!("[QuotaRefresh] 启动中（setup 阶段）");
-            }
+            // 常驻额度循环：内部根据普通刷新开关 / client 同步 / 每账号周期保鲜自门控。
+            // 这样 Server 运行中收到新配置账号后无需重启就能开始观察 reset_at。
+            let handle = start_quota_refresh(state.store.clone(), app.handle().clone());
+            let mut qr = state.quota_refresh_handle.lock().unwrap();
+            *qr = Some(handle);
+            println!("[QuotaRefresh] 常驻循环启动中（setup 阶段）");
 
             // 启动时立刻跑一次同步，把 store/disk 不一致 + 落后的 RT 立即对齐
             let store_for_init = state.store.clone();
@@ -5573,6 +6031,7 @@ pub fn run() {
             sync_current_auth_to_account,
             delete_account,
             update_account,
+            set_account_window_priming,
             update_relay_usage_cookie,
             set_account_inactive_refresh_enabled,
             set_session_anchor,
@@ -5708,6 +6167,7 @@ mod tests {
             last_used: None,
             notes: None,
             account_expires_at: None,
+            window_priming: account::WindowPrimingState::default(),
             cached_quota: None,
             keepalive: account::KeepaliveState::default(),
             is_banned: false,
@@ -5731,6 +6191,275 @@ mod tests {
     fn quota_refresh_never_allows_local_token_refresh() {
         assert!(!allow_local_refresh_for_quota(true));
         assert!(!allow_local_refresh_for_quota(false));
+    }
+
+    #[test]
+    fn window_prime_due_detects_passed_enabled_windows_and_deduplicates() {
+        let now = Utc::now();
+        let mut account = test_account("prime", "workspace-1", "rt-1");
+        account.kind = account::AccountKind::ChatgptOauth;
+        account.window_priming.five_hour_enabled = true;
+        account.window_priming.weekly_enabled = true;
+        account.cached_quota = Some(account::CachedQuota {
+            five_hour_left: 0.0,
+            five_hour_reset: String::new(),
+            five_hour_reset_at: Some(now.timestamp() - 30),
+            primary_window_seconds: Some(5 * 3600),
+            five_hour_label: "5H".to_string(),
+            weekly_left: 0.0,
+            weekly_reset: String::new(),
+            weekly_reset_at: Some(now.timestamp() - 10),
+            secondary_window_seconds: Some(7 * 24 * 3600),
+            weekly_label: "7D".to_string(),
+            plan_type: "plus".to_string(),
+            is_valid_for_cli: true,
+            reset_credits: None,
+            spark: None,
+            updated_at: now - chrono::Duration::minutes(5),
+        });
+
+        let due = window_prime_due(&account, now.timestamp());
+        assert_eq!(due.five_hour_reset_at, Some(now.timestamp() - 30));
+        assert_eq!(due.weekly_reset_at, Some(now.timestamp() - 10));
+
+        account.window_priming.last_five_hour_reset_at = due.five_hour_reset_at;
+        account.window_priming.last_weekly_reset_at = due.weekly_reset_at;
+        assert!(!window_prime_due(&account, now.timestamp()).any());
+    }
+
+    #[test]
+    fn window_prime_due_rejects_future_disabled_and_non_chatgpt_windows() {
+        let now = Utc::now();
+        let mut account = test_account("prime", "workspace-1", "rt-1");
+        account.cached_quota = Some(account::CachedQuota {
+            five_hour_left: 100.0,
+            five_hour_reset: String::new(),
+            five_hour_reset_at: Some(now.timestamp() + 60),
+            primary_window_seconds: Some(5 * 3600),
+            five_hour_label: "5H".to_string(),
+            weekly_left: 100.0,
+            weekly_reset: String::new(),
+            weekly_reset_at: Some(now.timestamp() - 10),
+            secondary_window_seconds: Some(7 * 24 * 3600),
+            weekly_label: "7D".to_string(),
+            plan_type: "plus".to_string(),
+            is_valid_for_cli: true,
+            reset_credits: None,
+            spark: None,
+            updated_at: now - chrono::Duration::minutes(5),
+        });
+        account.window_priming.five_hour_enabled = true;
+        account.window_priming.weekly_enabled = true;
+
+        // Legacy without a JWT access token derives as OpenAI key, so it must never hit ChatGPT.
+        assert!(!window_prime_due(&account, now.timestamp()).any());
+        account.kind = account::AccountKind::ChatgptOauth;
+        let due = window_prime_due(&account, now.timestamp());
+        assert!(due.five_hour_reset_at.is_none());
+        assert_eq!(due.weekly_reset_at, Some(now.timestamp() - 10));
+
+        account.window_priming.weekly_enabled = false;
+        assert!(!window_prime_due(&account, now.timestamp()).any());
+    }
+
+    #[test]
+    fn window_prime_reservation_is_at_most_once_per_reset_even_after_error() {
+        let mut account = test_account("prime", "workspace-1", "rt-1");
+        account.kind = account::AccountKind::ChatgptOauth;
+        let due = WindowPrimeDue {
+            five_hour_reset_at: Some(1_700_000_000),
+            weekly_reset_at: Some(1_700_000_100),
+            bootstrap_request_id: None,
+        };
+
+        assert!(reserve_window_prime_attempt(&mut account, &due));
+        assert_eq!(
+            account.window_priming.last_five_hour_reset_at,
+            due.five_hour_reset_at
+        );
+        assert_eq!(
+            account.window_priming.last_weekly_reset_at,
+            due.weekly_reset_at
+        );
+
+        record_window_prime_result(
+            &mut account,
+            &due,
+            true,
+            false,
+            Some("timeout after send".to_string()),
+        );
+        assert!(!reserve_window_prime_attempt(&mut account, &due));
+        assert_eq!(
+            account.window_priming.last_error.as_deref(),
+            Some("timeout after send")
+        );
+
+        // 新的 reset_at 才能重新获得一次发送资格。
+        let next_due = WindowPrimeDue {
+            five_hour_reset_at: Some(1_700_018_000),
+            weekly_reset_at: None,
+            bootstrap_request_id: None,
+        };
+        assert!(reserve_window_prime_attempt(&mut account, &next_due));
+    }
+
+    #[test]
+    fn window_prime_bootstrap_request_is_once_even_without_cached_reset_at() {
+        let mut account = test_account("prime", "workspace-1", "rt-1");
+        account.kind = account::AccountKind::ChatgptOauth;
+        account.window_priming.five_hour_enabled = true;
+        account.window_priming.weekly_enabled = true;
+        account.window_priming.bootstrap_request_id = Some("bootstrap-1".to_string());
+        account.cached_quota = None;
+
+        let due = window_prime_due(&account, Utc::now().timestamp());
+        assert_eq!(due.bootstrap_request_id.as_deref(), Some("bootstrap-1"));
+        assert!(reserve_window_prime_attempt(&mut account, &due));
+        assert!(!reserve_window_prime_attempt(&mut account, &due));
+        assert_eq!(
+            account
+                .window_priming
+                .last_bootstrap_request_id
+                .as_deref(),
+            Some("bootstrap-1")
+        );
+        assert!(!window_prime_due(&account, Utc::now().timestamp()).any());
+    }
+
+    #[test]
+    fn team_weekly_window_in_primary_slot_is_treated_as_7d() {
+        let now = Utc::now();
+        let reset_at = now.timestamp() - 10;
+        let mut account = test_account("team", "workspace-1", "rt-1");
+        account.kind = account::AccountKind::ChatgptOauth;
+        account.window_priming.weekly_enabled = true;
+        account.cached_quota = Some(account::CachedQuota {
+            five_hour_left: 100.0,
+            five_hour_reset: "6天后重置".to_string(),
+            five_hour_reset_at: Some(reset_at),
+            primary_window_seconds: Some(7 * 24 * 3600),
+            five_hour_label: "周限额".to_string(),
+            weekly_left: 100.0,
+            weekly_reset: "未知".to_string(),
+            weekly_reset_at: None,
+            secondary_window_seconds: None,
+            weekly_label: "周限额".to_string(),
+            // 套餐名故意写 plus：窗口语义必须服从返回时长而不是 plan。
+            plan_type: "plus".to_string(),
+            is_valid_for_cli: true,
+            reset_credits: None,
+            spark: None,
+            updated_at: now - chrono::Duration::minutes(5),
+        });
+
+        assert!(account_uses_weekly_priming(&account));
+        assert_eq!(
+            semantic_window_reset_at(account.cached_quota.as_ref().unwrap(), true),
+            Some(reset_at)
+        );
+        assert!(semantic_window_reset_at(account.cached_quota.as_ref().unwrap(), false).is_none());
+        let due = window_prime_due(&account, now.timestamp());
+        assert_eq!(due.weekly_reset_at, Some(reset_at));
+        assert!(due.five_hour_reset_at.is_none());
+    }
+
+    #[test]
+    fn automatic_defaults_manage_all_subscription_accounts_without_repeat_bootstrap() {
+        let now = Utc::now();
+        let mut store = AccountStore::default();
+
+        let mut team = test_account("team", "team-workspace", "rt-team");
+        team.id = "team".to_string();
+        team.kind = account::AccountKind::ChatgptOauth;
+        team.cached_quota = Some(account::CachedQuota {
+            five_hour_left: 100.0,
+            five_hour_reset: "6天23小时59分钟后重置".to_string(),
+            five_hour_reset_at: Some(now.timestamp() + 7 * 24 * 3600),
+            primary_window_seconds: Some(7 * 24 * 3600),
+            five_hour_label: "周限额".to_string(),
+            weekly_left: 100.0,
+            weekly_reset: "未知".to_string(),
+            weekly_reset_at: None,
+            secondary_window_seconds: None,
+            weekly_label: "周限额".to_string(),
+            plan_type: "plus".to_string(),
+            is_valid_for_cli: true,
+            reset_credits: None,
+            spark: None,
+            updated_at: now,
+        });
+
+        let mut plus = test_account("plus", "plus-workspace", "rt-plus");
+        plus.id = "plus".to_string();
+        plus.kind = account::AccountKind::ChatgptOauth;
+        plus.cached_quota = Some(account::CachedQuota {
+            five_hour_left: 100.0,
+            five_hour_reset: "4小时59分钟后重置".to_string(),
+            five_hour_reset_at: Some(now.timestamp() + 5 * 3600),
+            primary_window_seconds: Some(5 * 3600),
+            five_hour_label: "5H 限额".to_string(),
+            weekly_left: 100.0,
+            weekly_reset: "6天23小时59分钟后重置".to_string(),
+            weekly_reset_at: Some(now.timestamp() + 7 * 24 * 3600),
+            secondary_window_seconds: Some(7 * 24 * 3600),
+            weekly_label: "周限额".to_string(),
+            // 套餐名故意写 team：5H 返回仍必须按 5H 管理。
+            plan_type: "team".to_string(),
+            is_valid_for_cli: true,
+            reset_credits: None,
+            spark: None,
+            updated_at: now,
+        });
+
+        let mut active_pro = team.clone();
+        active_pro.id = "pro".to_string();
+        active_pro.name = "pro".to_string();
+        active_pro.cached_quota.as_mut().unwrap().plan_type = "pro".to_string();
+        active_pro.cached_quota.as_mut().unwrap().five_hour_left = 91.0;
+
+        let mut opted_out = plus.clone();
+        opted_out.id = "off".to_string();
+        opted_out.name = "off".to_string();
+        opted_out.window_priming.configured = true;
+
+        store.accounts.insert(team.id.clone(), team);
+        store.accounts.insert(plus.id.clone(), plus);
+        store.accounts.insert(active_pro.id.clone(), active_pro);
+        store.accounts.insert(opted_out.id.clone(), opted_out);
+
+        assert!(apply_automatic_window_priming_defaults(&mut store));
+        let team_state = &store.accounts["team"].window_priming;
+        assert!(team_state.weekly_enabled);
+        assert!(!team_state.five_hour_enabled);
+        let team_bootstrap = team_state.bootstrap_request_id.clone();
+        assert!(team_bootstrap.is_some());
+
+        let plus_state = &store.accounts["plus"].window_priming;
+        assert!(plus_state.five_hour_enabled);
+        assert!(!plus_state.weekly_enabled);
+        let plus_bootstrap = plus_state.bootstrap_request_id.clone();
+        assert!(plus_bootstrap.is_some());
+
+        assert!(store.accounts["pro"]
+            .window_priming
+            .bootstrap_request_id
+            .is_none());
+        assert!(!store.accounts["off"].window_priming.enabled());
+
+        assert!(!apply_automatic_window_priming_defaults(&mut store));
+        assert_eq!(
+            store.accounts["team"]
+                .window_priming
+                .bootstrap_request_id,
+            team_bootstrap
+        );
+        assert_eq!(
+            store.accounts["plus"]
+                .window_priming
+                .bootstrap_request_id,
+            plus_bootstrap
+        );
     }
 
     #[test]

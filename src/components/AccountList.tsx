@@ -81,6 +81,18 @@ function accountExpiryInfo(value?: string | null): AccountExpiryInfo {
     return { text: value, badge: null, tone: 'normal', title: `账号到期日 ${value}，点击修改` };
 }
 
+function primingWindowKind(account: Account): 'five_hour' | 'weekly' {
+    const seconds = account.cached_quota?.primary_window_seconds;
+    if (typeof seconds === 'number' && seconds > 0) {
+        return seconds >= 24 * 60 * 60 ? 'weekly' : 'five_hour';
+    }
+    const primaryLabel = account.cached_quota?.five_hour_label ?? '';
+    if (/周|weekly|7\s*d/i.test(primaryLabel)) {
+        return 'weekly';
+    }
+    return 'five_hour';
+}
+
 /** 把上游英文邀请提示翻成人话 */
 function friendlyInviteMessage(raw: string | null | undefined): string {
     const m = (raw || '').trim();
@@ -219,6 +231,19 @@ export function AccountList({
     const [expiryEditor, setExpiryEditor] = useState<{ id: string; name: string; value: string } | null>(null);
     const [savingExpiry, setSavingExpiry] = useState(false);
     const [expiryError, setExpiryError] = useState<string | null>(null);
+    // 周期保鲜：跨过 reset_at 后按账号发一次最小 Codex 请求。
+    const [primeEditor, setPrimeEditor] = useState<{
+        id: string;
+        name: string;
+        fiveHour: boolean;
+        weekly: boolean;
+        mode: 'five_hour' | 'weekly';
+        lastAttempt?: string | null;
+        lastSuccess?: string | null;
+        lastError?: string | null;
+    } | null>(null);
+    const [savingPrime, setSavingPrime] = useState(false);
+    const [primeError, setPrimeError] = useState<string | null>(null);
 
     const autoReload = settings.auto_reload_ide;
     const setAutoReload = (val: boolean) => onUpdateSettings({ ...settings, auto_reload_ide: val });
@@ -242,6 +267,32 @@ export function AccountList({
             setExpiryError(String(err));
         } finally {
             setSavingExpiry(false);
+        }
+    };
+
+    const saveWindowPriming = async () => {
+        if (!primeEditor || savingPrime) return;
+        setSavingPrime(true);
+        setPrimeError(null);
+        try {
+            await invoke('set_account_window_priming', {
+                id: primeEditor.id,
+                fiveHourEnabled: primeEditor.fiveHour,
+                weeklyEnabled: primeEditor.weekly,
+            });
+            if (settings.remote_mode === 'client' || settings.remote_mode === 'solo') {
+                try {
+                    await invoke('remote_push_account', { id: primeEditor.id });
+                } catch (err) {
+                    throw new Error(`本地已保存，但同步 Server 失败：${String(err)}`);
+                }
+            }
+            onRefreshComplete?.();
+            setPrimeEditor(null);
+        } catch (err) {
+            setPrimeError(String(err));
+        } finally {
+            setSavingPrime(false);
         }
     };
 
@@ -872,6 +923,14 @@ export function AccountList({
                         const isCurrent = acc.id === currentId;
                         const isRefreshing = refreshingIds.has(acc.id);
                         const expiry = accountExpiryInfo(acc.account_expires_at);
+                        const priming = acc.window_priming;
+                        const primeMode = primingWindowKind(acc);
+                        const primingEnabled = priming?.configured
+                            ? (primeMode === 'weekly'
+                                ? priming?.weekly_enabled
+                                : priming?.five_hour_enabled)
+                            : true;
+                        const primingLabel = primeMode === 'weekly' ? '7D' : '5H';
 
                         return (
                             <div key={acc.id} className={`account-row ${isCurrent ? 'current' : ''} ${selectedIds.has(acc.id) ? 'selected' : ''} ${isBanned ? 'banned' : isLoggedOut ? 'logged-out' : isInvalid ? 'expired' : ''}`}>
@@ -953,7 +1012,9 @@ export function AccountList({
                                     ) : usage ? (
                                         <div className="quota-grid">
                                             <QuotaItem label={usage.five_hour_label} percentage={usage.five_hour_left} reset={usage.five_hour_reset} resetAt={usage.five_hour_reset_at} />
-                                            <QuotaItem label={usage.weekly_label} percentage={usage.weekly_left} reset={usage.weekly_reset} resetAt={usage.weekly_reset_at} />
+                                            {usage.weekly_reset_at && (
+                                                <QuotaItem label={usage.weekly_label} percentage={usage.weekly_left} reset={usage.weekly_reset} resetAt={usage.weekly_reset_at} />
+                                            )}
                                             {usage.spark && (
                                                 <>
                                                     <QuotaItem label="Spark 5H" percentage={usage.spark.five_hour_left} reset={usage.spark.five_hour_reset} resetAt={usage.spark.five_hour_reset_at} />
@@ -993,6 +1054,27 @@ export function AccountList({
                                             >
                                                 {launchingIds.has(acc.id) ? '启动中…' : '🚀 启动 codex'}
                                             </button>
+                                            {effectiveKind(acc) === 'chatgpt_oauth' && (
+                                                <button
+                                                    className={`wakeup-btn window-prime-btn ${primingEnabled ? 'active' : ''}`}
+                                                    onClick={() => {
+                                                        setPrimeError(null);
+                                                        setPrimeEditor({
+                                                            id: acc.id,
+                                                            name: acc.name,
+                                                            mode: primeMode,
+                                                            fiveHour: primeMode === 'five_hour' ? (priming?.configured ? (priming?.five_hour_enabled ?? false) : true) : false,
+                                                            weekly: primeMode === 'weekly' ? (priming?.configured ? (priming?.weekly_enabled ?? false) : true) : false,
+                                                            lastAttempt: priming?.last_attempt_at,
+                                                            lastSuccess: priming?.last_success_at,
+                                                            lastError: priming?.last_error,
+                                                        });
+                                                    }}
+                                                    title={priming?.last_error
+                                                        ? `周期保鲜最近错误：${priming.last_error}`
+                                                        : '周期保鲜会在额度窗口到点后自动发一次最小 Codex 请求'}
+                                                >{primingEnabled ? `🌿 周期保鲜 · ${primingLabel}` : `🌿 保鲜已关 · ${primingLabel}`}</button>
+                                            )}
                                         </div>
                                     )}
                                 </div>
@@ -1078,6 +1160,61 @@ export function AccountList({
                                 <button className="secondary-btn" onClick={() => setExpiryEditor(null)} disabled={savingExpiry}>取消</button>
                                 <button className="primary-btn" onClick={saveAccountExpiry} disabled={savingExpiry}>
                                     {savingExpiry ? '保存中…' : '保存'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {primeEditor && (
+                <div className="modal-overlay" onClick={() => !savingPrime && setPrimeEditor(null)}>
+                    <div className="modal-content account-expiry-modal window-prime-modal" onClick={e => e.stopPropagation()}>
+                        <div className="account-expiry-modal-header">
+                            <div>
+                                <h2>周期保鲜</h2>
+                                <p>{primeEditor.name}</p>
+                            </div>
+                            <button className="close-btn" onClick={() => setPrimeEditor(null)} disabled={savingPrime}>×</button>
+                        </div>
+                        <div className="account-expiry-modal-body window-prime-options">
+                            {primeEditor.mode === 'five_hour' ? (
+                                <label className="window-prime-option">
+                                    <input
+                                        type="checkbox"
+                                        checked={primeEditor.fiveHour}
+                                        onChange={e => setPrimeEditor({ ...primeEditor, fiveHour: e.target.checked })}
+                                        disabled={savingPrime}
+                                    />
+                                    <span><strong>接口返回 · 5 小时窗口</strong><small>按 primary_window 实际时长自动识别</small></span>
+                                </label>
+                            ) : (
+                                <label className="window-prime-option">
+                                    <input
+                                        type="checkbox"
+                                        checked={primeEditor.weekly}
+                                        onChange={e => setPrimeEditor({ ...primeEditor, weekly: e.target.checked })}
+                                        disabled={savingPrime}
+                                    />
+                                    <span><strong>接口返回 · 7 天窗口</strong><small>按 primary_window 实际时长自动识别</small></span>
+                                </label>
+                            )}
+                            <p className="account-expiry-help">系统默认自动管理全部订阅号，并以 /wham/usage 返回的 primary_window 实际时长判断 5H 或 7D，不绑定套餐名称。首次遇到无法确认是否激活的 100% 窗口时只发一次极小请求；之后按固定 reset_at 到点触发。这里可以单独关闭该账号，client/solo 模式由 Server 单端执行。</p>
+                            {(primeEditor.lastAttempt || primeEditor.lastSuccess || primeEditor.lastError) && (
+                                <div className="window-prime-status">
+                                    {primeEditor.lastAttempt && <span>最近尝试：{new Date(primeEditor.lastAttempt).toLocaleString()}</span>}
+                                    {primeEditor.lastSuccess && <span className="ok">最近成功：{new Date(primeEditor.lastSuccess).toLocaleString()}</span>}
+                                    {primeEditor.lastError && <span className="err">最近结果：{primeEditor.lastError}</span>}
+                                </div>
+                            )}
+                            {primeError && <p className="account-expiry-error">{primeError}</p>}
+                        </div>
+                        <div className="account-expiry-modal-actions">
+                            <span></span>
+                            <div className="account-expiry-modal-actions-right">
+                                <button className="secondary-btn" onClick={() => setPrimeEditor(null)} disabled={savingPrime}>取消</button>
+                                <button className="primary-btn" onClick={saveWindowPriming} disabled={savingPrime}>
+                                    {savingPrime ? '保存中…' : '保存'}
                                 </button>
                             </div>
                         </div>

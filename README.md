@@ -34,6 +34,7 @@ Codex Switcher 是一个面向 Codex CLI / Codex App 多账号工作流的桌面
 - **余额接口自动探测**：第一次刷新中转账号余额时按顺序 probe `/v1/dashboard/billing/*`（new-api 系）→ `/v1/usage`（sub2api / OpenAI 兼容）→ 都不通则不拉。探测结果落库，下次直接走对应 fetcher。
 - **可观测配额**：5 小时/周配额、token、成本、cache savings、切号原因、周期历史都能看。
 - **月抛账号到期提醒**：可为每个账号手工记录订阅到期日，列表直接显示日期，并对 7 天内到期和已过期账号醒目标记。ChatGPT / Codex 当前没有提供可信的订阅到期日接口，因此该日期与 OAuth token 到期、额度重置时间严格分开，不参与自动切号判断。
+- **周期保鲜**：所有 ChatGPT 订阅号默认自动管理，并按 `/wham/usage` 返回的 `primary_window.limit_window_seconds` 自动识别 5H 或 7D，不绑定 Plus / Pro / Team 套餐名称；可在账号行单独关闭。系统只对无法确认已激活的 100% 窗口生成一次启动事件（极小请求可能因取整仍显示 100%）；明确低于 100% 的窗口不补发。之后额度缓存跨过对应 `reset_at` 时生成下一事件。唯一权威端先持久化防重水位，再发一次极小 Codex 请求并重拉 usage。同一事件即使超时或报错也绝不自动重发；client/solo 模式只由 Server 执行。
 - **长期开发友好**：session affinity 保住 prompt cache，`prompt_cache_key` 按账号隔离，减少切号后的缓存污染。
 - **跨工具 Skills**：把 Codex/Claude/Gemini/OpenCode 的 Skills 统一发现、安装、同步。
 
@@ -694,6 +695,7 @@ Codex Switcher is a desktop app for multi-account Codex CLI / Codex App workflow
 - **Multi-account pool**: manages Codex OAuth accounts, OpenAI API keys, relay/API-key accounts, and remote account pools.
 - **Quota visibility**: tracks 5-hour and weekly quota, token usage, costs, cache savings, switch reasons, and quota cycles.
 - **Disposable-account expiry reminders**: stores a manually managed subscription-expiry date per account, shows it in the account list, and highlights dates within 7 days or already expired. ChatGPT / Codex currently exposes no trustworthy subscription-expiry API, so this value stays separate from OAuth token expiry and quota reset windows and never drives automatic switching.
+- **Quota-cycle keepalive**: enabled by default for every ChatGPT subscription account, with per-account opt-out. Window semantics come from `/wham/usage` `primary_window.limit_window_seconds`, not hardcoded plan names, so future OpenAI policy changes are handled automatically. The system creates one bootstrap event only for an ambiguous 100% window; a window clearly below 100% receives no extra request. Later, crossing the semantic cached `reset_at` creates the next event. The authoritative host durably reserves each event before one minimal Codex request; events are never retried automatically.
 - **Long-session friendly**: session affinity and per-account `prompt_cache_key` isolation help preserve prompt-cache benefits.
 - **Cross-tool Skills**: discover, install, sync, and link Skills across Codex, Claude, Gemini, and OpenCode-style directories.
 
@@ -809,6 +811,7 @@ Codex Switcher — это настольное приложение для ра�
 - **Пул аккаунтов**: Codex OAuth, OpenAI API keys, relay/API-key аккаунты и удаленные пулы.
 - **Наблюдаемость квот**: 5-часовые и недельные квоты, токены, стоимость, cache savings, причины переключений и история циклов.
 - **Напоминания об окончании подписки**: для каждого аккаунта можно вручную указать дату окончания подписки; даты в пределах 7 дней и уже истекшие выделяются в списке. ChatGPT / Codex сейчас не предоставляет надежное API этой даты, поэтому она хранится отдельно от срока OAuth-токена и окон сброса квот и не влияет на автоматическое переключение.
+- **Поддержание цикла квоты**: по умолчанию включено для всех подписочных аккаунтов ChatGPT и может быть отключено отдельно. Тип окна определяется по фактическому `primary_window.limit_window_seconds` из `/wham/usage`, а не по названию тарифа. Для неоднозначного окна с 100% создается одно стартовое событие; окно ниже 100% не получает лишний запрос. Далее события возникают после перехода через правильный `reset_at`. Авторитетный хост сначала сохраняет защитную отметку, затем отправляет один минимальный запрос Codex; событие никогда не повторяется автоматически после ошибки.
 - **Поддержка длинных сессий**: session affinity и изоляция `prompt_cache_key` по аккаунтам помогают сохранить пользу prompt cache.
 - **Skills для разных инструментов**: поиск, установка, синхронизация и symlink-распределение Skills для Codex, Claude, Gemini и OpenCode-подобных инструментов.
 

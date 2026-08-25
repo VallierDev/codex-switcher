@@ -54,6 +54,8 @@ pub struct UsageDisplay {
     pub five_hour_reset: String,
     /// 5小时重置时间戳
     pub five_hour_reset_at: Option<i64>,
+    /// wham/usage primary_window.limit_window_seconds；窗口语义以它为准。
+    pub primary_window_seconds: Option<i64>,
     /// 周窗口使用百分比
     pub weekly_used: i32,
     /// 周窗口剩余百分比
@@ -64,6 +66,8 @@ pub struct UsageDisplay {
     pub weekly_reset: String,
     /// 周重置时间戳
     pub weekly_reset_at: Option<i64>,
+    /// wham/usage secondary_window.limit_window_seconds。
+    pub secondary_window_seconds: Option<i64>,
     /// 额度余额
     pub credits_balance: Option<f64>,
     /// 是否有额度
@@ -348,11 +352,13 @@ impl UsageFetcher {
 
         // 解析 5 小时窗口 (Primary)
         let primary_val = rate_limit.and_then(|r| r.get("primary_window"));
-        let (p_used, p_reset, p_label, p_reset_at) = Self::parse_window(primary_val, "5H 限额");
+        let (p_used, p_reset, p_label, p_reset_at, p_window_seconds) =
+            Self::parse_window(primary_val, "5H 限额");
 
         // 解析周窗口 (Secondary)
         let secondary_val = rate_limit.and_then(|r| r.get("secondary_window"));
-        let (s_used, s_reset, s_label, s_reset_at) = Self::parse_window(secondary_val, "周限额");
+        let (s_used, s_reset, s_label, s_reset_at, s_window_seconds) =
+            Self::parse_window(secondary_val, "周限额");
 
         // 解析额度
         let credits = json.get("credits");
@@ -389,9 +395,9 @@ impl UsageFetcher {
             })
             .and_then(|e| e.get("rate_limit"))
             .map(|rl| {
-                let (p_used, p_reset, _l, p_at) =
+                let (p_used, p_reset, _l, p_at, _) =
                     Self::parse_window(rl.get("primary_window"), "5H 限额");
-                let (s_used, s_reset, _l2, s_at) =
+                let (s_used, s_reset, _l2, s_at, _) =
                     Self::parse_window(rl.get("secondary_window"), "周限额");
                 SparkWindows {
                     five_hour_left: 100 - p_used,
@@ -410,11 +416,13 @@ impl UsageFetcher {
             five_hour_label: p_label,
             five_hour_reset: p_reset,
             five_hour_reset_at: p_reset_at,
+            primary_window_seconds: p_window_seconds,
             weekly_used: s_used,
             weekly_left: 100 - s_used,
             weekly_label: s_label,
             weekly_reset: s_reset,
             weekly_reset_at: s_reset_at,
+            secondary_window_seconds: s_window_seconds,
             credits_balance,
             has_credits: has_credits || unlimited,
             reset_credits,
@@ -427,10 +435,10 @@ impl UsageFetcher {
     fn parse_window(
         window: Option<&Value>,
         default_label: &str,
-    ) -> (i32, String, String, Option<i64>) {
+    ) -> (i32, String, String, Option<i64>, Option<i64>) {
         let window = match window {
             Some(w) => w,
-            None => return (0, "未知".to_string(), default_label.to_string(), None),
+            None => return (0, "未知".to_string(), default_label.to_string(), None, None),
         };
 
         // 关键修复：使用 f64 解析百分比，然后四舍五入
@@ -479,7 +487,13 @@ impl UsageFetcher {
             }
         };
 
-        (used_percent, reset_str, label, reset_at)
+        (
+            used_percent,
+            reset_str,
+            label,
+            reset_at,
+            (limit_window_seconds > 0).then_some(limit_window_seconds),
+        )
     }
 
     /// 根据窗口秒数获取人类可读标签

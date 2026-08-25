@@ -254,6 +254,7 @@ fn handle_list_quota(state: &ApiState) -> Response<ResponseBody> {
                 "id": a.id,
                 "name": a.name,
                 "cached_quota": a.cached_quota,
+                "window_priming": a.window_priming,
                 "is_banned": a.is_banned,
                 "is_token_invalid": a.is_token_invalid,
                 "is_logged_out": a.is_logged_out,
@@ -403,8 +404,8 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
         };
         let mut to_write = incoming;
         to_write.id = final_id.clone();
-        if action == "merged" {
-            if let Some(old) = store.accounts.get(&final_id) {
+        if let Some(old) = store.accounts.get(&final_id) {
+            if action == "merged" {
                 to_write.created_at = old.created_at.clone();
                 if to_write.notes.is_none() {
                     to_write.notes = old.notes.clone();
@@ -412,7 +413,24 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
                 if to_write.account_expires_at.is_none() {
                     to_write.account_expires_at = old.account_expires_at.clone();
                 }
+                // identity merge 代表旧账号换 id/重新导入；新客户端没有显式配置时，
+                // 保留 Server 上已经启用的开关。普通同-id update 接受客户端开关，
+                // 所以用户仍可以正常关闭。
+                if !to_write.window_priming.configured
+                    && !to_write.window_priming.enabled()
+                    && old.window_priming.enabled()
+                {
+                    to_write.window_priming.five_hour_enabled =
+                        old.window_priming.five_hour_enabled;
+                    to_write.window_priming.weekly_enabled = old.window_priming.weekly_enabled;
+                }
             }
+
+            // last_* 是 Server 执行真实请求前写入的防重水位，只能单调向前。
+            // client 可能在下一次 /quotas 同步前推来旧 Account，绝不能回滚水位后再发一次。
+            to_write
+                .window_priming
+                .merge_runtime_watermarks_from(&old.window_priming);
         }
         if let Err(e) = upsert_account(&mut store, to_write) {
             return err_resp(e);
@@ -546,10 +564,12 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
                             five_hour_left: usage.five_hour_left as f64,
                             five_hour_reset: usage.five_hour_reset.clone(),
                             five_hour_reset_at: usage.five_hour_reset_at,
+                            primary_window_seconds: usage.primary_window_seconds,
                             five_hour_label: usage.five_hour_label.clone(),
                             weekly_left: usage.weekly_left as f64,
                             weekly_reset: usage.weekly_reset.clone(),
                             weekly_reset_at: usage.weekly_reset_at,
+                            secondary_window_seconds: usage.secondary_window_seconds,
                             weekly_label: usage.weekly_label.clone(),
                             plan_type: usage.plan_type.clone(),
                             is_valid_for_cli: usage.is_valid_for_cli,
@@ -749,10 +769,12 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
                         five_hour_left: usage.five_hour_left as f64,
                         five_hour_reset: usage.five_hour_reset.clone(),
                         five_hour_reset_at: usage.five_hour_reset_at,
+                        primary_window_seconds: usage.primary_window_seconds,
                         five_hour_label: usage.five_hour_label.clone(),
                         weekly_left: usage.weekly_left as f64,
                         weekly_reset: usage.weekly_reset.clone(),
                         weekly_reset_at: usage.weekly_reset_at,
+                        secondary_window_seconds: usage.secondary_window_seconds,
                         weekly_label: usage.weekly_label.clone(),
                         plan_type: usage.plan_type.clone(),
                         is_valid_for_cli: usage.is_valid_for_cli,

@@ -334,6 +334,11 @@ pub struct Account {
     /// 与 OAuth access_token 的 expires_at 无关，主要用于月抛账号管理。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_expires_at: Option<String>,
+
+    /// 「周期保鲜」配置与运行状态。窗口跨过 reset_at 后，调度器可用该账号
+    /// 发送一次最小 Codex 请求，让新的 5h / 7d 滚动窗口开始计时。
+    #[serde(default)]
+    pub window_priming: WindowPrimingState,
     /// 缓存的配额信息
     #[serde(default)]
     pub cached_quota: Option<CachedQuota>,
@@ -495,6 +500,67 @@ pub struct KeepaliveState {
     pub last_error: Option<String>,
 }
 
+/// 5 小时 / 7 天额度窗口「周期保鲜」。
+///
+/// `last_*_reset_at` 记录的是“触发本次开窗的旧窗口 reset_at”，用于跨重启去重；
+/// 它不是新窗口的结束时间。成功开窗后调度器会重新读取 usage，新的倒计时仍存入
+/// `cached_quota`。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WindowPrimingState {
+    /// 用户是否显式配置过。false 表示沿用系统默认：订阅号自动管理。
+    #[serde(default)]
+    pub configured: bool,
+    #[serde(default)]
+    pub five_hour_enabled: bool,
+    #[serde(default)]
+    pub weekly_enabled: bool,
+    /// 开启功能时若目标窗口没有 reset_at（UI 显示 N/A），生成一次性启动事件。
+    #[serde(default)]
+    pub bootstrap_request_id: Option<String>,
+    #[serde(default)]
+    pub last_bootstrap_request_id: Option<String>,
+    #[serde(default)]
+    pub last_five_hour_reset_at: Option<i64>,
+    #[serde(default)]
+    pub last_weekly_reset_at: Option<i64>,
+    #[serde(default)]
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_success_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+impl WindowPrimingState {
+    pub fn enabled(&self) -> bool {
+        self.five_hour_enabled || self.weekly_enabled
+    }
+
+    /// 合并 Server 已经执行过的运行时水位。开关仍以 `self`（最新客户端配置）为准，
+    /// 但 reset_at/时间戳只能前进，避免旧 client 覆盖后重复发送模型请求。
+    pub fn merge_runtime_watermarks_from(&mut self, previous: &Self) {
+        self.last_five_hour_reset_at = self
+            .last_five_hour_reset_at
+            .max(previous.last_five_hour_reset_at);
+        self.last_weekly_reset_at = self
+            .last_weekly_reset_at
+            .max(previous.last_weekly_reset_at);
+
+        let incoming_attempt = self.last_attempt_at;
+        let previous_attempt = previous.last_attempt_at;
+        if previous_attempt >= incoming_attempt && previous.last_error.is_some() {
+            self.last_error = previous.last_error.clone();
+        }
+        if previous_attempt >= incoming_attempt
+            && previous.last_bootstrap_request_id.is_some()
+        {
+            self.last_bootstrap_request_id = previous.last_bootstrap_request_id.clone();
+        }
+        self.last_attempt_at = incoming_attempt.max(previous_attempt);
+        self.last_success_at = self.last_success_at.max(previous.last_success_at);
+    }
+}
+
 impl Default for KeepaliveState {
     fn default() -> Self {
         Self {
@@ -528,11 +594,15 @@ pub struct CachedQuota {
     pub five_hour_left: f64,
     pub five_hour_reset: String,
     pub five_hour_reset_at: Option<i64>,
+    #[serde(default)]
+    pub primary_window_seconds: Option<i64>,
     #[serde(default = "default_five_hour_label")]
     pub five_hour_label: String,
     pub weekly_left: f64,
     pub weekly_reset: String,
     pub weekly_reset_at: Option<i64>,
+    #[serde(default)]
+    pub secondary_window_seconds: Option<i64>,
     #[serde(default = "default_weekly_label")]
     pub weekly_label: String,
     pub plan_type: String,
@@ -1125,6 +1195,7 @@ impl AccountStore {
             last_used: None,
             notes,
             account_expires_at: None,
+            window_priming: WindowPrimingState::default(),
             cached_quota: None,
             keepalive: KeepaliveState::default(),
             is_banned: false,
@@ -1191,6 +1262,7 @@ impl AccountStore {
             last_used: None,
             notes,
             account_expires_at: None,
+            window_priming: WindowPrimingState::default(),
             cached_quota: None,
             keepalive: KeepaliveState::default(),
             is_banned: false,
@@ -2022,9 +2094,53 @@ mod tests {
         );
         let mut value = serde_json::to_value(&account).unwrap();
         value.as_object_mut().unwrap().remove("account_expires_at");
+        value.as_object_mut().unwrap().remove("window_priming");
 
         let decoded: Account = serde_json::from_value(value).unwrap();
         assert!(decoded.account_expires_at.is_none());
+        assert_eq!(decoded.window_priming, WindowPrimingState::default());
+    }
+
+    #[test]
+    fn window_priming_runtime_watermarks_never_roll_back_from_stale_client() {
+        let old_attempt = Utc::now();
+        let previous = WindowPrimingState {
+            configured: false,
+            five_hour_enabled: true,
+            weekly_enabled: true,
+            bootstrap_request_id: Some("bootstrap-1".to_string()),
+            last_bootstrap_request_id: Some("bootstrap-1".to_string()),
+            last_five_hour_reset_at: Some(200),
+            last_weekly_reset_at: Some(300),
+            last_attempt_at: Some(old_attempt),
+            last_success_at: Some(old_attempt),
+            last_error: Some("server result".to_string()),
+        };
+        let mut stale_client = WindowPrimingState {
+            configured: true,
+            // 开关属于用户配置，可以由 client 关闭；运行水位不能回滚。
+            five_hour_enabled: false,
+            weekly_enabled: false,
+            bootstrap_request_id: Some("bootstrap-1".to_string()),
+            last_bootstrap_request_id: None,
+            last_five_hour_reset_at: Some(100),
+            last_weekly_reset_at: None,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_error: None,
+        };
+
+        stale_client.merge_runtime_watermarks_from(&previous);
+        assert!(!stale_client.enabled());
+        assert_eq!(stale_client.last_five_hour_reset_at, Some(200));
+        assert_eq!(stale_client.last_weekly_reset_at, Some(300));
+        assert_eq!(
+            stale_client.last_bootstrap_request_id.as_deref(),
+            Some("bootstrap-1")
+        );
+        assert_eq!(stale_client.last_attempt_at, Some(old_attempt));
+        assert_eq!(stale_client.last_success_at, Some(old_attempt));
+        assert_eq!(stale_client.last_error.as_deref(), Some("server result"));
     }
 
     #[test]

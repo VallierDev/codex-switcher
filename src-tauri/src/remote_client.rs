@@ -198,6 +198,8 @@ pub struct RemoteQuotaEntry {
     #[serde(default)]
     pub cached_quota: Option<crate::account::CachedQuota>,
     #[serde(default)]
+    pub window_priming: Option<crate::account::WindowPrimingState>,
+    #[serde(default)]
     pub is_banned: bool,
     #[serde(default)]
     pub is_token_invalid: bool,

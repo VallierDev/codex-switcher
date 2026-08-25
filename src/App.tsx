@@ -301,7 +301,7 @@ function App() {
           <div className="app-logo">
             <Zap size={18} />
           </div>
-          <h1>Codex Switcher <span className="app-version">v0.7.9</span></h1>
+          <h1>Codex Switcher <span className="app-version">v0.7.10</span></h1>
           <div className={`proxy-indicator ${proxyRunning ? 'on' : 'off'}`} title={proxyRunning ? '代理运行中' : '代理未启动'}>
             <span className="proxy-dot" />
             {proxyRunning ? 'Proxy ON' : 'Proxy OFF'}
