@@ -1288,23 +1288,98 @@ fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(
 // 核心请求处理
 // ────────────────────────────────────────────────────────────────
 
-/// OpenAI `chat/completions` 入站处理：翻成 codex `responses`，用一个 Spark-capable(Pro)
-/// 账号打 ChatGPT 上游，缓冲整条 SSE 后组装回单条 chat/completions JSON。
+/// Worker 显式声明"这一条请求跟随 current"的标记 header。
+///
+/// 只认这一个名字、只认值 `1`。**不看 User-Agent、不看模型名** —— Harness、pi
+/// sidecar 和 glance 打的是同一个 endpoint，UA 和模型都会漂（Harness 的 UA 由
+/// `dsh-llm` 的 attribution 固定，glance 用的是 OpenAI SDK 默认 UA，两边都可能
+/// 随版本变），拿它们做判据等于把路由押在一个没人维护的字符串上。
+/// 本地专用，`handle_chat_inbound` 自己从零构造出站 header，绝不外泄到 chatgpt.com。
+const WORKER_FOLLOW_CURRENT_HEADER: &str = "x-pod-worker-follow-current";
+
+/// `chat/completions` 入站选中的账号来源。决定 401 时怎么处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatInboundPick {
+    /// 显式 Worker 标记 → `store.current`。401 只刷新 current 再用 current 重试，
+    /// 永不切号、永不去刷别的账号。
+    FollowCurrent,
+    /// 用户主动定义的硬路由（`session_routes`）。严格模式：401 原样透回。
+    HardRoute,
+    /// 历史行为：第一个 plan=pro 的非 Relay 账号（glance 的 Spark 通道）。
+    SparkPro,
+}
+
+/// 请求是否带了 Worker 跟随标记。
+///
+/// 值必须精确等于 `1`（去掉首尾空白后）。空值、`0`、`true` 都不算 —— 一个模糊
+/// 匹配的标记跟按 UA 猜没有本质区别。
+fn wants_worker_current(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(WORKER_FOLLOW_CURRENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// `chat/completions` 入站选号的纯决策。
+///
+/// 抽成纯函数是为了能脱离 `ProxyState` 单测：调用方负责把 store 快照
+/// （`current` / `spark_pro`）和硬路由结果喂进来，这里只做优先级判定。
+///
+/// 优先级：硬路由 > （带标记时）current > pro 扫描。
+/// **没带标记时这个函数只可能返回 `SparkPro`**，即 glance 走的还是原来那条路。
+fn decide_chat_inbound_pick(
+    worker_follow_current: bool,
+    hard_routed: Option<&str>,
+    current: Option<&str>,
+    spark_pro: Option<&str>,
+) -> Option<(String, ChatInboundPick)> {
+    if worker_follow_current {
+        if let Some(id) = hard_routed {
+            return Some((id.to_string(), ChatInboundPick::HardRoute));
+        }
+        if let Some(id) = current {
+            return Some((id.to_string(), ChatInboundPick::FollowCurrent));
+        }
+    }
+    spark_pro.map(|id| (id.to_string(), ChatInboundPick::SparkPro))
+}
+
+/// OpenAI `chat/completions` 入站处理：翻成 codex `responses`，用一个账号打 ChatGPT
+/// 上游，缓冲整条 SSE 后组装回单条 chat/completions JSON。
 /// 供 glance 等 OpenAI 兼容客户端复用 ChatGPT 订阅里闲置的 Spark 额度。
-async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<ProxyBody> {
+///
+/// 选号见 `decide_chat_inbound_pick`。Codex CLI/Desktop 到不了这个函数 —— 它走
+/// `/v1/responses` + WS，被 `handle_request` 里的 path 守卫挡在外面，全仓库这个
+/// 函数只有那一个调用点。
+async fn handle_chat_inbound(
+    state: Arc<ProxyState>,
+    headers_in: &hyper::HeaderMap,
+    body: &Bytes,
+) -> Response<ProxyBody> {
     let chat: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid JSON: {}", e)),
     };
 
-    // 选供号：第一个非 relay 且 plan_type==pro 的账号（Spark 专属）。
-    let (token, name) = {
+    // 带 Worker 标记时才查硬路由：`resolve_hard_route` 会写 hit 计数并落盘，
+    // 对没带标记的 glance 流量跑它既是行为变化也是无谓写盘。
+    let worker_follow_current = wants_worker_current(headers_in);
+    let hard_routed: Option<String> = if worker_follow_current {
+        resolve_hard_route(&state, body, headers_in).map(|(_sk, aid)| aid)
+    } else {
+        None
+    };
+
+    // 选供号。没带标记 → 只可能落到第一个非 relay 且 plan_type==pro 的账号
+    // （Spark 专属），跟这段代码以前的行为逐字相同。
+    let (token, name, pick) = {
         let store = match state.store.lock() {
             Ok(s) => s,
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
-        let mut picked: Option<(String, String)> = None;
-        for (_id, acc) in store.accounts.iter() {
+        let mut spark_pro: Option<String> = None;
+        for (id, acc) in store.accounts.iter() {
             if acc.is_relay() {
                 continue;
             }
@@ -1313,22 +1388,38 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
                 .as_ref()
                 .map(|q| q.plan_type.to_lowercase())
                 .unwrap_or_default();
-            if plan == "pro" {
-                if let Some(tok) = AccountStore::extract_access_token(&acc.auth_json) {
-                    picked = Some((tok, acc.name.clone()));
-                    break;
-                }
+            if plan == "pro" && AccountStore::extract_access_token(&acc.auth_json).is_some() {
+                spark_pro = Some(id.clone());
+                break;
             }
         }
-        match picked {
-            Some(p) => p,
-            None => {
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "没有可用的 Pro 账号（chat 入站/Spark 需要一个 plan=pro 的账号；先刷新一次该号配额）",
-                )
-            }
-        }
+        let decided = decide_chat_inbound_pick(
+            worker_follow_current,
+            hard_routed.as_deref(),
+            store.current.as_deref(),
+            spark_pro.as_deref(),
+        );
+        let Some((account_id, pick)) = decided else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "没有可用的 Pro 账号（chat 入站/Spark 需要一个 plan=pro 的账号；先刷新一次该号配额）",
+            );
+        };
+        // current / 硬路由账号可能缺 access_token（刚导入、被清过），这跟"没有 Pro 号"
+        // 不是一回事，报错要分开说，否则运维会去刷一个根本没被选中的账号的配额。
+        let Some(acc) = store.accounts.get(&account_id) else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("chat 入站选中的账号不存在: {}", account_id),
+            );
+        };
+        let Some(tok) = AccountStore::extract_access_token(&acc.auth_json) else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("chat 入站选中的账号缺 access_token: {}", acc.name),
+            );
+        };
+        (tok, acc.name.clone(), pick)
     };
 
     let want_stream = chat
@@ -1346,7 +1437,15 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
         .and_then(|m| m.as_str())
         .unwrap_or(default_model)
         .to_string();
-    println!("[ChatInbound] 账号={} model={}", name, model);
+    let pick_label = match pick {
+        ChatInboundPick::FollowCurrent => "current(worker)",
+        ChatInboundPick::HardRoute => "hard-route(worker)",
+        ChatInboundPick::SparkPro => "pro-scan",
+    };
+    println!(
+        "[ChatInbound] 账号={} model={} 选号={}",
+        name, model, pick_label
+    );
 
     let body_bytes = match serde_json::to_vec(&responses_body) {
         Ok(v) => Bytes::from(v),
@@ -1384,7 +1483,16 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
     // spark 偶尔"只 reasoning 不出 message"（空响应）—— 最多重试一次。
     // 这里复用同一个 prompt_cache_key，避免同一入站请求被拆成两个服务端缓存上下文。
     let mut chat_resp = serde_json::Value::Null;
-    for attempt in 0..2 {
+    let mut token = token;
+    // 401 静默刷新只允许发生一次，且只在 FollowCurrent 分支：
+    // - SparkPro 是扫出来的号，不是 current，刷 current 等于刷错账号；
+    // - HardRoute 是用户主动指定的，严格模式下 401 原样透回。
+    let mut refresh_left = matches!(pick, ChatInboundPick::FollowCurrent) as u32;
+    // 空响应重试跟 401 刷新是两个独立预算。用同一个 `attempt` 计数会让"第二次
+    // 尝试撞 401"消耗掉循环的最后一轮，然后带着 chat_resp=Null 掉出循环，把一个
+    // 空的 200 当成成功回给客户端。上界仍然收敛：最多 1 次刷新 + 1 次空响应重试。
+    let mut empty_retry_left = 1u32;
+    loop {
         let resp = match forward_with_token(
             &state,
             &hyper::Method::POST,
@@ -1402,6 +1510,27 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
         };
         let status = resp.status();
         let raw = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 401 && refresh_left > 0 {
+            refresh_left -= 1;
+            match silent_refresh_current(&state).await {
+                SilentRefreshOutcome::Refreshed(fresh) => {
+                    println!("[ChatInbound] current 401，静默刷新成功，用 current 重试");
+                    token = fresh;
+                    continue;
+                }
+                other => {
+                    let why = match other {
+                        SilentRefreshOutcome::LoggedOut => "current 已登出".to_string(),
+                        SilentRefreshOutcome::NoRefreshToken => "current 没有 refresh_token".to_string(),
+                        SilentRefreshOutcome::OtherError(e) => e,
+                        SilentRefreshOutcome::Refreshed(_) => unreachable!(),
+                    };
+                    // 刷不动就把上游 401 原样透回。这里刻意不切号 —— Worker 要的是
+                    // "跟随 current"，悄悄换一个号会让下一轮又打到另一个账号上。
+                    eprintln!("[ChatInbound] current 401 且刷新失败：{}", why);
+                }
+            }
+        }
         if !status.is_success() {
             let msg = crate::chat_inbound::extract_upstream_error(&raw)
                 .unwrap_or_else(|| format!("上游 HTTP {}", status.as_u16()));
@@ -1416,10 +1545,11 @@ async fn handle_chat_inbound(state: Arc<ProxyState>, body: &Bytes) -> Response<P
         let has_content = msg.get("content").map(|c| !c.is_null()).unwrap_or(false);
         let has_tools = msg.get("tool_calls").map(|t| t.is_array()).unwrap_or(false);
         chat_resp = parsed;
-        if has_content || has_tools || attempt == 1 {
+        if has_content || has_tools || empty_retry_left == 0 {
             break;
         }
-        println!("[ChatInbound] 空响应，重试一次（attempt {}）", attempt + 1);
+        empty_retry_left -= 1;
+        println!("[ChatInbound] 空响应，重试一次");
     }
 
     if want_stream {
@@ -1550,7 +1680,7 @@ async fn handle_request(
     {
         let p = path_and_query.split('?').next().unwrap_or("");
         if method == Method::POST && (p == "/v1/chat/completions" || p == "/chat/completions") {
-            return Ok(handle_chat_inbound(state, &body_bytes).await);
+            return Ok(handle_chat_inbound(state, &req_headers, &body_bytes).await);
         }
     }
 
@@ -2951,10 +3081,15 @@ fn build_upstream_headers(
         // 从不是官方客户端会发的字段，只对本地/日志有意义，不该离开这台机器。
         // `x-pod-worker-route`：本地硬路由专用 key（见 resolve_hard_route），
         // 同理只对本地有意义。
+        // `x-pod-worker-follow-current`：chat 入站的本地选号标记（见
+        // WORKER_FOLLOW_CURRENT_HEADER）。chat 入站自己从零构造出站 header，本来
+        // 就漏不出去；在这里一并剥掉是为了让"不外泄"成为被强制的性质而不是巧合。
+        // 对 Codex 是空操作 —— responses/WS 路径上没有任何客户端会发这个 header。
         if lower == "session_id"
             || lower == "x-worker-id"
             || lower == "x-task-id"
             || lower == "x-pod-worker-route"
+            || lower == WORKER_FOLLOW_CURRENT_HEADER
         {
             continue;
         }
@@ -6611,6 +6746,140 @@ fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 只带 Worker 标记的 header map。
+    fn worker_headers() -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            HeaderName::from_static(WORKER_FOLLOW_CURRENT_HEADER),
+            HeaderValue::from_static("1"),
+        );
+        h
+    }
+
+    #[test]
+    fn worker_marked_chat_inbound_uses_current_not_the_pro_account() {
+        // Worker 请求永远用 current —— 即使存在一个 plan=pro 的号，而 current 不是它。
+        let picked = decide_chat_inbound_pick(
+            wants_worker_current(&worker_headers()),
+            None,
+            Some("current-account"),
+            Some("pro-account"),
+        );
+        assert_eq!(
+            picked,
+            Some(("current-account".to_string(), ChatInboundPick::FollowCurrent))
+        );
+    }
+
+    #[test]
+    fn unmarked_chat_inbound_still_uses_the_pro_account() {
+        // glance 等既有客户端不带标记 → 仍然走 pro 扫描，行为不变。
+        let picked = decide_chat_inbound_pick(false, None, Some("current-account"), Some("pro-account"));
+        assert_eq!(
+            picked,
+            Some(("pro-account".to_string(), ChatInboundPick::SparkPro))
+        );
+    }
+
+    #[test]
+    fn worker_marker_is_never_inferred_from_user_agent_or_model() {
+        // 关键守卫：即使 UA 是 Harness、模型是 Worker 在用的那个，只要没有显式
+        // 标记 header 就不算 Worker 请求。禁止任何模糊判断。
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::USER_AGENT,
+            HeaderValue::from_static("deepseek-harness/0.1.2 (+https://github.com/deepseek-ai/deepseek-harness)"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-worker-id"),
+            HeaderValue::from_static("pi-prompt-gate"),
+        );
+        assert!(!wants_worker_current(&headers));
+        assert_eq!(
+            decide_chat_inbound_pick(
+                wants_worker_current(&headers),
+                None,
+                Some("current-account"),
+                Some("pro-account"),
+            ),
+            Some(("pro-account".to_string(), ChatInboundPick::SparkPro))
+        );
+
+        // 模型名同理：body 里的 model 从不参与选号，这里用带标记/不带标记的
+        // 同一个模型证明差异只来自 header。
+        assert!(wants_worker_current(&worker_headers()));
+    }
+
+    #[test]
+    fn worker_marker_value_must_be_exactly_one() {
+        for bad in ["", "0", "true", "yes", "11"] {
+            let mut h = hyper::HeaderMap::new();
+            h.insert(
+                HeaderName::from_static(WORKER_FOLLOW_CURRENT_HEADER),
+                HeaderValue::from_str(bad).unwrap(),
+            );
+            assert!(!wants_worker_current(&h), "value {:?} 不应被当成标记", bad);
+        }
+        // 前后空白是传输噪声，不是另一个值。
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            HeaderName::from_static(WORKER_FOLLOW_CURRENT_HEADER),
+            HeaderValue::from_static(" 1 "),
+        );
+        assert!(wants_worker_current(&h));
+    }
+
+    #[test]
+    fn manual_hard_route_still_wins_for_worker_requests() {
+        // 手动硬路由仍然可用，且优先于 current。
+        let picked = decide_chat_inbound_pick(
+            true,
+            Some("hard-routed-account"),
+            Some("current-account"),
+            Some("pro-account"),
+        );
+        assert_eq!(
+            picked,
+            Some((
+                "hard-routed-account".to_string(),
+                ChatInboundPick::HardRoute
+            ))
+        );
+    }
+
+    #[test]
+    fn worker_request_falls_back_to_pro_only_when_there_is_no_current() {
+        // current 缺失（首次启动、账号被清空）时不应直接 503：还有 pro 号就用它。
+        assert_eq!(
+            decide_chat_inbound_pick(true, None, None, Some("pro-account")),
+            Some(("pro-account".to_string(), ChatInboundPick::SparkPro))
+        );
+        // 两个都没有才是真的无号可用。
+        assert_eq!(decide_chat_inbound_pick(true, None, None, None), None);
+    }
+
+    #[test]
+    fn only_follow_current_is_allowed_to_refresh_on_401() {
+        // 401 时只有 FollowCurrent 分支能刷新（刷的就是它自己用的号）；
+        // pro 扫描出来的号和硬路由号都不能触发刷 current，否则就是刷错账号。
+        assert_eq!(matches!(ChatInboundPick::FollowCurrent, ChatInboundPick::FollowCurrent) as u32, 1);
+        assert_eq!(matches!(ChatInboundPick::SparkPro, ChatInboundPick::FollowCurrent) as u32, 0);
+        assert_eq!(matches!(ChatInboundPick::HardRoute, ChatInboundPick::FollowCurrent) as u32, 0);
+    }
+
+    #[test]
+    fn worker_marker_never_reaches_the_upstream() {
+        // 标记是纯本地路由 key。chat 入站自己从零构造出站 header，但 responses
+        // 路径共用 build_upstream_headers —— 这里锁住它也不会把标记透传出去。
+        let mut inbound = hyper::HeaderMap::new();
+        inbound.insert(
+            HeaderName::from_static(WORKER_FOLLOW_CURRENT_HEADER),
+            HeaderValue::from_static("1"),
+        );
+        let outbound = build_upstream_headers(&inbound, "chatgpt.com");
+        assert!(outbound.get(WORKER_FOLLOW_CURRENT_HEADER).is_none());
+    }
 
     #[test]
     fn upstream_headers_strip_desktop_chatgpt_identity() {
