@@ -31,11 +31,12 @@ pub async fn fetch_model_quotas(
     access_token: &str,
     project_id: &str,
 ) -> Result<HashMap<String, ModelQuota>, String> {
+    let user_agent = super::native::request_user_agent(client).await;
     let response = client
         .post(FETCH_MODELS_URL)
         .bearer_auth(access_token)
         .header("content-type", "application/json")
-        .header("user-agent", "antigravity/2.11.0")
+        .header("user-agent", user_agent)
         .json(&serde_json::json!({"project": project_id}))
         .send()
         .await

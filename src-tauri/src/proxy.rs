@@ -54,6 +54,35 @@ static REMOTE_TOKEN_CACHE: std::sync::LazyLock<
     Mutex<std::collections::HashMap<String, RemoteTokenCacheEntry>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+#[derive(Clone)]
+struct RemoteAntigravityTokenCacheEntry {
+    access_token: String,
+    project_id: String,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+static REMOTE_ANTIGRAVITY_TOKEN_CACHE: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, RemoteAntigravityTokenCacheEntry>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn remote_antigravity_token_cache_get(id: &str) -> Option<RemoteAntigravityTokenCacheEntry> {
+    let cache = REMOTE_ANTIGRAVITY_TOKEN_CACHE.lock().ok()?;
+    let entry = cache.get(id)?;
+    (entry.expires_at > Utc::now() + chrono::Duration::minutes(5)).then(|| entry.clone())
+}
+
+fn remote_antigravity_token_cache_put(id: &str, entry: RemoteAntigravityTokenCacheEntry) {
+    if let Ok(mut cache) = REMOTE_ANTIGRAVITY_TOKEN_CACHE.lock() {
+        cache.insert(id.to_string(), entry);
+    }
+}
+
+fn remote_antigravity_token_cache_remove(id: &str) {
+    if let Ok(mut cache) = REMOTE_ANTIGRAVITY_TOKEN_CACHE.lock() {
+        cache.remove(id);
+    }
+}
+
 fn remote_token_cache_get(id: &str) -> Option<(String, bool)> {
     let g = REMOTE_TOKEN_CACHE.lock().ok()?;
     let e = g.get(id)?;
@@ -253,6 +282,8 @@ impl Default for ProxyStats {
 struct ProxyState {
     store: Arc<Mutex<AccountStore>>,
     client: Client,
+    /// Native Antigravity keeps one HTTP/1.1 connection pool per Google identity.
+    antigravity_clients: Mutex<std::collections::HashMap<String, Client>>,
     app_handle: tauri::AppHandle,
     switching: AtomicBool,
     stats: Arc<ProxyStats>,
@@ -316,6 +347,7 @@ pub fn start(
         let state = Arc::new(ProxyState {
             store,
             client,
+            antigravity_clients: Mutex::new(std::collections::HashMap::new()),
             app_handle,
             switching: AtomicBool::new(false),
             stats,
@@ -648,8 +680,8 @@ struct RelayRoute {
 #[derive(Debug, Clone)]
 struct AntigravityRoute {
     account_id: String,
-    access_token: String,
-    refresh_token: String,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
     project_id: String,
     expires_at: Option<chrono::DateTime<Utc>>,
 }
@@ -666,6 +698,7 @@ fn antigravity_routes(state: &ProxyState, model_id: &str) -> Vec<AntigravityRout
     let Ok(store) = state.store.lock() else {
         return Vec::new();
     };
+    let client_mode = store.settings.remote_mode == "client";
     let mut routes: Vec<(f64, Option<chrono::DateTime<Utc>>, AntigravityRoute)> = store
         .accounts
         .values()
@@ -681,21 +714,29 @@ fn antigravity_routes(state: &ProxyState, model_id: &str) -> Vec<AntigravityRout
                 model_id,
                 Utc::now(),
             )?;
-            let tokens = account.auth_json.get("tokens")?;
+            let tokens = account.auth_json.get("tokens");
+            let access_token = tokens
+                .and_then(|tokens| tokens.get("access_token"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            let refresh_token = tokens
+                .and_then(|tokens| tokens.get("refresh_token"))
+                .and_then(serde_json::Value::as_str)
+                .or(account.refresh_token.as_deref())
+                .map(ToOwned::to_owned);
+            if !client_mode && (access_token.is_none() || refresh_token.is_none()) {
+                return None;
+            }
             Some((
                 quota_score,
                 account.last_used,
                 AntigravityRoute {
                     account_id: account.id.clone(),
-                    access_token: tokens.get("access_token")?.as_str()?.to_string(),
-                    refresh_token: tokens
-                        .get("refresh_token")
-                        .and_then(serde_json::Value::as_str)
-                        .or(account.refresh_token.as_deref())?
-                        .to_string(),
+                    access_token,
+                    refresh_token,
                     project_id: account.auth_json.get("project_id")?.as_str()?.to_string(),
                     expires_at: tokens
-                        .get("expires_at")
+                        .and_then(|tokens| tokens.get("expires_at"))
                         .and_then(serde_json::Value::as_str)
                         .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
                         .map(|value| value.with_timezone(&Utc)),
@@ -728,10 +769,62 @@ fn has_antigravity_account(state: &ProxyState) -> bool {
         .unwrap_or(false)
 }
 
+fn antigravity_remote_urls(store: &AccountStore) -> (String, String) {
+    match std::env::var("CODEX_SWITCHER_ANTIGRAVITY_SERVER_URL_OVERRIDE") {
+        Ok(url) if !url.trim().is_empty() => (url, String::new()),
+        _ => (
+            store.settings.remote_server_url.clone(),
+            store.settings.remote_server_url_fallback.clone(),
+        ),
+    }
+}
+
 async fn refresh_antigravity_route_if_needed(
     state: &ProxyState,
     mut route: AntigravityRoute,
 ) -> Result<AntigravityRoute, String> {
+    let (remote_mode, primary, fallback, secret) = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        let (primary, fallback) = antigravity_remote_urls(&store);
+        (
+            store.settings.remote_mode.clone(),
+            primary,
+            fallback,
+            store.settings.remote_shared_secret.clone(),
+        )
+    };
+    if remote_mode == "client" {
+        if let Some(cached) = remote_antigravity_token_cache_get(&route.account_id) {
+            route.access_token = Some(cached.access_token);
+            route.project_id = cached.project_id;
+            route.expires_at = Some(cached.expires_at);
+            return Ok(route);
+        }
+        if secret.is_empty() {
+            return Err("Client mode has no remote_shared_secret for Google token lease".into());
+        }
+        let base = crate::remote_client::resolve_base_url(&primary, &fallback).await?;
+        let leased =
+            crate::remote_client::fetch_antigravity_token(&base, &secret, &route.account_id, false)
+                .await?;
+        let expires_at = leased
+            .expires_at
+            .as_deref()
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .ok_or_else(|| "Server Google token lease has no valid expires_at".to_string())?;
+        let cached = RemoteAntigravityTokenCacheEntry {
+            access_token: leased.access_token,
+            project_id: leased.project_id,
+            expires_at,
+        };
+        route.access_token = Some(cached.access_token.clone());
+        route.project_id = cached.project_id.clone();
+        route.expires_at = Some(cached.expires_at);
+        remote_antigravity_token_cache_put(&route.account_id, cached);
+        return Ok(route);
+    }
+
     let refresh_needed = route
         .expires_at
         .map(|expires| expires <= Utc::now() + chrono::Duration::minutes(5))
@@ -739,16 +832,17 @@ async fn refresh_antigravity_route_if_needed(
     if !refresh_needed {
         return Ok(route);
     }
+    let refresh_token = route
+        .refresh_token
+        .as_deref()
+        .ok_or_else(|| "Antigravity account has no refresh token".to_string())?;
     let config = crate::antigravity::oauth::OAuthClientConfig::from_environment();
-    let tokens = crate::antigravity::oauth::refresh_access_token(
-        &state.client,
-        &config,
-        &route.refresh_token,
-    )
-    .await?;
-    route.access_token = tokens.access_token;
+    let tokens =
+        crate::antigravity::oauth::refresh_access_token(&state.client, &config, refresh_token)
+            .await?;
+    route.access_token = Some(tokens.access_token);
     if let Some(refresh_token) = tokens.refresh_token {
-        route.refresh_token = refresh_token;
+        route.refresh_token = Some(refresh_token);
     }
     route.expires_at = Some(Utc::now() + chrono::Duration::seconds(tokens.expires_in));
 
@@ -757,7 +851,7 @@ async fn refresh_antigravity_route_if_needed(
         .accounts
         .get_mut(&route.account_id)
         .ok_or_else(|| "Antigravity account disappeared during refresh".to_string())?;
-    account.refresh_token = Some(route.refresh_token.clone());
+    account.refresh_token = route.refresh_token.clone();
     if let Some(object) = account.auth_json.as_object_mut() {
         let tokens = object
             .entry("tokens")
@@ -765,12 +859,14 @@ async fn refresh_antigravity_route_if_needed(
         if let Some(tokens) = tokens.as_object_mut() {
             tokens.insert(
                 "access_token".to_string(),
-                serde_json::Value::String(route.access_token.clone()),
+                serde_json::Value::String(route.access_token.clone().unwrap_or_default()),
             );
-            tokens.insert(
-                "refresh_token".to_string(),
-                serde_json::Value::String(route.refresh_token.clone()),
-            );
+            if let Some(refresh_token) = route.refresh_token.clone() {
+                tokens.insert(
+                    "refresh_token".to_string(),
+                    serde_json::Value::String(refresh_token),
+                );
+            }
             if let Some(expires_at) = route.expires_at {
                 tokens.insert(
                     "expires_at".to_string(),
@@ -785,6 +881,57 @@ async fn refresh_antigravity_route_if_needed(
     }
     store.save()?;
     Ok(route)
+}
+
+async fn force_remote_antigravity_route(
+    state: &ProxyState,
+    mut route: AntigravityRoute,
+) -> Result<AntigravityRoute, String> {
+    let (primary, fallback, secret) = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        if store.settings.remote_mode != "client" {
+            return Err("not in client mode".to_string());
+        }
+        let (primary, fallback) = antigravity_remote_urls(&store);
+        (
+            primary,
+            fallback,
+            store.settings.remote_shared_secret.clone(),
+        )
+    };
+    let base = crate::remote_client::resolve_base_url(&primary, &fallback).await?;
+    let leased =
+        crate::remote_client::fetch_antigravity_token(&base, &secret, &route.account_id, true)
+            .await?;
+    let expires_at = leased
+        .expires_at
+        .as_deref()
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|value| value.with_timezone(&Utc))
+        .ok_or_else(|| "Server Google token lease has no valid expires_at".to_string())?;
+    let cached = RemoteAntigravityTokenCacheEntry {
+        access_token: leased.access_token,
+        project_id: leased.project_id,
+        expires_at,
+    };
+    route.access_token = Some(cached.access_token.clone());
+    route.project_id = cached.project_id.clone();
+    route.expires_at = Some(cached.expires_at);
+    remote_antigravity_token_cache_put(&route.account_id, cached);
+    Ok(route)
+}
+
+fn antigravity_http_client(state: &ProxyState, account_id: &str) -> Result<Client, String> {
+    let mut clients = state
+        .antigravity_clients
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(client) = clients.get(account_id) {
+        return Ok(client.clone());
+    }
+    let client = crate::antigravity::native::build_http_client()?;
+    clients.insert(account_id.to_string(), client.clone());
+    Ok(client)
 }
 
 async fn handle_antigravity_response(
@@ -814,7 +961,7 @@ async fn handle_antigravity_response(
     }
     let mut last_error = "Antigravity request failed".to_string();
     for route in routes {
-        let route = match refresh_antigravity_route_if_needed(&state, route).await {
+        let mut route = match refresh_antigravity_route_if_needed(&state, route).await {
             Ok(route) => route,
             Err(error) => {
                 last_error = error;
@@ -830,13 +977,22 @@ async fn handle_antigravity_response(
                 Ok(value) => value,
                 Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
             };
-        let response = match state
-            .client
-            .post("https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent")
-            .bearer_auth(&route.access_token)
+        let antigravity_client = match antigravity_http_client(&state, &route.account_id) {
+            Ok(client) => client,
+            Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        };
+        let user_agent = crate::antigravity::native::request_user_agent(&antigravity_client).await;
+        let endpoint = if stream {
+            crate::antigravity::native::STREAM_URL
+        } else {
+            crate::antigravity::native::GENERATE_URL
+        };
+        let mut response = match antigravity_client
+            .post(endpoint)
+            .bearer_auth(route.access_token.as_deref().unwrap_or_default())
             .header("content-type", "application/json")
-            .header("user-agent", "antigravity/2.11.0 darwin/arm64")
-            .body(payload)
+            .header("user-agent", user_agent)
+            .body(payload.clone())
             .send()
             .await
         {
@@ -846,15 +1002,37 @@ async fn handle_antigravity_response(
                 continue;
             }
         };
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && route.refresh_token.is_none() {
+            remote_antigravity_token_cache_remove(&route.account_id);
+            route = match force_remote_antigravity_route(&state, route).await {
+                Ok(route) => route,
+                Err(error) => {
+                    last_error = format!("Server Google token force refresh failed: {error}");
+                    continue;
+                }
+            };
+            response = match antigravity_client
+                .post(endpoint)
+                .bearer_auth(route.access_token.as_deref().unwrap_or_default())
+                .header("content-type", "application/json")
+                .header(
+                    "user-agent",
+                    crate::antigravity::native::request_user_agent(&antigravity_client).await,
+                )
+                .body(payload)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = format!("Antigravity retry failed: {error}");
+                    continue;
+                }
+            };
+        }
         let status = response.status();
-        let raw = match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                last_error = format!("Antigravity response read failed: {error}");
-                continue;
-            }
-        };
         if status.as_u16() == 429 {
+            let _ = response.bytes().await;
             if let Ok(mut store) = state.store.lock() {
                 if let Some(account) = store.accounts.get_mut(&route.account_id) {
                     crate::antigravity::quota::mark_model_exhausted(&mut account.auth_json, &model);
@@ -865,9 +1043,44 @@ async fn handle_antigravity_response(
             continue;
         }
         if !status.is_success() {
-            last_error = format!("Antigravity upstream returned HTTP {status}");
+            let error_body = response.text().await.unwrap_or_default();
+            let preview: String = error_body.chars().take(500).collect();
+            last_error = format!("Antigravity upstream returned HTTP {status}: {preview}");
             continue;
         }
+        schedule_antigravity_success_refresh(
+            state.clone(),
+            antigravity_client.clone(),
+            route.clone(),
+        );
+        if stream {
+            let mut headers = response.headers().clone();
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("text/event-stream"),
+            );
+            headers.insert(
+                reqwest::header::CACHE_CONTROL,
+                reqwest::header::HeaderValue::from_static("no-cache"),
+            );
+            let status = response.status();
+            let translated_stream = antigravity_codex_stream(response, translator_state, model);
+            return build_stream_response_from_parts(
+                status,
+                headers,
+                Bytes::new(),
+                translated_stream,
+                Some(state.tracker.clone()),
+                None,
+            );
+        }
+        let raw = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                last_error = format!("Antigravity response read failed: {error}");
+                continue;
+            }
+        };
         let translated = match crate::antigravity::translate::antigravity_response_to_codex(
             &raw,
             &mut translator_state,
@@ -877,22 +1090,6 @@ async fn handle_antigravity_response(
             Ok(value) => value,
             Err(error) => return error_response(StatusCode::BAD_GATEWAY, &error),
         };
-        let latest_quotas = crate::antigravity::quota::fetch_model_quotas(
-            &state.client,
-            &route.access_token,
-            &route.project_id,
-        )
-        .await
-        .ok();
-        if let Ok(mut store) = state.store.lock() {
-            if let Some(account) = store.accounts.get_mut(&route.account_id) {
-                account.last_used = Some(Utc::now());
-                if let Some(ref quotas) = latest_quotas {
-                    crate::antigravity::quota::write_model_quotas(&mut account.auth_json, quotas);
-                }
-            }
-            let _ = store.save();
-        }
         return Response::builder()
             .status(StatusCode::OK)
             .header(
@@ -913,6 +1110,140 @@ async fn handle_antigravity_response(
             });
     }
     error_response(StatusCode::TOO_MANY_REQUESTS, &last_error)
+}
+
+fn schedule_antigravity_success_refresh(
+    state: Arc<ProxyState>,
+    client: Client,
+    route: AntigravityRoute,
+) {
+    tokio::spawn(async move {
+        let latest_quotas = crate::antigravity::quota::fetch_model_quotas(
+            &client,
+            route.access_token.as_deref().unwrap_or_default(),
+            &route.project_id,
+        )
+        .await
+        .ok();
+        if let Ok(mut store) = state.store.lock() {
+            if let Some(account) = store.accounts.get_mut(&route.account_id) {
+                account.last_used = Some(Utc::now());
+                if let Some(ref quotas) = latest_quotas {
+                    crate::antigravity::quota::write_model_quotas(&mut account.auth_json, quotas);
+                }
+            }
+            let _ = store.save();
+        }
+    });
+}
+
+struct AntigravityCodexStream {
+    upstream: ByteStream,
+    buffer: Vec<u8>,
+    queued: std::collections::VecDeque<Bytes>,
+    translator: crate::relay_translate::TranslatorState,
+    model: String,
+    upstream_done: bool,
+    finalized: bool,
+    failed: bool,
+}
+
+fn antigravity_codex_stream(
+    response: reqwest::Response,
+    translator: crate::relay_translate::TranslatorState,
+    model: String,
+) -> ByteStream {
+    let mut queued = std::collections::VecDeque::new();
+    queued.push_back(Bytes::from(crate::relay_translate::emit_created(
+        &translator,
+    )));
+    let state = AntigravityCodexStream {
+        upstream: response.bytes_stream().boxed(),
+        buffer: Vec::new(),
+        queued,
+        translator,
+        model,
+        upstream_done: false,
+        finalized: false,
+        failed: false,
+    };
+    futures_util::stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(bytes) = state.queued.pop_front() {
+                return Some((Ok(bytes), state));
+            }
+            while let Some(data) = pop_sse_data(&mut state.buffer) {
+                if data == b"[DONE]" {
+                    state.upstream_done = true;
+                    break;
+                }
+                if let Some(chat_chunk) =
+                    crate::antigravity::translate::antigravity_sse_event_to_chat_chunk(
+                        &data,
+                        &state.model,
+                    )
+                {
+                    for event in
+                        crate::relay_translate::handle_chunk(&mut state.translator, &chat_chunk)
+                    {
+                        state.queued.push_back(Bytes::from(event));
+                    }
+                }
+            }
+            if let Some(bytes) = state.queued.pop_front() {
+                return Some((Ok(bytes), state));
+            }
+            if state.failed {
+                return None;
+            }
+            if state.upstream_done {
+                if !state.finalized {
+                    state.finalized = true;
+                    let completed = crate::relay_translate::emit_completed(&mut state.translator);
+                    return Some((Ok(Bytes::from(completed)), state));
+                }
+                return None;
+            }
+            match state.upstream.next().await {
+                Some(Ok(bytes)) => state.buffer.extend_from_slice(&bytes),
+                Some(Err(error)) => {
+                    state.failed = true;
+                    return Some((Err(error), state));
+                }
+                None => {
+                    state.upstream_done = true;
+                    state.buffer.extend_from_slice(b"\n\n");
+                }
+            }
+        }
+    })
+    .boxed()
+}
+
+fn pop_sse_data(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let (end, delimiter_len) = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|end| (end, 4))
+        .or_else(|| {
+            buffer
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|end| (end, 2))
+        })?;
+    let event: Vec<u8> = buffer.drain(..end).collect();
+    buffer.drain(..delimiter_len);
+    let mut data = Vec::new();
+    for line in event.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if let Some(value) = line.strip_prefix(b"data:") {
+            if !data.is_empty() {
+                data.push(b'\n');
+            }
+            data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
+        }
+    }
+    (!data.is_empty()).then_some(data)
 }
 
 fn antigravity_codex_catalog_entry(
@@ -2150,7 +2481,7 @@ async fn handle_request(
     }
 
     // 已连接 Google 账号时，将 Antigravity 模型合并进 Codex 原生模型目录。
-    // Client 只需无密钥账号镜像即可展示；真实执行仍交给权威 Server。
+    // Client 只需无密钥账号镜像即可展示；推理本机直出，ST 向 Mini 租用。
     if req.method() == Method::GET
         && (req.uri().path() == "/v1/models" || req.uri().path().ends_with("/models"))
     {
@@ -2247,34 +2578,12 @@ async fn handle_request(
     };
 
     // ── 原生 Antigravity 模型路由 ──
-    // Client 模式无论 client_direct_upstream 如何，都把 Google 模型交给权威 Server。
-    let remote_mode_for_provider = state
-        .store
-        .lock()
-        .map(|store| store.settings.remote_mode.clone())
-        .unwrap_or_default();
+    // Client 与 Codex 同构：Mini 只管 RT/ST，请求从当前运行 Codex 的机器直连 Google。
     if let Some(model) = request_model(&body_bytes) {
         if crate::antigravity::is_antigravity_model(&model) {
-            if remote_mode_for_provider == "client" {
-                return Ok(
-                    match forward_to_server_parts(
-                        &state,
-                        &method,
-                        &path_and_query,
-                        &req_headers,
-                        &body_bytes,
-                    )
-                    .await
-                    {
-                        Ok(response) => build_stream_response(response, None, None),
-                        Err(error) => error_response(StatusCode::BAD_GATEWAY, &error),
-                    },
-                );
-            } else {
-                return Ok(
-                    handle_antigravity_response(state, method, &path_and_query, body_bytes).await,
-                );
-            }
+            return Ok(
+                handle_antigravity_response(state, method, &path_and_query, body_bytes).await,
+            );
         }
     }
 
@@ -6585,22 +6894,24 @@ where
         .await
         .map_err(|e| e.to_string())?;
     let status = response.status();
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
         return Err(format!("Antigravity HTTP {status}"));
     }
-    for line in String::from_utf8_lossy(&bytes).lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buffer.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
+        while let Some(data) = pop_sse_data(&mut buffer) {
+            if data == b"[DONE]" {
+                return Ok(());
+            }
+            client
+                .send(tungstenite::Message::Text(
+                    String::from_utf8_lossy(&data).into_owned().into(),
+                ))
+                .await
+                .map_err(|e| e.to_string())?;
         }
-        client
-            .send(tungstenite::Message::Text(data.to_string().into()))
-            .await
-            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -7533,6 +7844,13 @@ fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_sse_parser_handles_crlf_and_multiple_data_lines() {
+        let mut buffer = b"event: message\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\nrest".to_vec();
+        assert_eq!(pop_sse_data(&mut buffer), Some(b"{\"a\":\n1}".to_vec()));
+        assert_eq!(buffer, b"rest");
+    }
 
     /// 只有 Worker 的 follow-current 请求才允许被换号。
     ///

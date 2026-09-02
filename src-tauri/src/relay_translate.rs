@@ -49,6 +49,10 @@ pub struct TranslatorState {
     seq_num: u64,
     full_content: String,
     full_reasoning_content: String,
+    thought_signature: Option<Value>,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
     message_idx: Option<usize>,
     item_id: Option<String>,
     next_idx: usize,
@@ -78,6 +82,10 @@ impl TranslatorState {
             seq_num: 0,
             full_content: String::new(),
             full_reasoning_content: String::new(),
+            thought_signature: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
             message_idx: None,
             item_id: None,
             next_idx: 0,
@@ -958,6 +966,21 @@ pub fn handle_chunk(state: &mut TranslatorState, chunk: &[u8]) -> Vec<Vec<u8>> {
         Err(_) => return out,
     };
 
+    if let Some(usage) = data.get("usage") {
+        state.input_tokens = usage
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(state.input_tokens);
+        state.output_tokens = usage
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(state.output_tokens);
+        state.total_tokens = usage
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| state.input_tokens.saturating_add(state.output_tokens));
+    }
+
     let choices = match data.get("choices").and_then(Value::as_array) {
         Some(c) if !c.is_empty() => c,
         _ => return out,
@@ -967,6 +990,13 @@ pub fn handle_chunk(state: &mut TranslatorState, chunk: &[u8]) -> Vec<Vec<u8>> {
         Some(d) if d.is_object() => d.clone(),
         _ => return out,
     };
+
+    if let Some(signature) = delta
+        .get("thought_signature")
+        .filter(|value| !value.is_null())
+    {
+        state.thought_signature = Some(signature.clone());
+    }
 
     // 1) Tool calls (incremental)
     if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -1188,15 +1218,19 @@ pub fn emit_completed(state: &mut TranslatorState) -> Vec<u8> {
         // 仍然带着 encrypted_content；process_reasoning_item 从中读出来填回
         // chat messages 的 reasoning_content 字段 —— MiMo 的"必须回传
         // reasoning_content"强校验直接通过，不再需要丢历史 workaround。
-        closing.push((
-            idx,
-            json!({
-                "id": item_id,
-                "type": "reasoning",
-                "summary": [{"type": "summary_text", "text": state.full_reasoning_content.clone()}],
-                "encrypted_content": state.full_reasoning_content.clone(),
-            }),
-        ));
+        let mut reasoning_item = json!({
+            "id": item_id,
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": state.full_reasoning_content.clone()}],
+            "encrypted_content": state.full_reasoning_content.clone(),
+        });
+        if let (Some(signature), Some(object)) = (
+            state.thought_signature.clone(),
+            reasoning_item.as_object_mut(),
+        ) {
+            object.insert("thought_signature".to_string(), signature);
+        }
+        closing.push((idx, reasoning_item));
     }
     for tc in state.tool_calls.values() {
         let mut item = json!({
@@ -1207,6 +1241,11 @@ pub fn emit_completed(state: &mut TranslatorState) -> Vec<u8> {
             "arguments": tc.arguments,
             "call_id": tc.call_id,
         });
+        if let (Some(signature), Some(object)) =
+            (state.thought_signature.clone(), item.as_object_mut())
+        {
+            object.insert("thought_signature".to_string(), signature);
+        }
         // Codex-side coercion: shell tools map onto local_shell_call.
         if matches!(
             tc.name.as_str(),
@@ -1248,9 +1287,9 @@ pub fn emit_completed(state: &mut TranslatorState) -> Vec<u8> {
         o.insert(
             "usage".to_string(),
             json!({
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
+                "input_tokens": state.input_tokens,
+                "output_tokens": state.output_tokens,
+                "total_tokens": state.total_tokens,
             }),
         );
         // 故意把 response.id 设成空串：codex 0.130 WS 客户端
@@ -1293,15 +1332,19 @@ fn collect_final_output(state: &TranslatorState) -> Value {
             .unwrap_or_else(|| format!("rs_{}", unix_ms()));
         // collect_final_output 进的是 response.completed.response.output；
         // 与 emit_completed 的 response.output_item.done 一致，都带 encrypted_content。
-        closing.push((
-            idx,
-            json!({
-                "id": item_id,
-                "type": "reasoning",
-                "summary": [{"type": "summary_text", "text": state.full_reasoning_content.clone()}],
-                "encrypted_content": state.full_reasoning_content.clone(),
-            }),
-        ));
+        let mut reasoning_item = json!({
+            "id": item_id,
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": state.full_reasoning_content.clone()}],
+            "encrypted_content": state.full_reasoning_content.clone(),
+        });
+        if let (Some(signature), Some(object)) = (
+            state.thought_signature.clone(),
+            reasoning_item.as_object_mut(),
+        ) {
+            object.insert("thought_signature".to_string(), signature);
+        }
+        closing.push((idx, reasoning_item));
     }
     for tc in state.tool_calls.values() {
         let mut item = json!({
@@ -1312,6 +1355,11 @@ fn collect_final_output(state: &TranslatorState) -> Value {
             "arguments": tc.arguments,
             "call_id": tc.call_id,
         });
+        if let (Some(signature), Some(object)) =
+            (state.thought_signature.clone(), item.as_object_mut())
+        {
+            object.insert("thought_signature".to_string(), signature);
+        }
         if matches!(
             tc.name.as_str(),
             "shell" | "container.exec" | "shell_command"
@@ -1388,6 +1436,12 @@ pub fn translate_sync_response(
                 "arguments": args_string.clone(),
                 "call_id": id,
             });
+            if let (Some(signature), Some(object)) = (
+                message.get("thought_signature").cloned(),
+                item.as_object_mut(),
+            ) {
+                object.insert("thought_signature".to_string(), signature);
+            }
             let name_str = item
                 .get("name")
                 .and_then(Value::as_str)
@@ -1427,11 +1481,18 @@ pub fn translate_sync_response(
     }
     if let Some(reasoning_content) = message.get("reasoning_content").and_then(Value::as_str) {
         if !reasoning_content.is_empty() {
-            output_items.push(json!({
+            let mut item = json!({
                 "id": format!("rs_{}", unix_ms()),
                 "type": "reasoning",
                 "summary": [{"type": "summary_text", "text": reasoning_content}],
-            }));
+            });
+            if let (Some(signature), Some(object)) = (
+                message.get("thought_signature").cloned(),
+                item.as_object_mut(),
+            ) {
+                object.insert("thought_signature".to_string(), signature);
+            }
+            output_items.push(item);
         }
     }
 

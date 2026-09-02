@@ -30,6 +30,14 @@ fn active_solo_until() -> &'static AtomicI64 {
     V.get_or_init(|| AtomicI64::new(0))
 }
 
+fn antigravity_refresh_locks(
+) -> &'static tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<
+        tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = OnceLock::new();
+    LOCKS.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Server 侧定时任务使用：是否有活跃 solo client？有则应跳过本地保活 / quota 刷新。
 pub fn solo_is_active() -> bool {
     active_solo_until().load(Ordering::Relaxed) > chrono::Utc::now().timestamp()
@@ -194,6 +202,12 @@ async fn route(
         if !id.is_empty() {
             match (method.clone(), sub) {
                 (Method::GET, Some("token")) => return handle_get_token(&state, id),
+                (Method::GET, Some("antigravity-token")) => {
+                    return handle_antigravity_token(&state, id, false).await;
+                }
+                (Method::POST, Some("antigravity-token")) => {
+                    return handle_antigravity_token(&state, id, true).await;
+                }
                 (Method::POST, Some("refresh")) => {
                     return handle_refresh_account(&state, id).await;
                 }
@@ -295,6 +309,141 @@ fn handle_get_token(state: &ApiState, id: &str) -> Response<ResponseBody> {
         ),
         None => json_resp(StatusCode::NOT_FOUND, json!({"error": "account not found"})),
     }
+}
+
+/// Client 的 Gemini 推理本机直出，但 Google RT/ST 仍由 Mini Server 唯一管理。
+/// 该端点在 per-account 锁内按需刷新，只返回短期 access token，永不返回 RT。
+async fn handle_antigravity_token(
+    state: &ApiState,
+    id: &str,
+    force_refresh: bool,
+) -> Response<ResponseBody> {
+    let account_lock = {
+        let mut locks = antigravity_refresh_locks().lock().await;
+        locks
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = account_lock.lock().await;
+
+    let (mut access_token, mut refresh_token, mut expires_at, project_id) = {
+        let store = match state.store.lock() {
+            Ok(store) => store,
+            Err(error) => return err_resp(error.to_string()),
+        };
+        let Some(account) = store.accounts.get(id) else {
+            return json_resp(StatusCode::NOT_FOUND, json!({"error":"account not found"}));
+        };
+        if !account.is_antigravity_oauth() {
+            return json_resp(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"account is not an Antigravity provider"}),
+            );
+        }
+        let tokens = account.auth_json.get("tokens").unwrap_or(&Value::Null);
+        (
+            tokens
+                .get("access_token")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            tokens
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .or(account.refresh_token.as_deref())
+                .unwrap_or_default()
+                .to_string(),
+            tokens
+                .get("expires_at")
+                .and_then(Value::as_str)
+                .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                .map(|value| value.with_timezone(&chrono::Utc)),
+            account
+                .auth_json
+                .get("project_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+
+    if project_id.is_empty() || refresh_token.is_empty() {
+        return json_resp(
+            StatusCode::UNAUTHORIZED,
+            json!({"error":"Google credential is incomplete"}),
+        );
+    }
+    let refresh_needed = force_refresh
+        || access_token.is_empty()
+        || expires_at
+            .map(|expires| expires <= chrono::Utc::now() + chrono::Duration::minutes(5))
+            .unwrap_or(true);
+    if refresh_needed {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(45))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => return err_resp(error.to_string()),
+        };
+        let config = crate::antigravity::oauth::OAuthClientConfig::from_environment();
+        let refreshed =
+            match crate::antigravity::oauth::refresh_access_token(&client, &config, &refresh_token)
+                .await
+            {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    return json_resp(StatusCode::UNAUTHORIZED, json!({"error":error}));
+                }
+            };
+        access_token = refreshed.access_token;
+        if let Some(rotated) = refreshed.refresh_token {
+            refresh_token = rotated;
+        }
+        expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(refreshed.expires_in));
+        let mut store = match state.store.lock() {
+            Ok(store) => store,
+            Err(error) => return err_resp(error.to_string()),
+        };
+        let Some(account) = store.accounts.get_mut(id) else {
+            return json_resp(StatusCode::NOT_FOUND, json!({"error":"account not found"}));
+        };
+        account.refresh_token = Some(refresh_token.clone());
+        if let Some(object) = account.auth_json.as_object_mut() {
+            let tokens = object.entry("tokens").or_insert_with(|| json!({}));
+            if let Some(tokens) = tokens.as_object_mut() {
+                tokens.insert(
+                    "access_token".to_string(),
+                    Value::String(access_token.clone()),
+                );
+                tokens.insert("refresh_token".to_string(), Value::String(refresh_token));
+                if let Some(expires_at) = expires_at {
+                    tokens.insert(
+                        "expires_at".to_string(),
+                        Value::String(expires_at.to_rfc3339()),
+                    );
+                }
+            }
+            object.insert(
+                "last_refresh".to_string(),
+                Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+        if let Err(error) = store.save() {
+            return err_resp(error);
+        }
+    }
+
+    json_resp(
+        StatusCode::OK,
+        json!({
+            "account_id": id,
+            "access_token": access_token,
+            "project_id": project_id,
+            "expires_at": expires_at.map(|value| value.to_rfc3339()),
+        }),
+    )
 }
 
 /// 强制刷新某账号的 access_token，返回刷新后的 auth_json（与 /token 同形）。

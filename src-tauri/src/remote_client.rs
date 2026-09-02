@@ -192,6 +192,85 @@ pub struct RemoteToken {
     pub refresh_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteAntigravityToken {
+    pub account_id: String,
+    pub access_token: String,
+    pub project_id: String,
+    pub expires_at: Option<String>,
+}
+
+/// 从 Mini Server 获取 Google 短期 access token 租约。
+/// Server 按需刷新 RT；Client 只在内存中缓存 ST，不写 accounts.json。
+pub async fn fetch_antigravity_token(
+    base_url: &str,
+    secret: &str,
+    id: &str,
+    force_refresh: bool,
+) -> Result<RemoteAntigravityToken, String> {
+    let url = format!("{}/accounts/{}/antigravity-token", trim_url(base_url), id);
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let request = if force_refresh {
+        client.post(url)
+    } else {
+        client.get(url)
+    };
+    let response = request
+        .header(AUTH_HEADER, secret)
+        .send()
+        .await
+        .map_err(|error| format!("Server Google token 租约失败: {error}"))?;
+    let status = response.status();
+    let body: Value = response.json().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        // Rolling upgrade: the old Mini build only has the generic token endpoint.
+        // Read it once, project the response down to an ST-only in-memory lease, and
+        // discard the returned auth document immediately. Never persist its RT locally.
+        if !force_refresh
+            && matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            )
+        {
+            let legacy = fetch_token(base_url, secret, id).await?;
+            let tokens = legacy
+                .auth_json
+                .get("tokens")
+                .ok_or_else(|| "Legacy Server Google token response has no tokens".to_string())?;
+            return Ok(RemoteAntigravityToken {
+                account_id: id.to_string(),
+                access_token: tokens
+                    .get("access_token")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Legacy Server Google token response has no ST".to_string())?
+                    .to_string(),
+                project_id: legacy
+                    .auth_json
+                    .get("project_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "Legacy Server Google token response has no project_id".to_string()
+                    })?
+                    .to_string(),
+                expires_at: tokens
+                    .get("expires_at")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+            });
+        }
+        return Err(body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Server Google token 租约失败")
+            .to_string());
+    }
+    serde_json::from_value(body).map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RemoteQuotaEntry {
     pub id: String,

@@ -21,9 +21,34 @@ fn spawn_mock_chat_completions_server(sse_body: &'static str) -> u16 {
             Ok(p) => p,
             Err(_) => return,
         };
-        // Read until end of headers (\r\n\r\n) — minimal HTTP/1.1 parsing.
+        // Read the complete request, not just one socket chunk. Closing the server
+        // side with unread POST bytes can emit a TCP RST and truncate the response
+        // tail (usually the final `[DONE]`) when the full suite runs in parallel.
+        let mut request = Vec::new();
         let mut buf = [0u8; 4096];
-        let _ = std::io::Read::read(&mut stream, &mut buf);
+        loop {
+            let read = match std::io::Read::read(&mut stream, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            request.extend_from_slice(&buf[..read]);
+            let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
         let header = "HTTP/1.1 200 OK\r\n\
                      Content-Type: text/event-stream; charset=utf-8\r\n\
                      Cache-Control: no-cache\r\n\

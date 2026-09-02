@@ -193,11 +193,12 @@ pub async fn fetch_project_id(
     client: &reqwest::Client,
     access_token: &str,
 ) -> Result<String, String> {
+    let user_agent = super::native::request_user_agent(client).await;
     let endpoint = format!("{CLOUD_CODE_ENDPOINT}/{API_VERSION}:loadCodeAssist");
     let response = client
         .post(endpoint)
         .bearer_auth(access_token)
-        .header("user-agent", "antigravity/2.11.0")
+        .header("user-agent", &user_agent)
         .json(&json!({"metadata": {"ideType": "ANTIGRAVITY"}}))
         .send()
         .await
@@ -231,13 +232,14 @@ async fn onboard_user(
     access_token: &str,
     tier_id: &str,
 ) -> Result<String, String> {
+    let user_agent = super::native::onboard_user_agent(client).await;
     let endpoint = format!("{DAILY_CLOUD_CODE_ENDPOINT}/{API_VERSION}:onboardUser");
     for _ in 0..5 {
         let response = client
             .post(&endpoint)
             .bearer_auth(access_token)
-            .header("user-agent", "antigravity/2.11.0")
-            .header("x-goog-api-client", "gl-node/22.0.0 antigravity/2.11.0")
+            .header("user-agent", &user_agent)
+            .header("x-goog-api-client", super::native::GOOGLE_API_CLIENT)
             .json(&json!({
                 "tier_id": tier_id,
                 "metadata": {

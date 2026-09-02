@@ -60,14 +60,27 @@ fn chat_to_gemini_request(chat: &Value) -> Result<Value, String> {
         }
 
         let mut parts = Vec::new();
+        let thought_signature = message.get("thought_signature").cloned();
         append_content_parts(message.get("content"), &mut parts);
         if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
             if !reasoning.is_empty() {
-                parts.push(json!({"text": reasoning, "thought": true}));
+                let mut thought = json!({"text": reasoning, "thought": true});
+                if message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_none()
+                {
+                    if let (Some(signature), Some(object)) =
+                        (thought_signature.clone(), thought.as_object_mut())
+                    {
+                        object.insert("thoughtSignature".to_string(), signature);
+                    }
+                }
+                parts.push(thought);
             }
         }
         if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-            for call in tool_calls {
+            for (index, call) in tool_calls.iter().enumerate() {
                 let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
                 let function = call.get("function").unwrap_or(&Value::Null);
                 let name = function
@@ -82,7 +95,15 @@ fn chat_to_gemini_request(chat: &Value) -> Result<Value, String> {
                 if !id.is_empty() {
                     call_names.insert(id.to_string(), name.to_string());
                 }
-                parts.push(json!({"functionCall": {"name": name, "args": arguments, "id": id}}));
+                let mut part = json!({"functionCall": {"name": name, "args": arguments, "id": id}});
+                if index == 0 {
+                    if let (Some(signature), Some(object)) =
+                        (thought_signature.clone(), part.as_object_mut())
+                    {
+                        object.insert("thoughtSignature".to_string(), signature);
+                    }
+                }
+                parts.push(part);
             }
         }
         if !parts.is_empty() {
@@ -111,10 +132,16 @@ fn chat_to_gemini_request(chat: &Value) -> Result<Value, String> {
                     Some(tool)
                 }?;
                 let name = function.get("name")?.as_str()?;
+                let parameters = sanitize_schema_value(
+                    function
+                        .get("parameters")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                );
                 Some(json!({
                     "name": name,
                     "description": function.get("description").cloned().unwrap_or(Value::String(String::new())),
-                    "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                    "parameters": parameters,
                 }))
             })
             .collect();
@@ -164,6 +191,133 @@ fn content_as_text(content: Option<&Value>) -> String {
     }
 }
 
+fn sanitize_schema_value(value: Value) -> Value {
+    sanitize_schema_node(value, false)
+}
+
+fn sanitize_schema_node(value: Value, property_map: bool) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|value| sanitize_schema_node(value, false))
+                .collect(),
+        ),
+        Value::Object(mut object) => {
+            // `properties` 下面的 key 是用户工具参数名，不是 Schema 关键字。
+            // 例如参数完全可以叫 `format` / `items` / `default`，绝不能删。
+            if property_map {
+                for value in object.values_mut() {
+                    *value = sanitize_schema_node(std::mem::take(value), false);
+                }
+                return Value::Object(object);
+            }
+            for union_key in ["anyOf", "oneOf"] {
+                if let Some(Value::Array(branches)) = object.remove(union_key) {
+                    let nullable = branches
+                        .iter()
+                        .any(|branch| branch.get("type").and_then(Value::as_str) == Some("null"));
+                    if let Some(branch) = branches
+                        .into_iter()
+                        .find(|branch| branch.get("type").and_then(Value::as_str) != Some("null"))
+                    {
+                        let mut selected = sanitize_schema_node(branch, false);
+                        if nullable {
+                            if let Some(selected_object) = selected.as_object_mut() {
+                                selected_object.insert("nullable".to_string(), Value::Bool(true));
+                            }
+                        }
+                        for (key, value) in object {
+                            if matches!(key.as_str(), "description" | "nullable") {
+                                if let Some(selected_object) = selected.as_object_mut() {
+                                    selected_object.entry(key).or_insert(value);
+                                }
+                            }
+                        }
+                        return selected;
+                    }
+                }
+            }
+
+            if let Some(Value::Array(types)) = object.get("type").cloned() {
+                let nullable = types.iter().any(|value| value.as_str() == Some("null"));
+                if let Some(kind) = types
+                    .into_iter()
+                    .find(|value| value.as_str() != Some("null"))
+                {
+                    object.insert("type".to_string(), kind);
+                }
+                if nullable {
+                    object.insert("nullable".to_string(), Value::Bool(true));
+                }
+            }
+
+            const UNSUPPORTED: &[&str] = &[
+                "$schema",
+                "$id",
+                "$ref",
+                "$defs",
+                "definitions",
+                "title",
+                "format",
+                "default",
+                "const",
+                "examples",
+                "example",
+                "pattern",
+                "patternProperties",
+                "additionalProperties",
+                "minLength",
+                "maxLength",
+                "minimum",
+                "maximum",
+                "exclusiveMinimum",
+                "exclusiveMaximum",
+                "minItems",
+                "maxItems",
+                "uniqueItems",
+                "allOf",
+                "if",
+                "then",
+                "else",
+                "not",
+                "dependentSchemas",
+                "dependentRequired",
+                "unevaluatedProperties",
+                "propertyNames",
+            ];
+            object.retain(|key, _| !UNSUPPORTED.contains(&key.as_str()) && !key.starts_with("x-"));
+            for (key, value) in object.iter_mut() {
+                *value = sanitize_schema_node(std::mem::take(value), key == "properties");
+            }
+            if object.get("type").and_then(Value::as_str) == Some("array")
+                && !object.contains_key("items")
+            {
+                object.insert("items".to_string(), json!({"type":"string"}));
+            }
+            if let (Some(Value::Array(required)), Some(Value::Object(properties))) =
+                (object.get("required").cloned(), object.get("properties"))
+            {
+                let filtered: Vec<Value> = required
+                    .into_iter()
+                    .filter(|name| {
+                        name.as_str()
+                            .map(|name| properties.contains_key(name))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                if filtered.is_empty() {
+                    object.remove("required");
+                } else {
+                    object.insert("required".to_string(), Value::Array(filtered));
+                }
+            }
+            Value::Object(object)
+        }
+        other => other,
+    }
+}
+
 pub fn antigravity_json_to_chat_response(raw: &[u8], model: &str) -> Result<Vec<u8>, String> {
     let envelope: Value = serde_json::from_slice(raw).map_err(|e| e.to_string())?;
     let response = envelope.get("response").unwrap_or(&envelope);
@@ -175,7 +329,11 @@ pub fn antigravity_json_to_chat_response(raw: &[u8], model: &str) -> Result<Vec<
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
+    let mut thought_signature = None;
     for part in parts {
+        if thought_signature.is_none() {
+            thought_signature = part.get("thoughtSignature").cloned();
+        }
         if part.get("thought").and_then(Value::as_bool) == Some(true) {
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 reasoning.push_str(text);
@@ -199,13 +357,106 @@ pub fn antigravity_json_to_chat_response(raw: &[u8], model: &str) -> Result<Vec<
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
     }
+    if let Some(signature) = thought_signature {
+        message["thought_signature"] = signature;
+    }
+    let usage = antigravity_usage(response)
+        .unwrap_or_else(|| json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
     serde_json::to_vec(&json!({
         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         "object": "chat.completion",
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "usage": usage,
     }))
     .map_err(|e| e.to_string())
+}
+
+pub fn antigravity_sse_event_to_chat_chunk(raw: &[u8], model: &str) -> Option<Vec<u8>> {
+    let envelope: Value = serde_json::from_slice(raw).ok()?;
+    let response = envelope.get("response").unwrap_or(&envelope);
+    let parts = response
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    let mut thought_signature = None;
+    for part in parts {
+        if thought_signature.is_none() {
+            thought_signature = part.get("thoughtSignature").cloned();
+        }
+        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                reasoning.push_str(text);
+            }
+        } else if let Some(text) = part.get("text").and_then(Value::as_str) {
+            content.push_str(text);
+        } else if let Some(call) = part.get("functionCall") {
+            let name = call.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
+            tool_calls.push(json!({
+                "index": tool_calls.len(),
+                "id": call.get("id").and_then(Value::as_str).map(ToOwned::to_owned).unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4())),
+                "type": "function",
+                "function": {"name": name, "arguments": args.to_string()},
+            }));
+        }
+    }
+    let mut delta = Map::new();
+    if !content.is_empty() {
+        delta.insert("content".to_string(), Value::String(content));
+    }
+    if !reasoning.is_empty() {
+        delta.insert("reasoning_content".to_string(), Value::String(reasoning));
+    }
+    if !tool_calls.is_empty() {
+        delta.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    if let Some(signature) = thought_signature {
+        delta.insert("thought_signature".to_string(), signature);
+    }
+    let finish_reason = response
+        .pointer("/candidates/0/finishReason")
+        .filter(|value| !value.is_null())
+        .map(|_| Value::String("stop".to_string()))
+        .unwrap_or(Value::Null);
+    if delta.is_empty() && finish_reason.is_null() {
+        return None;
+    }
+    let mut chunk = json!({
+        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    });
+    if let Some(usage) = antigravity_usage(response) {
+        chunk["usage"] = usage;
+    }
+    serde_json::to_vec(&chunk).ok()
+}
+
+fn antigravity_usage(response: &Value) -> Option<Value> {
+    let usage = response.get("usageMetadata")?;
+    let input = usage
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = usage
+        .get("candidatesTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = usage
+        .get("totalTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input.saturating_add(output));
+    Some(json!({
+        "prompt_tokens": input,
+        "completion_tokens": output,
+        "total_tokens": total,
+    }))
 }
 
 pub fn antigravity_response_to_codex(
@@ -231,6 +482,9 @@ pub fn antigravity_response_to_codex(
     }
     if let Some(tool_calls) = message.get("tool_calls") {
         delta.insert("tool_calls".to_string(), tool_calls.clone());
+    }
+    if let Some(signature) = message.get("thought_signature") {
+        delta.insert("thought_signature".to_string(), signature.clone());
     }
     let chunk = format!(
         "data: {}\n\n",
@@ -298,5 +552,49 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("response.output_text.delta"));
         assert!(text.contains("response.completed"));
+    }
+
+    #[test]
+    fn sanitizes_tool_schema_without_touching_property_names() {
+        let schema = json!({
+            "type": "object",
+            "title": "tool",
+            "properties": {
+                "format": {"type": "string", "format": "uri", "default": "x"},
+                "items": {"type": "array"},
+                "choice": {"anyOf": [{"type":"string"}, {"type":"null"}]}
+            },
+            "required": ["format", "missing"]
+        });
+        let cleaned = sanitize_schema_value(schema);
+        assert!(cleaned.get("title").is_none());
+        assert_eq!(cleaned["properties"]["format"]["type"], "string");
+        assert!(cleaned["properties"]["format"].get("format").is_none());
+        assert_eq!(cleaned["properties"]["items"]["items"]["type"], "string");
+        assert_eq!(cleaned["properties"]["choice"]["nullable"], true);
+        assert_eq!(cleaned["required"], json!(["format"]));
+    }
+
+    #[test]
+    fn preserves_thought_signature_in_stream_chunk() {
+        let raw = json!({"response":{"candidates":[{"content":{"parts":[{
+            "thought": true,
+            "text": "thinking",
+            "thoughtSignature": "sig-native"
+        }]}}]}});
+        let chunk = antigravity_sse_event_to_chat_chunk(
+            &serde_json::to_vec(&raw).unwrap(),
+            "gemini-3.7-flash-high",
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&chunk).unwrap();
+        assert_eq!(
+            value["choices"][0]["delta"]["reasoning_content"],
+            "thinking"
+        );
+        assert_eq!(
+            value["choices"][0]["delta"]["thought_signature"],
+            "sig-native"
+        );
     }
 }

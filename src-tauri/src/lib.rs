@@ -5751,6 +5751,14 @@ async fn remote_sync_skills(state: State<'_, AppState>) -> Result<SkillSyncRepor
 }
 
 /// 按当前 settings 启动/重启 server 端 HTTP API（便于 UI 切换模式后不用重启 App）
+fn effective_remote_server_port(configured: u16) -> u16 {
+    std::env::var("CODEX_SWITCHER_REMOTE_SERVER_PORT_OVERRIDE")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(configured)
+}
+
 #[tauri::command]
 fn remote_restart_server(state: State<AppState>, app: tauri::AppHandle) -> Result<String, String> {
     let (mode, port, bind, secret) = {
@@ -5778,6 +5786,7 @@ fn remote_restart_server(state: State<AppState>, app: tauri::AppHandle) -> Resul
     if secret.is_empty() {
         return Err("共享密钥为空，请先生成".to_string());
     }
+    let port = effective_remote_server_port(port);
     let handle = remote_server::spawn_remote_server(
         state.store.clone(),
         bind.clone(),
@@ -5970,6 +5979,7 @@ pub fn run() {
                 if remote_secret.is_empty() {
                     eprintln!("[RemoteServer] shared_secret 为空，拒绝启动（请在 UI 配置）");
                 } else {
+                    let remote_port = effective_remote_server_port(remote_port);
                     let handle = remote_server::spawn_remote_server(
                         state.store.clone(),
                         remote_bind,
