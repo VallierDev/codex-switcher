@@ -1305,8 +1305,8 @@ fn antigravity_codex_catalog_entry(
         "supports_parallel_tool_calls".into(),
         serde_json::json!(true),
     );
-    object.insert("prefer_websockets".into(), serde_json::json!(false));
-    object.insert("supports_websockets".into(), serde_json::json!(false));
+    object.insert("prefer_websockets".into(), serde_json::json!(true));
+    object.insert("supports_websockets".into(), serde_json::json!(true));
     object.insert(
         "supports_image_detail_original".into(),
         serde_json::json!(true),
@@ -1317,6 +1317,11 @@ fn antigravity_codex_catalog_entry(
     object.insert("visibility".into(), serde_json::json!("list"));
     object.insert("supported_in_api".into(), serde_json::json!(true));
     object.insert("priority".into(), serde_json::json!(40));
+    // Never inherit lifecycle metadata from the native model used as a schema
+    // template. Codex Desktop treats a past `upgrade.retirement_at` as a hard
+    // disable signal and aborts the turn before any request reaches the proxy.
+    object.insert("upgrade".into(), serde_json::Value::Null);
+    object.insert("retirement_at".into(), serde_json::Value::Null);
     entry
 }
 
@@ -1405,7 +1410,12 @@ async fn handle_models_with_antigravity(
             let template = models
                 .iter()
                 .find(|model| {
-                    model.get("slug").and_then(serde_json::Value::as_str) == Some("gpt-5.4-mini")
+                    model.get("slug").and_then(serde_json::Value::as_str) == Some("gpt-5.6-luna")
+                })
+                .or_else(|| {
+                    models
+                        .iter()
+                        .find(|model| model.get("upgrade").is_none_or(serde_json::Value::is_null))
                 })
                 .cloned()
                 .or_else(|| models.first().cloned());
@@ -6418,18 +6428,36 @@ async fn bridge_websockets<S1, S2>(
         + futures_util::Sink<tungstenite::Message, Error = tungstenite::Error>
         + Unpin,
 {
-    // 握手 header 不含模型，首个 response.create 才含 model。先读一帧做精确分流：
-    // GPT 帧仍进入原 bridge；只有明确的 Antigravity 模型才走 Google 兼容层。
-    let first_message = client.next().await;
-    if first_message
-        .as_ref()
-        .and_then(|result| result.as_ref().ok())
-        .and_then(ws_message_model)
-        .map(|model| crate::antigravity::is_antigravity_model(&model))
+    // Desktop 0.151 may send session/prewarm frames before the first response.create,
+    // and may nest the model under `response.model`. Buffer a bounded prefix until
+    // the actual model-bearing frame arrives; deciding from frame 1 routes Gemini
+    // into the already-open ChatGPT socket and leaves the Desktop turn hanging.
+    let mut pending = std::collections::VecDeque::new();
+    let detected_model = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for _ in 0..16 {
+            let message = client.next().await?;
+            let model = message.as_ref().ok().and_then(ws_message_model);
+            let terminal = message
+                .as_ref()
+                .map(|message| message.is_close())
+                .unwrap_or(true);
+            pending.push_back(message);
+            if model.is_some() || terminal {
+                return model;
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    if detected_model
+        .as_deref()
+        .map(crate::antigravity::is_antigravity_model)
         .unwrap_or(false)
     {
         drop(upstream);
-        bridge_antigravity_websocket(client, first_message, state).await;
+        bridge_antigravity_websocket(client, pending, state).await;
         return;
     }
 
@@ -6452,11 +6480,11 @@ async fn bridge_websockets<S1, S2>(
     let c2u_count_b = c2u_count.clone();
     let u2c_count_b = u2c_count.clone();
 
-    // GPT/原生模型：把刚才为识别模型而读取的首帧原样送入原上游，之后逻辑不变。
-    if let Some(first_message) = first_message {
-        match first_message {
+    // GPT/原生模型：把为识别模型缓冲的所有帧原样、按顺序送入旧上游。
+    while let Some(buffered_message) = pending.pop_front() {
+        match buffered_message {
             Ok(message) if !message.is_close() => {
-                c2u_count_b.store(1, std::sync::atomic::Ordering::Relaxed);
+                c2u_count_b.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let tungstenite::Message::Text(ref text) = message {
                     if request_is_spark_model(text.as_bytes()) {
                         ws_is_spark_w.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -6787,12 +6815,17 @@ fn ws_message_model(message: &tungstenite::Message) -> Option<String> {
     let tungstenite::Message::Text(text) = message else {
         return None;
     };
-    request_model(text.as_bytes())
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value
+        .get("model")
+        .or_else(|| value.pointer("/response/model"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 async fn bridge_antigravity_websocket<S>(
     mut client: S,
-    first_message: Option<Result<tungstenite::Message, tungstenite::Error>>,
+    mut pending: std::collections::VecDeque<Result<tungstenite::Message, tungstenite::Error>>,
     state: Arc<ProxyState>,
 ) where
     S: futures_util::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
@@ -6808,10 +6841,6 @@ async fn bridge_antigravity_websocket<S>(
         Ok(client) => client,
         Err(_) => return,
     };
-    let mut pending = std::collections::VecDeque::new();
-    if let Some(message) = first_message {
-        pending.push_back(message);
-    }
     loop {
         let message = match pending.pop_front() {
             Some(message) => Some(message),
@@ -7844,6 +7873,62 @@ fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_catalog_never_inherits_template_retirement() {
+        let template = serde_json::json!({
+            "slug": "retired-native-model",
+            "upgrade": {
+                "model": "gpt-5.6-luna",
+                "retirement_at": "2026-08-31T19:00:00Z"
+            },
+            "retirement_at": "2026-08-31T19:00:00Z",
+            "supported_in_api": true
+        });
+        let entry = antigravity_codex_catalog_entry(
+            crate::antigravity::models::find_model("gemini-3.7-flash-high").unwrap(),
+            Some(&template),
+        );
+        assert_eq!(entry["slug"], "gemini-3.7-flash-high");
+        assert!(entry["upgrade"].is_null());
+        assert!(entry["retirement_at"].is_null());
+        assert_eq!(entry["prefer_websockets"], true);
+        assert_eq!(entry["supports_websockets"], true);
+    }
+
+    #[test]
+    fn websocket_model_detection_accepts_desktop_nested_response_shape() {
+        let top_level = tungstenite::Message::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "gemini-3.7-flash-high"
+            })
+            .to_string()
+            .into(),
+        );
+        let nested = tungstenite::Message::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "response": {"model": "gemini-3.7-flash-high"}
+            })
+            .to_string()
+            .into(),
+        );
+        let prewarm = tungstenite::Message::Text(
+            serde_json::json!({"type": "session.update"})
+                .to_string()
+                .into(),
+        );
+        assert_eq!(
+            ws_message_model(&top_level).as_deref(),
+            Some("gemini-3.7-flash-high")
+        );
+        assert_eq!(
+            ws_message_model(&nested).as_deref(),
+            Some("gemini-3.7-flash-high")
+        );
+        assert_eq!(ws_message_model(&prewarm), None);
+    }
 
     #[test]
     fn antigravity_sse_parser_handles_crlf_and_multiple_data_lines() {
