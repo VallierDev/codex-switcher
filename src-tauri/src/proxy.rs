@@ -1292,6 +1292,49 @@ fn antigravity_codex_catalog_entry(
     object.insert("slug".into(), serde_json::json!(model.id));
     object.insert("display_name".into(), serde_json::json!(model.display_name));
     object.insert("description".into(), serde_json::json!(model.description));
+    let identity = format!(
+        "You are Codex, a coding agent powered by {} through Google Antigravity.",
+        model.display_name
+    );
+    if let Some(base) = object
+        .get("base_instructions")
+        .and_then(serde_json::Value::as_str)
+    {
+        let rewritten = base
+            .replacen(
+                "You are Codex, a coding agent based on GPT-5.",
+                &identity,
+                1,
+            )
+            .replacen("You are Codex, an agent based on GPT-5.", &identity, 1);
+        object.insert(
+            "base_instructions".into(),
+            serde_json::Value::String(rewritten),
+        );
+    }
+    if let Some(template) = object
+        .get("model_messages")
+        .and_then(|messages| messages.get("instructions_template"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+    {
+        if let Some(model_messages) = object
+            .get_mut("model_messages")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            let rewritten = template
+                .replacen(
+                    "You are Codex, a coding agent based on GPT-5.",
+                    &identity,
+                    1,
+                )
+                .replacen("You are Codex, an agent based on GPT-5.", &identity, 1);
+            model_messages.insert(
+                "instructions_template".into(),
+                serde_json::Value::String(rewritten),
+            );
+        }
+    }
     object.insert(
         "context_window".into(),
         serde_json::json!(model.context_length),
@@ -7925,7 +7968,11 @@ mod tests {
                 "retirement_at": "2026-08-31T19:00:00Z"
             },
             "retirement_at": "2026-08-31T19:00:00Z",
-            "supported_in_api": true
+            "supported_in_api": true,
+            "base_instructions": "You are Codex, an agent based on GPT-5. Keep helping.",
+            "model_messages": {
+                "instructions_template": "You are Codex, an agent based on GPT-5. {{ personality }}"
+            }
         });
         let entry = antigravity_codex_catalog_entry(
             crate::antigravity::models::find_model("gemini-3.7-flash-high").unwrap(),
@@ -7936,6 +7983,18 @@ mod tests {
         assert!(entry["retirement_at"].is_null());
         assert_eq!(entry["prefer_websockets"], true);
         assert_eq!(entry["supports_websockets"], true);
+        assert!(entry["base_instructions"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("powered by Gemini 3.7 Flash"));
+        assert!(!entry["base_instructions"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("based on GPT-5"));
+        assert!(entry["model_messages"]["instructions_template"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("powered by Gemini 3.7 Flash"));
     }
 
     #[test]
