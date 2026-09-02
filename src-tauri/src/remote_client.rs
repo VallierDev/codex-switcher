@@ -198,6 +198,8 @@ pub struct RemoteQuotaEntry {
     #[serde(default)]
     pub cached_quota: Option<crate::account::CachedQuota>,
     #[serde(default)]
+    pub antigravity_model_quotas: Option<Value>,
+    #[serde(default)]
     pub window_priming: Option<crate::account::WindowPrimingState>,
     #[serde(default)]
     pub is_banned: bool,
@@ -327,6 +329,43 @@ pub async fn upsert_account(
     resp.json::<UpsertOutcome>()
         .await
         .map_err(|e| format!("解析 upsert 响应失败: {}", e))
+}
+
+/// Client 模式把 Google OAuth code 交给权威 Server 完成交换。
+/// 返回值是去除 token 的账号镜像，真实 refresh token 只落 Server。
+pub async fn complete_antigravity_oauth(
+    base_url: &str,
+    secret: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<Account, String> {
+    let url = format!("{}/antigravity/oauth/complete", trim_url(base_url));
+    let response = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?
+        .post(url)
+        .header(AUTH_HEADER, secret)
+        .json(&serde_json::json!({"code": code, "redirect_uri": redirect_uri}))
+        .send()
+        .await
+        .map_err(|e| format!("Server Google OAuth 请求失败: {e}"))?;
+    let status = response.status();
+    let body: Value = response.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Server Google OAuth 失败")
+            .to_string());
+    }
+    serde_json::from_value(
+        body.get("account")
+            .cloned()
+            .ok_or_else(|| "Server OAuth 响应缺少 account".to_string())?,
+    )
+    .map_err(|e| format!("解析 Google 账号镜像失败: {e}"))
 }
 
 /// 删除 Server 上指定账号

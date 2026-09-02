@@ -1285,6 +1285,12 @@
     color: #a855f7;
 }
 
+.badge.kind-antigravity {
+    color: #0f7b5a;
+    background: rgba(52, 168, 83, 0.14);
+    border-color: rgba(52, 168, 83, 0.32);
+}
+
 /* Coding Plan / Token Plan 类（厂商自家订阅） */
 .badge.kind-codingplan {
     background: rgba(245, 158, 11, 0.14);

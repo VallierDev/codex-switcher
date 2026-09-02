@@ -174,6 +174,10 @@ async fn route(
         return handle_solo_current(&state, req).await;
     }
 
+    if path == "/antigravity/oauth/complete" && method == Method::POST {
+        return handle_antigravity_oauth_complete(&state, req).await;
+    }
+
     if path == "/accounts" {
         match method {
             Method::GET => return handle_list(&state),
@@ -254,6 +258,7 @@ fn handle_list_quota(state: &ApiState) -> Response<ResponseBody> {
                 "id": a.id,
                 "name": a.name,
                 "cached_quota": a.cached_quota,
+                "antigravity_model_quotas": a.auth_json.get("model_quotas").cloned(),
                 "window_priming": a.window_priming,
                 "is_banned": a.is_banned,
                 "is_token_invalid": a.is_token_invalid,
@@ -302,16 +307,16 @@ fn handle_get_token(state: &ApiState, id: &str) -> Response<ResponseBody> {
 /// reused 错误 = 瞬时并发(此刻 store 已被赢家刷成最新)——不当失败,直接回读 store 里
 /// 当前(大概率已新鲜)的 auth_json 返回。
 async fn handle_refresh_token(state: &ApiState, id: &str) -> Response<ResponseBody> {
-    let is_relay = state
+    let is_openai_account = state
         .store
         .lock()
         .ok()
-        .and_then(|s| s.accounts.get(id).map(|a| a.is_relay()))
+        .and_then(|s| s.accounts.get(id).map(|a| a.is_openai_account()))
         .unwrap_or(false);
-    if is_relay {
+    if !is_openai_account {
         return json_resp(
             StatusCode::BAD_REQUEST,
-            json!({"error": "relay account has no refresh_token"}),
+            json!({"error": "provider account does not use OpenAI refresh_token"}),
         );
     }
 
@@ -354,6 +359,84 @@ struct UpsertResult {
     upserted: &'static str,
     quota_refreshed: bool,
     quota_error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AntigravityOAuthCompletePayload {
+    code: String,
+    redirect_uri: String,
+}
+
+async fn handle_antigravity_oauth_complete(
+    state: &ApiState,
+    req: Request<Incoming>,
+) -> Response<ResponseBody> {
+    let body = match req.collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(error) => return err_resp(format!("读取 OAuth body 失败: {error}")),
+    };
+    let payload: AntigravityOAuthCompletePayload = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return json_resp(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("OAuth JSON 解析失败: {error}")}),
+            )
+        }
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return err_resp(error.to_string()),
+    };
+    let config = crate::antigravity::oauth::OAuthClientConfig::from_environment();
+    let credential = match crate::antigravity::oauth::complete_credential(
+        &client,
+        &config,
+        &payload.code,
+        &payload.redirect_uri,
+    )
+    .await
+    {
+        Ok(credential) => credential,
+        Err(error) => return json_resp(StatusCode::BAD_REQUEST, json!({"error": error})),
+    };
+    let mut auth_json = credential.to_auth_json();
+    if let Ok(quotas) = crate::antigravity::quota::fetch_model_quotas(
+        &client,
+        &credential.access_token,
+        &credential.project_id,
+    )
+    .await
+    {
+        crate::antigravity::quota::write_model_quotas(&mut auth_json, &quotas);
+    }
+    let account = {
+        let mut store = match state.store.lock() {
+            Ok(store) => store,
+            Err(error) => return err_resp(error.to_string()),
+        };
+        let account = store.add_antigravity_account(
+            credential.email.clone(),
+            auth_json,
+            Some("Google Antigravity OAuth".to_string()),
+        );
+        if let Err(error) = store.save() {
+            return err_resp(error);
+        }
+        account
+    };
+    let mut mirror = account;
+    mirror.refresh_token = None;
+    mirror.auth_json = json!({
+        "provider": "antigravity",
+        "email": mirror.name,
+        "project_id": mirror.auth_json.get("project_id").cloned().unwrap_or(Value::Null),
+    });
+    let _ = state.app_handle.emit("accounts-updated", ());
+    json_resp(StatusCode::OK, json!({"account": mirror}))
 }
 
 async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<ResponseBody> {
@@ -405,6 +488,27 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
         let mut to_write = incoming;
         to_write.id = final_id.clone();
         if let Some(old) = store.accounts.get(&final_id) {
+            // Client 只保存 Google 账号的无密钥镜像。用户在 Client 修改备注/
+            // 到期日或手动点“推送 Server”时，普通 upsert 也可能被触发。
+            // Server 是 Google refresh token 的唯一写者：无 token 镜像只允许更新
+            // 非密钥字段，绝不能覆盖 Server 上的认证材料。
+            if old.is_antigravity_oauth()
+                && to_write.is_antigravity_oauth()
+                && to_write
+                    .auth_json
+                    .pointer("/tokens/refresh_token")
+                    .and_then(Value::as_str)
+                    .is_none()
+            {
+                let incoming_quotas = to_write.auth_json.get("model_quotas").cloned();
+                to_write.auth_json = old.auth_json.clone();
+                if let (Some(quotas), Some(object)) =
+                    (incoming_quotas, to_write.auth_json.as_object_mut())
+                {
+                    object.insert("model_quotas".to_string(), quotas);
+                }
+                to_write.refresh_token = old.refresh_token.clone();
+            }
             if action == "merged" {
                 to_write.created_at = old.created_at.clone();
                 if to_write.notes.is_none() {
@@ -431,6 +535,17 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
             to_write
                 .window_priming
                 .merge_runtime_watermarks_from(&old.window_priming);
+        } else if to_write.is_antigravity_oauth()
+            && to_write
+                .auth_json
+                .pointer("/tokens/refresh_token")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return json_resp(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "tokenless Google mirror cannot create a Server credential"}),
+            );
         }
         if let Err(e) = upsert_account(&mut store, to_write) {
             return err_resp(e);
@@ -475,17 +590,16 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
     let mut quota_refreshed = false;
     let mut quota_error: Option<String> = None;
 
-    // Relay 账号不走 OpenAI usage 接口（必然失败 + 错误地标 is_token_invalid）。
-    // Relay 余额由各 client 主动 refresh_relay_usage 拉取并展示，Server 不参与。
-    let is_relay = state
+    // 非 OpenAI Provider 账号不走 OpenAI usage/refresh 接口。
+    let is_openai_account = state
         .store
         .lock()
         .ok()
-        .and_then(|s| s.accounts.get(&id).map(|a| a.is_relay()))
+        .and_then(|s| s.accounts.get(&id).map(|a| a.is_openai_account()))
         .unwrap_or(false);
 
-    let access_token = if is_relay {
-        None // 跳过下面的 fetch_usage_direct 分支
+    let access_token = if !is_openai_account {
+        None // 跳过下面的 OpenAI fetch_usage_direct 分支
     } else {
         match access_token_opt {
             Some(t) => Some(t),
@@ -629,13 +743,16 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
             || crate::scheduler::is_revoked_error(error)
         {
             let _ = state.app_handle.emit("accounts-updated", ());
-            return json_resp(StatusCode::BAD_REQUEST, json!({
-                "error": if crate::scheduler::is_logged_out_error(error) {
-                    "ACCOUNT_LOGGED_OUT:登录已失效，refresh_token 已过期或被撤销，请重新登录"
-                } else {
-                    error
-                }
-            }));
+            return json_resp(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": if crate::scheduler::is_logged_out_error(error) {
+                        "ACCOUNT_LOGGED_OUT:登录已失效，refresh_token 已过期或被撤销，请重新登录"
+                    } else {
+                        error
+                    }
+                }),
+            );
         }
     }
 
@@ -682,7 +799,7 @@ fn handle_delete(state: &ApiState, id: &str) -> Response<ResponseBody> {
 async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<ResponseBody> {
     let id = id.to_string();
 
-    let (access_token_opt, account_id, refresh_token, is_relay) = {
+    let (access_token_opt, account_id, refresh_token, is_openai_account) = {
         let store = match state.store.lock() {
             Ok(s) => s,
             Err(e) => return err_resp(format!("锁获取失败: {}", e)),
@@ -694,7 +811,7 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
                 a.refresh_token
                     .clone()
                     .or_else(|| AccountStore::extract_refresh_token(&a.auth_json)),
-                a.is_relay(),
+                a.is_openai_account(),
             ),
             None => {
                 return json_resp(StatusCode::NOT_FOUND, json!({"error": "account not found"}));
@@ -702,12 +819,11 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
         }
     };
 
-    // Relay 账号：Server 不查 OpenAI usage（会失败 + 误标 token_invalid）
-    // Relay 余额由 client 自己 refresh_relay_usage，Server 这里直接返回 ok。
-    if is_relay {
+    // 非 OpenAI Provider 账号：Server 不查 OpenAI usage。
+    if !is_openai_account {
         return json_resp(
             StatusCode::OK,
-            json!({"ok": true, "skipped": "relay account; client-side refresh_relay_usage"}),
+            json!({"ok": true, "skipped": "provider account; no OpenAI usage refresh"}),
         );
     }
 

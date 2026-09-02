@@ -8,6 +8,7 @@ const KIND_BADGE: Record<ReturnType<typeof effectiveKind>, { label: string; clas
     chatgpt_oauth: { label: '订阅', className: 'badge kind-chatgpt' },
     openai_key: { label: 'API', className: 'badge kind-openai' },
     relay: { label: '中转', className: 'badge kind-relay' },
+    antigravity_oauth: { label: 'Google', className: 'badge kind-antigravity' },
 };
 
 /** Relay 类账号在 row 上展示哪个标签。新字段 `relay_category` 是权威来源，
@@ -22,6 +23,24 @@ function relayCategoryBadge(account: Account): { label: string; className: strin
         default:
             return { label: '中转', className: 'badge kind-relay' };
     }
+}
+
+interface AntigravityModelQuota {
+    remaining_fraction: number;
+    reset_time?: string | null;
+    updated_at?: string;
+}
+
+const ANTIGRAVITY_QUOTA_LABELS: Record<string, string> = {
+    'gemini-3.7-flash-high': 'G3.7 Flash',
+    'gemini-3.6-flash-high': 'G3.6 Flash',
+    'gemini-pro-agent': 'G3.1 Pro H',
+    'gemini-3.1-pro-low': 'G3.1 Pro L',
+};
+
+function antigravityModelQuotas(account: Account): Record<string, AntigravityModelQuota> {
+    const auth = account.auth_json as { model_quotas?: Record<string, AntigravityModelQuota> } | null;
+    return auth?.model_quotas ?? {};
 }
 import { useShortCountdown } from '../hooks/useCountdown';
 import './AccountList.css';
@@ -165,7 +184,7 @@ interface UsageData {
     spark?: SparkWindows | null;
 }
 
-type FilterType = 'all' | 'sub' | 'plus' | 'pro' | 'team' | 'free' | 'relay' | 'coding_plan' | 'third_party';
+type FilterType = 'all' | 'sub' | 'google' | 'plus' | 'pro' | 'team' | 'free' | 'relay' | 'coding_plan' | 'third_party';
 
 interface AccountListProps {
     accounts: Account[];
@@ -533,6 +552,7 @@ export function AccountList({
                 if (filter === 'coding_plan') return isRelay && a.relay_category === 'coding_plan';
                 if (filter === 'third_party') return isRelay && a.relay_category === 'third_party';
                 if (isRelay) return false; // 其它 plan 过滤胶囊只看订阅类
+                if (filter === 'google') return effectiveKind(a) === 'antigravity_oauth';
                 // Sub = 所有 ChatGPT 订阅号（不含 Relay / OpenAI Key）
                 if (filter === 'sub') return effectiveKind(a) === 'chatgpt_oauth';
                 const type = usageMap[a.id]?.plan_type?.toLowerCase() || '';
@@ -547,7 +567,7 @@ export function AccountList({
     }, [accounts, searchQuery, filter, usageMap]);
 
     const filterCounts = useMemo(() => {
-        const counts = { all: accounts.length, sub: 0, pro: 0, plus: 0, team: 0, free: 0, relay: 0, coding_plan: 0, third_party: 0 };
+        const counts = { all: accounts.length, sub: 0, google: 0, pro: 0, plus: 0, team: 0, free: 0, relay: 0, coding_plan: 0, third_party: 0 };
         accounts.forEach(a => {
             const kind = effectiveKind(a);
             if (kind === 'relay') {
@@ -555,6 +575,10 @@ export function AccountList({
                 if (cat === 'coding_plan') counts.coding_plan++;
                 else if (cat === 'third_party') counts.third_party++;
                 else counts.relay++;
+                return;
+            }
+            if (kind === 'antigravity_oauth') {
+                counts.google++;
                 return;
             }
             // Sub = ChatGPT 订阅类（所有 plan tier 合在一起）
@@ -814,11 +838,12 @@ export function AccountList({
                     <input type="text" placeholder="搜索邮箱..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
                 </div>
                 <div className="filter-group">
-                    {(['all', 'sub', 'pro', 'plus', 'team', 'free', 'relay', 'coding_plan', 'third_party'] as const).map(t => {
+                    {(['all', 'sub', 'google', 'pro', 'plus', 'team', 'free', 'relay', 'coding_plan', 'third_party'] as const).map(t => {
                         const isRelayLike = t === 'relay' || t === 'coding_plan' || t === 'third_party';
                         const isSubGroup = t === 'sub';
                         const label = t === 'all' ? 'ALL'
                             : t === 'sub' ? 'Sub'
+                            : t === 'google' ? 'Google'
                             : t === 'coding_plan' ? 'Plan'
                             : t === 'third_party' ? '三方'
                             : t === 'relay' ? '中转'
@@ -1009,6 +1034,32 @@ export function AccountList({
                                 <div className="col-quota-merged">
                                     {effectiveKind(acc) === 'relay' ? (
                                         <RelayQuotaItem account={acc} cache={relayUsageMap[acc.id]} />
+                                    ) : effectiveKind(acc) === 'antigravity_oauth' ? (
+                                        (() => {
+                                            const quotas = antigravityModelQuotas(acc);
+                                            const entries = Object.entries(ANTIGRAVITY_QUOTA_LABELS)
+                                                .filter(([model]) => quotas[model]);
+                                            if (entries.length === 0) {
+                                                return <span className="quota-empty">等待同步模型额度</span>;
+                                            }
+                                            return (
+                                                <div className="quota-grid">
+                                                    {entries.map(([model, label]) => {
+                                                        const quota = quotas[model];
+                                                        const resetAt = quota.reset_time
+                                                            ? Math.floor(new Date(quota.reset_time).getTime() / 1000)
+                                                            : undefined;
+                                                        return <QuotaItem
+                                                            key={model}
+                                                            label={label}
+                                                            percentage={Math.max(0, Math.min(100, quota.remaining_fraction * 100))}
+                                                            reset=""
+                                                            resetAt={resetAt}
+                                                        />;
+                                                    })}
+                                                </div>
+                                            );
+                                        })()
                                     ) : usage ? (
                                         <div className="quota-grid">
                                             <QuotaItem label={usage.five_hour_label} percentage={usage.five_hour_left} reset={usage.five_hour_reset} resetAt={usage.five_hour_reset_at} />
@@ -1044,7 +1095,7 @@ export function AccountList({
                                             }}
                                         >{expiry.text}</button>
                                     </div>
-                                    {effectiveKind(acc) !== 'relay' && (
+                                    {effectiveKind(acc) !== 'relay' && effectiveKind(acc) !== 'antigravity_oauth' && (
                                         <div className="wakeup-row">
                                             <button
                                                 className="wakeup-btn"
@@ -1079,8 +1130,10 @@ export function AccountList({
                                     )}
                                 </div>
                                 <div className="col-actions">
-                                    <button className="action-btn refresh" onClick={() => handleRefreshOne(acc.id)} disabled={isRefreshing} title="刷新"><RefreshCw size={14} className={isRefreshing ? 'spinning' : ''} /></button>
-                                    {settings.remote_mode === 'client' && (
+                                    {effectiveKind(acc) !== 'antigravity_oauth' && (
+                                        <button className="action-btn refresh" onClick={() => handleRefreshOne(acc.id)} disabled={isRefreshing} title="刷新"><RefreshCw size={14} className={isRefreshing ? 'spinning' : ''} /></button>
+                                    )}
+                                    {settings.remote_mode === 'client' && effectiveKind(acc) !== 'antigravity_oauth' && (
                                         <button
                                             className="action-btn push"
                                             onClick={() => handlePushToServer(acc.id, acc.name)}
@@ -1090,10 +1143,10 @@ export function AccountList({
                                             <UploadCloud size={14} className={pushingIds.has(acc.id) ? 'spinning' : ''} />
                                         </button>
                                     )}
-                                    {!isCurrent && (
+                                    {!isCurrent && effectiveKind(acc) !== 'antigravity_oauth' && (
                                         <button className="action-btn switch" onClick={() => onSwitch(acc.id)} disabled={switchingIds.has(acc.id)} title="切换"><ArrowLeftRight size={14} /></button>
                                     )}
-                                    {effectiveKind(acc) !== 'relay' && (usage?.plan_type ?? '').toLowerCase() !== 'free' && (
+                                    {effectiveKind(acc) === 'chatgpt_oauth' && (usage?.plan_type ?? '').toLowerCase() !== 'free' && (
                                         <button className="action-btn invite" onClick={() => openInvite(acc.id, acc.name)} title="发送 Codex 邀请"><UserPlus size={14} /></button>
                                     )}
                                     <button className="action-btn delete" onClick={() => setAccountToDelete({ id: acc.id, name: acc.name })} title="删除"><Trash2 size={14} /></button>

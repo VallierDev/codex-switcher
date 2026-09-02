@@ -3,6 +3,7 @@
 //! 暴露所有 Tauri 命令供前端调用
 
 pub mod account;
+mod antigravity;
 mod bulk_import;
 pub mod chat_inbound;
 mod codex_sessions;
@@ -1115,6 +1116,72 @@ async fn finalize_oauth_login(
     .await
 }
 
+/// 完成 Google Antigravity OAuth，并保存为独立 Provider 账号。
+/// 该账号不会写入 `~/.codex/auth.json`。
+#[tauri::command]
+async fn finalize_antigravity_oauth_login(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    code: String,
+) -> Result<Account, String> {
+    let (remote_mode, primary, fallback, secret) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        (
+            store.settings.remote_mode.clone(),
+            store.settings.remote_server_url.clone(),
+            store.settings.remote_server_url_fallback.clone(),
+            store.settings.remote_shared_secret.clone(),
+        )
+    };
+    if remote_mode == "client" {
+        let redirect_uri = antigravity::flow::take_pending_redirect_uri()?;
+        let base = if !fallback.trim().is_empty() {
+            fallback.trim().to_string()
+        } else {
+            remote_client::resolve_base_url(&primary, &fallback).await?
+        };
+        let account =
+            remote_client::complete_antigravity_oauth(&base, &secret, &code, &redirect_uri).await?;
+        {
+            let mut store = state.store.lock().map_err(|e| e.to_string())?;
+            store.accounts.insert(account.id.clone(), account.clone());
+            store.save()?;
+        }
+        let _ = app.emit("accounts-updated", ());
+        crate::tray::update_tray_menu(&app);
+        return Ok(account);
+    }
+
+    let credential = antigravity::flow::complete_oauth_login(code).await?;
+    let quota_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut auth_json = credential.to_auth_json();
+    if let Ok(quotas) = antigravity::quota::fetch_model_quotas(
+        &quota_client,
+        &credential.access_token,
+        &credential.project_id,
+    )
+    .await
+    {
+        antigravity::quota::write_model_quotas(&mut auth_json, &quotas);
+    }
+    let account = {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        let account = store.add_antigravity_account(
+            credential.email.clone(),
+            auth_json,
+            Some("Google Antigravity OAuth".to_string()),
+        );
+        store.save()?;
+        account
+    };
+    let _ = app.emit("accounts-updated", ());
+    crate::tray::update_tray_menu(&app);
+    Ok(account)
+}
+
 // ============================================================================
 // 邮箱 OTP 批量自动授权
 // ============================================================================
@@ -1363,6 +1430,17 @@ async fn switch_account(
     app: tauri::AppHandle,
     id: String,
 ) -> Result<(), String> {
+    {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        if store
+            .accounts
+            .get(&id)
+            .map(|account| account.is_antigravity_oauth())
+            .unwrap_or(false)
+        {
+            return Err("Antigravity 账号由模型路由自动选择，不切换 Codex 当前身份".to_string());
+        }
+    }
     // 0. 切换前仅同步“当前激活账号”与官方 auth.json，避免全表匹配导致串号
     if let Ok(current_auth) = AccountStore::read_codex_auth() {
         if let Ok(mut store) = state.store.lock() {
@@ -2077,10 +2155,7 @@ fn apply_automatic_window_priming_defaults(store: &mut AccountStore) -> bool {
         }
 
         let already_has_bootstrap = account.window_priming.bootstrap_request_id.is_some()
-            || account
-                .window_priming
-                .last_bootstrap_request_id
-                .is_some()
+            || account.window_priming.last_bootstrap_request_id.is_some()
             || account.window_priming.last_attempt_at.is_some();
         let definitely_active = account
             .cached_quota
@@ -2333,6 +2408,19 @@ pub fn start_quota_refresh(
                                                     acc.cached_quota = Some(q);
                                                     updated += 1;
                                                 }
+                                                if let Some(quotas) =
+                                                    e.antigravity_model_quotas.clone()
+                                                {
+                                                    if let Some(object) =
+                                                        acc.auth_json.as_object_mut()
+                                                    {
+                                                        object.insert(
+                                                            "model_quotas".to_string(),
+                                                            quotas,
+                                                        );
+                                                        updated += 1;
+                                                    }
+                                                }
                                                 if let Some(priming) = e.window_priming.clone() {
                                                     acc.window_priming = priming;
                                                 }
@@ -2513,7 +2601,10 @@ pub fn start_quota_refresh(
                     .accounts
                     .values()
                     .filter(|a| {
-                        !a.is_banned && !a.is_token_invalid && !a.is_logged_out && !a.is_relay()
+                        !a.is_banned
+                            && !a.is_token_invalid
+                            && !a.is_logged_out
+                            && a.is_openai_account()
                     })
                     .map(|a| {
                         let cq = a.cached_quota.as_ref();
@@ -2914,6 +3005,7 @@ pub fn score_candidate_accounts(store: &AccountStore) -> Vec<(String, String, f6
             || account.is_banned
             || account.is_token_invalid
             || account.is_logged_out
+            || account.is_antigravity_oauth()
         {
             continue;
         }
@@ -3070,11 +3162,8 @@ async fn get_quota_internal(state: &AppState, id: String) -> Result<UsageDisplay
     {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         if let Some(acc) = store.accounts.get(&id) {
-            if acc.is_relay() {
-                return Err(
-                    "RELAY_ACCOUNT:中转站账号不支持 OpenAI usage 查询，请用「中转站余额刷新」"
-                        .to_string(),
-                );
+            if !acc.is_openai_account() {
+                return Err("PROVIDER_ACCOUNT:该 Provider 账号不支持 OpenAI usage 查询".to_string());
             }
         }
     }
@@ -3119,12 +3208,18 @@ async fn get_quota_internal(state: &AppState, id: String) -> Result<UsageDisplay
             }
             Err(e) => {
                 if crate::scheduler::is_logged_out_error(&e) {
-                    return Err("ACCOUNT_LOGGED_OUT:登录已失效，refresh_token 已过期或被撤销，请重新登录".to_string());
+                    return Err(
+                        "ACCOUNT_LOGGED_OUT:登录已失效，refresh_token 已过期或被撤销，请重新登录"
+                            .to_string(),
+                    );
                 }
                 if crate::scheduler::is_revoked_error(&e) {
                     return Err(format!("TOKEN_INVALID:刷新 token 失败: {}", e));
                 }
-                return Err(format!("TOKEN_REFRESH_TRANSIENT:刷新请求失败，暂未判定账号失效: {}", e));
+                return Err(format!(
+                    "TOKEN_REFRESH_TRANSIENT:刷新请求失败，暂未判定账号失效: {}",
+                    e
+                ));
             }
         }
     } else {
@@ -3268,8 +3363,8 @@ async fn send_codex_invite(
             .accounts
             .get(&id)
             .ok_or_else(|| format!("账号 {} 不存在", id))?;
-        if account.is_relay() {
-            return Err("RELAY_ACCOUNT:中转站账号不支持 Codex 邀请".to_string());
+        if !account.is_openai_account() {
+            return Err("PROVIDER_ACCOUNT:该 Provider 账号不支持 Codex 邀请".to_string());
         }
         let at = AccountStore::extract_access_token(&account.auth_json);
         let aid = AccountStore::extract_account_id(&account.auth_json);
@@ -3393,7 +3488,7 @@ async fn resolve_account_access_token(
             .accounts
             .get(id)
             .ok_or_else(|| format!("账号 {} 不存在", id))?;
-        if account.is_relay() {
+        if !account.is_openai_account() {
             return Err(relay_err.to_string());
         }
         let at = AccountStore::extract_access_token(&account.auth_json);
@@ -3482,8 +3577,8 @@ fn open_codex_terminal(state: State<AppState>, id: String) -> Result<String, Str
             .accounts
             .get(&id)
             .ok_or_else(|| format!("账号 {} 不存在", id))?;
-        if acc.is_relay() {
-            return Err("RELAY_ACCOUNT:中转站账号不支持 codex 终端".to_string());
+        if !acc.is_openai_account() {
+            return Err("PROVIDER_ACCOUNT:该 Provider 账号不支持 codex 终端".to_string());
         }
         (acc.auth_json.clone(), acc.name.clone())
     };
@@ -3574,10 +3669,8 @@ async fn get_quota_by_id(
     {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         if let Some(acc) = store.accounts.get(&id) {
-            if acc.is_relay() {
-                return Err(
-                    "RELAY_ACCOUNT:中转站账号请用「中转站余额刷新」，不是 OpenAI usage".to_string(),
-                );
+            if !acc.is_openai_account() {
+                return Err("PROVIDER_ACCOUNT:该 Provider 账号不支持 OpenAI usage".to_string());
             }
         }
     }
@@ -6051,9 +6144,11 @@ pub fn run() {
             oauth_server::start_oauth_login,
             oauth_server::submit_oauth_callback,
             oauth_server::copy_to_clipboard,
+            antigravity::flow::start_antigravity_oauth_login,
             session_import::import_chatgpt_session,
             solo_sync_current,
             finalize_oauth_login,
+            finalize_antigravity_oauth_login,
             force_overwrite_disk_with_current,
             start_otp_login_batch,
             reload_ide_windows,
@@ -6318,10 +6413,7 @@ mod tests {
         assert!(reserve_window_prime_attempt(&mut account, &due));
         assert!(!reserve_window_prime_attempt(&mut account, &due));
         assert_eq!(
-            account
-                .window_priming
-                .last_bootstrap_request_id
-                .as_deref(),
+            account.window_priming.last_bootstrap_request_id.as_deref(),
             Some("bootstrap-1")
         );
         assert!(!window_prime_due(&account, Utc::now().timestamp()).any());
@@ -6449,15 +6541,11 @@ mod tests {
 
         assert!(!apply_automatic_window_priming_defaults(&mut store));
         assert_eq!(
-            store.accounts["team"]
-                .window_priming
-                .bootstrap_request_id,
+            store.accounts["team"].window_priming.bootstrap_request_id,
             team_bootstrap
         );
         assert_eq!(
-            store.accounts["plus"]
-                .window_priming
-                .bootstrap_request_id,
+            store.accounts["plus"].window_priming.bootstrap_request_id,
             plus_bootstrap
         );
     }

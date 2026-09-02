@@ -24,7 +24,7 @@ interface AddAccountModalProps {
     onSuccess?: () => void;  // 添加成功后的回调，用于刷新父组件列表
 }
 
-type TabType = 'official' | 'openai' | 'otp_batch' | 'bulk' | 'relay' | 'session';
+type TabType = 'official' | 'openai' | 'google' | 'otp_batch' | 'bulk' | 'relay' | 'session';
 
 interface ImportedSessionInfo {
     email: string | null;
@@ -333,6 +333,27 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
         };
     }, [isOpen, finalizeOAuthLogin]);
 
+    useEffect(() => {
+        if (!isOpen) return;
+        const unlisten = listen<string>('antigravity-oauth-callback-received', async (event) => {
+            setOauthStatus('已获取 Google 授权码，正在验证账号和项目...');
+            try {
+                await invoke('finalize_antigravity_oauth_login', { code: event.payload });
+                setOauthStatus('Google Antigravity 账号已添加。');
+                setLoading(false);
+                setTimeout(() => {
+                    onSuccess?.();
+                    onClose();
+                }, 1000);
+            } catch (err) {
+                setError(String(err));
+                setOauthStatus('');
+                setLoading(false);
+            }
+        });
+        return () => { unlisten.then(f => f()); };
+    }, [isOpen, onClose, onSuccess]);
+
     // 监听 OTP 批量授权进度（重试时 backend 的 index 是子集索引，要翻译回原 rows index）
     useEffect(() => {
         if (!isOpen) return;
@@ -415,6 +436,20 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                 setShowPasteInput(false);
                 setOauthStatus(`复制到剪贴板失败（${String(copyErr)}），请手动复制：\n${url}`);
             }
+        } catch (err) {
+            setError(String(err));
+            setOauthStatus('');
+            setLoading(false);
+        }
+    };
+
+    const handleAntigravityLogin = async () => {
+        setLoading(true);
+        setError(null);
+        setOauthStatus('正在启动 Google Antigravity 授权...');
+        try {
+            await invoke<string>('start_antigravity_oauth_login', { openBrowser: true });
+            setOauthStatus('请在浏览器中完成 Google 授权...');
         } catch (err) {
             setError(String(err));
             setOauthStatus('');
@@ -622,6 +657,12 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                             onClick={() => !loading && setActiveTab('official')}
                         >
                             从官方导入
+                        </button>
+                        <button
+                            className={`tab-item ${activeTab === 'google' ? 'active' : ''}`}
+                            onClick={() => !loading && setActiveTab('google')}
+                        >
+                            Google / Antigravity
                         </button>
                         <button
                             className={`tab-item ${activeTab === 'otp_batch' ? 'active' : ''}`}
@@ -1059,6 +1100,27 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                                     {relaySubmitting ? '导入中…' : '导入中转站'}
                                 </button>
                             </div>
+                        </div>
+                    ) : activeTab === 'google' ? (
+                        <div className="oauth-content">
+                            <div className="oauth-icon">◆</div>
+                            <h3 style={{ marginBottom: '8px', color: 'var(--text-primary)' }}>Google Antigravity OAuth</h3>
+                            <p className="oauth-desc">
+                                授权后 Gemini 模型通过 Codex Switcher 原生路由；不会修改 Codex 的 OpenAI 登录身份。
+                            </p>
+                            <button
+                                className="btn btn-primary btn-full"
+                                style={{ padding: '14px' }}
+                                onClick={handleAntigravityLogin}
+                                disabled={loading}
+                            >
+                                {loading ? '处理中...' : '连接 Google 账号'}
+                            </button>
+                            {!loading && (
+                                <button className="btn btn-ghost btn-full" style={{ marginTop: '12px' }} onClick={handleClose}>取消</button>
+                            )}
+                            {oauthStatus && <div className="oauth-status">{oauthStatus}</div>}
+                            {error && <div className="error-message" style={{ marginTop: '16px' }}>{error}</div>}
                         </div>
                     ) : activeTab === 'official' ? (
                         <form onSubmit={handleSubmitOfficial}>

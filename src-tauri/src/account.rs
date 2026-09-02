@@ -304,6 +304,11 @@ pub enum AccountKind {
     OpenaiKey,
     /// 第三方中转站（sk-...，上游 = relay_base_url）
     Relay,
+    /// Google Antigravity OAuth（Gemini / Cloud Code Assist）
+    ///
+    /// 该类型不写入 `~/.codex/auth.json`；Codex 仍保持 OpenAI Provider 身份，
+    /// 由代理根据模型路由到对应的 Antigravity 账号。
+    AntigravityOauth,
 }
 
 impl Default for AccountKind {
@@ -455,6 +460,19 @@ impl Account {
         self.effective_kind() == AccountKind::Relay
     }
 
+    /// 是否 Google Antigravity OAuth 账号。
+    pub fn is_antigravity_oauth(&self) -> bool {
+        self.effective_kind() == AccountKind::AntigravityOauth
+    }
+
+    /// 是否由 OpenAI/Codex 账号流程管理（可写入 Codex auth、查询 OpenAI quota）。
+    pub fn is_openai_account(&self) -> bool {
+        matches!(
+            self.effective_kind(),
+            AccountKind::Legacy | AccountKind::ChatgptOauth | AccountKind::OpenaiKey
+        )
+    }
+
     /// 把账号转成 codex 认识的 auth.json schema。
     ///
     /// 关键差异：
@@ -542,18 +560,14 @@ impl WindowPrimingState {
         self.last_five_hour_reset_at = self
             .last_five_hour_reset_at
             .max(previous.last_five_hour_reset_at);
-        self.last_weekly_reset_at = self
-            .last_weekly_reset_at
-            .max(previous.last_weekly_reset_at);
+        self.last_weekly_reset_at = self.last_weekly_reset_at.max(previous.last_weekly_reset_at);
 
         let incoming_attempt = self.last_attempt_at;
         let previous_attempt = previous.last_attempt_at;
         if previous_attempt >= incoming_attempt && previous.last_error.is_some() {
             self.last_error = previous.last_error.clone();
         }
-        if previous_attempt >= incoming_attempt
-            && previous.last_bootstrap_request_id.is_some()
-        {
+        if previous_attempt >= incoming_attempt && previous.last_bootstrap_request_id.is_some() {
             self.last_bootstrap_request_id = previous.last_bootstrap_request_id.clone();
         }
         self.last_attempt_at = incoming_attempt.max(previous_attempt);
@@ -1285,6 +1299,50 @@ impl AccountStore {
         if self.current.is_none() {
             self.current = Some(id);
         }
+        account
+    }
+
+    /// 添加 Google Antigravity OAuth 账号。
+    ///
+    /// OAuth token、邮箱和 project_id 保存在 provider 自己的 auth_json 中，
+    /// 不参与 Codex `auth.json` 的当前账号切换。
+    pub fn add_antigravity_account(
+        &mut self,
+        name: String,
+        auth_json: serde_json::Value,
+        notes: Option<String>,
+    ) -> Account {
+        let id = uuid::Uuid::new_v4().to_string();
+        let refresh_token = Self::extract_refresh_token(&auth_json);
+        let account = Account {
+            id: id.clone(),
+            name,
+            auth_json,
+            refresh_token,
+            created_at: Utc::now(),
+            last_used: None,
+            notes,
+            account_expires_at: None,
+            window_priming: WindowPrimingState::default(),
+            cached_quota: None,
+            keepalive: KeepaliveState::default(),
+            is_banned: false,
+            is_token_invalid: false,
+            is_logged_out: false,
+            kind: AccountKind::AntigravityOauth,
+            relay_base_url: None,
+            relay_homepage: None,
+            relay_usage_preset: None,
+            relay_usage_cookie: None,
+            relay_usage_cache: None,
+            relay_model_map: None,
+            relay_model_fallback: None,
+            relay_protocol: None,
+            relay_category: None,
+            is_session_anchor: false,
+        };
+
+        self.accounts.insert(id, account.clone());
         account
     }
 

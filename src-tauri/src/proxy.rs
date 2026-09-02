@@ -28,7 +28,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite;
 use tungstenite::client::IntoClientRequest;
 
-use crate::account::AccountStore;
+use crate::account::{AccountKind, AccountStore};
 use crate::session_affinity::SessionAffinity;
 use crate::session_routes::SessionRoutesStore;
 use crate::sse_watchdog::{wrap_with_sse_watchdog, SseStreamDiagnostic};
@@ -267,6 +267,16 @@ struct ProxyState {
     /// 避免「5min 额度刷新把 cached 5h 重置回 99% → 立刻又被选中 → 又 429」的来回切号风暴
     /// （cached 5h% 不反映某些模型的真实限额，所以不能只信它）。
     quota_cooldown: Arc<Mutex<std::collections::HashMap<String, i64>>>,
+    /// 本进程实际监听端口。debug 可通过环境变量覆盖，不写入用户设置。
+    listen_port: u16,
+}
+
+pub fn effective_listen_port(configured: u16) -> u16 {
+    std::env::var("CODEX_SWITCHER_PROXY_PORT_OVERRIDE")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(configured)
 }
 
 /// 启动代理服务器
@@ -282,6 +292,7 @@ pub fn start(
     session_affinity: Arc<SessionAffinity>,
     session_routes: Arc<Mutex<SessionRoutesStore>>,
 ) -> tauri::async_runtime::JoinHandle<()> {
+    let port = effective_listen_port(port);
     tauri::async_runtime::spawn(async move {
         let addr = if allow_lan {
             SocketAddr::from(([0, 0, 0, 0], port))
@@ -314,6 +325,7 @@ pub fn start(
             session_affinity,
             session_routes,
             quota_cooldown: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            listen_port: port,
         });
 
         loop {
@@ -633,6 +645,485 @@ struct RelayRoute {
     base_url: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct AntigravityRoute {
+    account_id: String,
+    access_token: String,
+    refresh_token: String,
+    project_id: String,
+    expires_at: Option<chrono::DateTime<Utc>>,
+}
+
+fn request_model(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("model")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn antigravity_routes(state: &ProxyState, model_id: &str) -> Vec<AntigravityRoute> {
+    let Ok(store) = state.store.lock() else {
+        return Vec::new();
+    };
+    let mut routes: Vec<(f64, Option<chrono::DateTime<Utc>>, AntigravityRoute)> = store
+        .accounts
+        .values()
+        .filter(|account| {
+            account.effective_kind() == AccountKind::AntigravityOauth
+                && !account.is_banned
+                && !account.is_logged_out
+                && !account.is_token_invalid
+        })
+        .filter_map(|account| {
+            let quota_score = crate::antigravity::quota::model_candidate_score(
+                &account.auth_json,
+                model_id,
+                Utc::now(),
+            )?;
+            let tokens = account.auth_json.get("tokens")?;
+            Some((
+                quota_score,
+                account.last_used,
+                AntigravityRoute {
+                    account_id: account.id.clone(),
+                    access_token: tokens.get("access_token")?.as_str()?.to_string(),
+                    refresh_token: tokens
+                        .get("refresh_token")
+                        .and_then(serde_json::Value::as_str)
+                        .or(account.refresh_token.as_deref())?
+                        .to_string(),
+                    project_id: account.auth_json.get("project_id")?.as_str()?.to_string(),
+                    expires_at: tokens
+                        .get("expires_at")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                        .map(|value| value.with_timezone(&Utc)),
+                },
+            ))
+        })
+        .collect();
+    routes.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    routes.into_iter().map(|(_, _, route)| route).collect()
+}
+
+fn has_antigravity_account(state: &ProxyState) -> bool {
+    state
+        .store
+        .lock()
+        .map(|store| {
+            store.accounts.values().any(|account| {
+                account.effective_kind() == AccountKind::AntigravityOauth
+                    && !account.is_banned
+                    && !account.is_logged_out
+                    && !account.is_token_invalid
+            })
+        })
+        .unwrap_or(false)
+}
+
+async fn refresh_antigravity_route_if_needed(
+    state: &ProxyState,
+    mut route: AntigravityRoute,
+) -> Result<AntigravityRoute, String> {
+    let refresh_needed = route
+        .expires_at
+        .map(|expires| expires <= Utc::now() + chrono::Duration::minutes(5))
+        .unwrap_or(true);
+    if !refresh_needed {
+        return Ok(route);
+    }
+    let config = crate::antigravity::oauth::OAuthClientConfig::from_environment();
+    let tokens = crate::antigravity::oauth::refresh_access_token(
+        &state.client,
+        &config,
+        &route.refresh_token,
+    )
+    .await?;
+    route.access_token = tokens.access_token;
+    if let Some(refresh_token) = tokens.refresh_token {
+        route.refresh_token = refresh_token;
+    }
+    route.expires_at = Some(Utc::now() + chrono::Duration::seconds(tokens.expires_in));
+
+    let mut store = state.store.lock().map_err(|e| e.to_string())?;
+    let account = store
+        .accounts
+        .get_mut(&route.account_id)
+        .ok_or_else(|| "Antigravity account disappeared during refresh".to_string())?;
+    account.refresh_token = Some(route.refresh_token.clone());
+    if let Some(object) = account.auth_json.as_object_mut() {
+        let tokens = object
+            .entry("tokens")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(tokens) = tokens.as_object_mut() {
+            tokens.insert(
+                "access_token".to_string(),
+                serde_json::Value::String(route.access_token.clone()),
+            );
+            tokens.insert(
+                "refresh_token".to_string(),
+                serde_json::Value::String(route.refresh_token.clone()),
+            );
+            if let Some(expires_at) = route.expires_at {
+                tokens.insert(
+                    "expires_at".to_string(),
+                    serde_json::Value::String(expires_at.to_rfc3339()),
+                );
+            }
+        }
+        object.insert(
+            "last_refresh".to_string(),
+            serde_json::Value::String(Utc::now().to_rfc3339()),
+        );
+    }
+    store.save()?;
+    Ok(route)
+}
+
+async fn handle_antigravity_response(
+    state: Arc<ProxyState>,
+    method: Method,
+    path_and_query: &str,
+    body: Bytes,
+) -> Response<ProxyBody> {
+    let path = path_and_query.split('?').next().unwrap_or("");
+    if method != Method::POST || !(path == "/v1/responses" || path.ends_with("/responses")) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "Antigravity route only supports /v1/responses",
+        );
+    }
+    let model = request_model(&body).unwrap_or_default();
+    let stream = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
+    let routes = antigravity_routes(&state, &model);
+    if routes.is_empty() {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "No Google account has quota for this Antigravity model",
+        );
+    }
+    let mut last_error = "Antigravity request failed".to_string();
+    for route in routes {
+        let route = match refresh_antigravity_route_if_needed(&state, route).await {
+            Ok(route) => route,
+            Err(error) => {
+                last_error = error;
+                continue;
+            }
+        };
+        let (payload, mut translator_state) =
+            match crate::antigravity::translate::responses_to_antigravity(
+                &body,
+                &model,
+                &route.project_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+            };
+        let response = match state
+            .client
+            .post("https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent")
+            .bearer_auth(&route.access_token)
+            .header("content-type", "application/json")
+            .header("user-agent", "antigravity/2.11.0 darwin/arm64")
+            .body(payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("Antigravity request failed: {error}");
+                continue;
+            }
+        };
+        let status = response.status();
+        let raw = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                last_error = format!("Antigravity response read failed: {error}");
+                continue;
+            }
+        };
+        if status.as_u16() == 429 {
+            if let Ok(mut store) = state.store.lock() {
+                if let Some(account) = store.accounts.get_mut(&route.account_id) {
+                    crate::antigravity::quota::mark_model_exhausted(&mut account.auth_json, &model);
+                }
+                let _ = store.save();
+            }
+            last_error = format!("Google account exhausted quota for {model}");
+            continue;
+        }
+        if !status.is_success() {
+            last_error = format!("Antigravity upstream returned HTTP {status}");
+            continue;
+        }
+        let translated = match crate::antigravity::translate::antigravity_response_to_codex(
+            &raw,
+            &mut translator_state,
+            &model,
+            stream,
+        ) {
+            Ok(value) => value,
+            Err(error) => return error_response(StatusCode::BAD_GATEWAY, &error),
+        };
+        let latest_quotas = crate::antigravity::quota::fetch_model_quotas(
+            &state.client,
+            &route.access_token,
+            &route.project_id,
+        )
+        .await
+        .ok();
+        if let Ok(mut store) = state.store.lock() {
+            if let Some(account) = store.accounts.get_mut(&route.account_id) {
+                account.last_used = Some(Utc::now());
+                if let Some(ref quotas) = latest_quotas {
+                    crate::antigravity::quota::write_model_quotas(&mut account.auth_json, quotas);
+                }
+            }
+            let _ = store.save();
+        }
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                "content-type",
+                if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+            )
+            .header("cache-control", "no-cache")
+            .body(full_body(Bytes::from(translated)))
+            .unwrap_or_else(|_| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Antigravity response build failed",
+                )
+            });
+    }
+    error_response(StatusCode::TOO_MANY_REQUESTS, &last_error)
+}
+
+fn antigravity_codex_catalog_entry(
+    model: &crate::antigravity::AntigravityModel,
+    template: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let default_reasoning_level = model.thinking_levels.last().copied().unwrap_or("high");
+    let mut entry = template.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let Some(object) = entry.as_object_mut() else {
+        return serde_json::json!({});
+    };
+    object.insert("slug".into(), serde_json::json!(model.id));
+    object.insert("display_name".into(), serde_json::json!(model.display_name));
+    object.insert("description".into(), serde_json::json!(model.description));
+    object.insert(
+        "context_window".into(),
+        serde_json::json!(model.context_length),
+    );
+    object.insert(
+        "max_context_window".into(),
+        serde_json::json!(model.context_length),
+    );
+    object.insert(
+        "max_output_tokens".into(),
+        serde_json::json!(model.max_completion_tokens),
+    );
+    object.insert(
+        "input_modalities".into(),
+        serde_json::json!(model.input_modalities),
+    );
+    object.insert(
+        "output_modalities".into(),
+        serde_json::json!(model.output_modalities),
+    );
+    object.insert(
+        "supported_reasoning_levels".into(),
+        serde_json::Value::Array(
+            model
+                .thinking_levels
+                .iter()
+                .map(|effort| {
+                    serde_json::json!({
+                        "effort": effort,
+                        "description": format!("Antigravity {effort} thinking"),
+                    })
+                })
+                .collect(),
+        ),
+    );
+    object.insert(
+        "default_reasoning_level".into(),
+        serde_json::json!(default_reasoning_level),
+    );
+    object.insert(
+        "default_reasoning_summary".into(),
+        serde_json::json!("auto"),
+    );
+    object.insert(
+        "supports_parallel_tool_calls".into(),
+        serde_json::json!(true),
+    );
+    object.insert("prefer_websockets".into(), serde_json::json!(false));
+    object.insert("supports_websockets".into(), serde_json::json!(false));
+    object.insert(
+        "supports_image_detail_original".into(),
+        serde_json::json!(true),
+    );
+    object.insert("multi_agent_version".into(), serde_json::json!("v2"));
+    object.insert("shell_type".into(), serde_json::json!("shell_command"));
+    object.insert("tool_mode".into(), serde_json::Value::Null);
+    object.insert("visibility".into(), serde_json::json!("list"));
+    object.insert("supported_in_api".into(), serde_json::json!(true));
+    object.insert("priority".into(), serde_json::json!(40));
+    entry
+}
+
+async fn handle_models_with_antigravity(
+    state: Arc<ProxyState>,
+    req_headers: &hyper::HeaderMap,
+    path_and_query: &str,
+) -> Response<ProxyBody> {
+    let (token, is_chatgpt) = match get_current_token(&state).await {
+        Ok(value) => value,
+        Err(error) => return error_response(StatusCode::UNAUTHORIZED, &error),
+    };
+    let (relay_base_url, chatgpt_account_id) = {
+        let store = match state.store.lock() {
+            Ok(store) => store,
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        };
+        let account = store
+            .current
+            .as_deref()
+            .and_then(|id| store.accounts.get(id));
+        (
+            account
+                .filter(|account| account.is_relay())
+                .and_then(|account| account.relay_base_url.clone()),
+            account.and_then(|account| AccountStore::extract_account_id(&account.auth_json)),
+        )
+    };
+    let (url, host) = get_upstream(is_chatgpt, relay_base_url.as_deref(), path_and_query);
+    let mut headers = build_upstream_headers(req_headers, &host);
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        match reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            Ok(value) => value,
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+        },
+    );
+    if is_chatgpt {
+        if let Some(account_id) = chatgpt_account_id {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&account_id) {
+                headers.insert(
+                    reqwest::header::HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+                    value,
+                );
+            }
+        }
+    }
+    let response = match state.client.get(url).headers(headers).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("models upstream failed: {error}"),
+            )
+        }
+    };
+    let status = response.status();
+    let raw = match response.bytes().await {
+        Ok(raw) => raw,
+        Err(error) => return error_response(StatusCode::BAD_GATEWAY, &error.to_string()),
+    };
+    if !status.is_success() {
+        return Response::builder()
+            .status(status.as_u16())
+            .header("content-type", "application/json")
+            .body(full_body(raw))
+            .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "models upstream failed"));
+    }
+    let mut catalog: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(value) => value,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(full_body(raw))
+                .unwrap()
+        }
+    };
+    if has_antigravity_account(&state) {
+        if let Some(models) = catalog
+            .get_mut("models")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            let template = models
+                .iter()
+                .find(|model| {
+                    model.get("slug").and_then(serde_json::Value::as_str) == Some("gpt-5.4-mini")
+                })
+                .cloned()
+                .or_else(|| models.first().cloned());
+            let existing: std::collections::HashSet<String> = models
+                .iter()
+                .filter_map(|model| {
+                    model
+                        .get("slug")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect();
+            for model in crate::antigravity::models() {
+                if !existing.contains(model.id) {
+                    models.push(antigravity_codex_catalog_entry(model, template.as_ref()));
+                }
+            }
+        } else if let Some(models) = catalog
+            .get_mut("data")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            let existing: std::collections::HashSet<String> = models
+                .iter()
+                .filter_map(|model| {
+                    model
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect();
+            for model in crate::antigravity::models() {
+                if !existing.contains(model.id) {
+                    models.push(serde_json::json!({"id": model.id, "object": "model", "owned_by": "antigravity"}));
+                }
+            }
+        }
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(full_body(Bytes::from(catalog.to_string())))
+        .unwrap_or_else(|_| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "models response build failed",
+            )
+        })
+}
+
 /// 取 store.current 的 Relay 路由信息（仅 Relay 类型；其它 None）。
 fn current_relay_route(state: &ProxyState) -> Option<RelayRoute> {
     let store = state.store.lock().ok()?;
@@ -687,7 +1178,13 @@ fn resolve_hard_route(
     // 展示字段每次请求都是新随机 UUID，如果混进这个候选列表且排在路由 key 前面，
     // 会先命中一个永远查不到路由的随机值，导致硬路由失效。
     let sk: Option<String> = (|| -> Option<String> {
-        for name in &["x-pod-worker-route", "session_id", "session-id", "x-session-id", "thread_id"] {
+        for name in &[
+            "x-pod-worker-route",
+            "session_id",
+            "session-id",
+            "x-session-id",
+            "thread_id",
+        ] {
             if let Some(v) = headers.get(*name).and_then(|v| v.to_str().ok()) {
                 if !v.is_empty() {
                     return Some(format!("hdr:{v}"));
@@ -1548,7 +2045,9 @@ async fn handle_chat_inbound(
                 other => {
                     let why = match other {
                         SilentRefreshOutcome::LoggedOut => "current 已登出".to_string(),
-                        SilentRefreshOutcome::NoRefreshToken => "current 没有 refresh_token".to_string(),
+                        SilentRefreshOutcome::NoRefreshToken => {
+                            "current 没有 refresh_token".to_string()
+                        }
                         SilentRefreshOutcome::OtherError(e) => e,
                         SilentRefreshOutcome::Refreshed(_) => unreachable!(),
                     };
@@ -1650,6 +2149,22 @@ async fn handle_request(
             .unwrap());
     }
 
+    // 已连接 Google 账号时，将 Antigravity 模型合并进 Codex 原生模型目录。
+    // Client 只需无密钥账号镜像即可展示；真实执行仍交给权威 Server。
+    if req.method() == Method::GET
+        && (req.uri().path() == "/v1/models" || req.uri().path().ends_with("/models"))
+    {
+        if has_antigravity_account(&state) {
+            let headers = req.headers().clone();
+            let path_and_query = req
+                .uri()
+                .path_and_query()
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| "/v1/models".to_string());
+            return Ok(handle_models_with_antigravity(state, &headers, &path_and_query).await);
+        }
+    }
+
     // ── WebSocket 升级检测 ──
     if is_websocket_upgrade(&req) {
         // DEBUG: dump 所有 upgrade headers，找 session_id 藏在哪
@@ -1730,6 +2245,38 @@ async fn handle_request(
             return Ok(error_response(StatusCode::BAD_REQUEST, "读取请求体失败"));
         }
     };
+
+    // ── 原生 Antigravity 模型路由 ──
+    // Client 模式无论 client_direct_upstream 如何，都把 Google 模型交给权威 Server。
+    let remote_mode_for_provider = state
+        .store
+        .lock()
+        .map(|store| store.settings.remote_mode.clone())
+        .unwrap_or_default();
+    if let Some(model) = request_model(&body_bytes) {
+        if crate::antigravity::is_antigravity_model(&model) {
+            if remote_mode_for_provider == "client" {
+                return Ok(
+                    match forward_to_server_parts(
+                        &state,
+                        &method,
+                        &path_and_query,
+                        &req_headers,
+                        &body_bytes,
+                    )
+                    .await
+                    {
+                        Ok(response) => build_stream_response(response, None, None),
+                        Err(error) => error_response(StatusCode::BAD_GATEWAY, &error),
+                    },
+                );
+            } else {
+                return Ok(
+                    handle_antigravity_response(state, method, &path_and_query, body_bytes).await,
+                );
+            }
+        }
+    }
 
     // ── OpenAI chat/completions 入站（glance 等 OpenAI 兼容客户端用 ChatGPT 账号的 codex 模型）──
     // 与下面 responses 路径完全独立：chat → 翻成 codex responses → 打 ChatGPT 上游 → 缓冲 SSE
@@ -1907,7 +2454,10 @@ async fn handle_request(
 
     // 3. 透明 Header 转发（官方 responses-api-proxy 逻辑）
     if is_chatgpt && std::env::var("PROXY_DEBUG_ALL_HEADERS").is_ok() {
-        println!("[Proxy DEBUG] HTTP POST {} inbound headers:", path_and_query);
+        println!(
+            "[Proxy DEBUG] HTTP POST {} inbound headers:",
+            path_and_query
+        );
         for (name, value) in &req_headers {
             let lower = name.as_str().to_lowercase();
             let v = if lower == "authorization" {
@@ -3204,9 +3754,13 @@ async fn forward_to_server_parts(
         )
     };
 
-    let api_base = crate::remote_client::resolve_base_url(&primary, &fallback)
-        .await
-        .map_err(|e| format!("Server 不可达: {}", e))?;
+    let api_base = if !fallback.trim().is_empty() {
+        fallback.trim().to_string()
+    } else {
+        crate::remote_client::resolve_base_url(&primary, &fallback)
+            .await
+            .map_err(|e| format!("Server 不可达: {}", e))?
+    };
     let proxy_base = derive_server_proxy_url(&api_base, proxy_port)
         .ok_or_else(|| format!("无法从 {} 构造 Server proxy URL", api_base))?;
     let upstream_url = format!("{}{}", proxy_base, path_and_query);
@@ -3244,7 +3798,7 @@ async fn forward_to_server_parts(
         .body(body.to_vec())
         .send()
         .await
-        .map_err(|e| format!("转发到 Server 失败: {}", e))
+        .map_err(|e| format!("转发到 Server 失败: {e:?}"))
 }
 
 /// 写 `~/.codex/auth.json` 但**尊重手机锚约束**：anchor 设置了且 account_id != anchor
@@ -4605,7 +5159,7 @@ fn build_stream_response_from_parts(
     };
     // 仅 SSE 响应才套 keep-alive heartbeat。非 SSE（如 /compact 返回的 JSON）注入
     // `: keep-alive\n\n` 会把额外字节塞进 JSON body，导致 codex 解析失败。
-    // `control character ( -) found while parsing a string` 直接挂掉。
+    // `control character (U+0000-U+001F) found while parsing a string` 直接挂掉。
     let is_sse = headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -4835,12 +5389,14 @@ async fn handle_websocket(
                                                 five_hour_left: usage.five_hour_left as f64,
                                                 five_hour_reset: usage.five_hour_reset.clone(),
                                                 five_hour_reset_at: usage.five_hour_reset_at,
-                                                primary_window_seconds: usage.primary_window_seconds,
+                                                primary_window_seconds: usage
+                                                    .primary_window_seconds,
                                                 five_hour_label: usage.five_hour_label.clone(),
                                                 weekly_left: usage.weekly_left as f64,
                                                 weekly_reset: usage.weekly_reset.clone(),
                                                 weekly_reset_at: usage.weekly_reset_at,
-                                                secondary_window_seconds: usage.secondary_window_seconds,
+                                                secondary_window_seconds: usage
+                                                    .secondary_window_seconds,
                                                 weekly_label: usage.weekly_label.clone(),
                                                 plan_type: usage.plan_type.clone(),
                                                 is_valid_for_cli: usage.is_valid_for_cli,
@@ -5541,7 +6097,7 @@ fn detect_ws_banned(msg: &tungstenite::Message) -> bool {
 /// - 切号信号 → 断开连接
 /// - 检测到限额/封号消息 → 断开连接（代理会在下次连接时预检切号）
 async fn bridge_websockets<S1, S2>(
-    client: S1,
+    mut client: S1,
     upstream: S2,
     disconnect: Arc<tokio::sync::Notify>,
     state: Arc<ProxyState>,
@@ -5553,6 +6109,21 @@ async fn bridge_websockets<S1, S2>(
         + futures_util::Sink<tungstenite::Message, Error = tungstenite::Error>
         + Unpin,
 {
+    // 握手 header 不含模型，首个 response.create 才含 model。先读一帧做精确分流：
+    // GPT 帧仍进入原 bridge；只有明确的 Antigravity 模型才走 Google 兼容层。
+    let first_message = client.next().await;
+    if first_message
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .and_then(ws_message_model)
+        .map(|model| crate::antigravity::is_antigravity_model(&model))
+        .unwrap_or(false)
+    {
+        drop(upstream);
+        bridge_antigravity_websocket(client, first_message, state).await;
+        return;
+    }
+
     let (mut client_write, mut client_read) = client.split();
     let (mut upstream_write, mut upstream_read) = upstream.split();
 
@@ -5571,6 +6142,36 @@ async fn bridge_websockets<S1, S2>(
     let u2c_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let c2u_count_b = c2u_count.clone();
     let u2c_count_b = u2c_count.clone();
+
+    // GPT/原生模型：把刚才为识别模型而读取的首帧原样送入原上游，之后逻辑不变。
+    if let Some(first_message) = first_message {
+        match first_message {
+            Ok(message) if !message.is_close() => {
+                c2u_count_b.store(1, std::sync::atomic::Ordering::Relaxed);
+                if let tungstenite::Message::Text(ref text) = message {
+                    if request_is_spark_model(text.as_bytes()) {
+                        ws_is_spark_w.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if let Some(session_key) = crate::session_affinity::extract_session_key(
+                        text.as_bytes(),
+                        &reqwest::header::HeaderMap::new(),
+                    ) {
+                        if let Ok(mut slot) = ws_session_key_w.lock() {
+                            *slot = Some(session_key);
+                        }
+                    }
+                }
+                if upstream_write.send(message).await.is_err() {
+                    return;
+                }
+            }
+            Ok(message) => {
+                let _ = upstream_write.send(message).await;
+                return;
+            }
+            Err(_) => return,
+        }
+    }
 
     let client_to_upstream = async {
         while let Some(msg) = client_read.next().await {
@@ -5839,9 +6440,7 @@ async fn bridge_websockets<S1, S2>(
             // 主动发 Close 让 codex 干净收尾（不会 reconnect）
             let _ = client_write.send(tungstenite::Message::Close(None)).await;
         } else if forwarded_terminal_error {
-            println!(
-                "[Proxy] WS bridge: 已透传上游 terminal error，不合成 response.completed"
-            );
+            println!("[Proxy] WS bridge: 已透传上游 terminal error，不合成 response.completed");
         } else if !saw_completed {
             println!(
                 "[Proxy] WS bridge: upstream 中途断（u→c={} 帧 has_fn_call={} → 不合成，codex 会 retry）",
@@ -5873,6 +6472,137 @@ async fn bridge_websockets<S1, S2>(
             );
         },
     }
+}
+
+fn ws_message_model(message: &tungstenite::Message) -> Option<String> {
+    let tungstenite::Message::Text(text) = message else {
+        return None;
+    };
+    request_model(text.as_bytes())
+}
+
+async fn bridge_antigravity_websocket<S>(
+    mut client: S,
+    first_message: Option<Result<tungstenite::Message, tungstenite::Error>>,
+    state: Arc<ProxyState>,
+) where
+    S: futures_util::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
+        + futures_util::Sink<tungstenite::Message, Error = tungstenite::Error>
+        + Unpin,
+{
+    let proxy_port = state.listen_port;
+    let http = match reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    let mut pending = std::collections::VecDeque::new();
+    if let Some(message) = first_message {
+        pending.push_back(message);
+    }
+    loop {
+        let message = match pending.pop_front() {
+            Some(message) => Some(message),
+            None => client.next().await,
+        };
+        let Some(message) = message else {
+            break;
+        };
+        match message {
+            Ok(tungstenite::Message::Text(text)) => {
+                if let Err(error) =
+                    execute_antigravity_ws_frame(&http, proxy_port, text.as_str(), &mut client)
+                        .await
+                {
+                    let _ = client
+                        .send(tungstenite::Message::Text(
+                            serde_json::json!({
+                                "type":"error",
+                                "error":{"type":"proxy_error","message":error}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await;
+                }
+            }
+            Ok(tungstenite::Message::Ping(payload)) => {
+                let _ = client.send(tungstenite::Message::Pong(payload)).await;
+            }
+            Ok(tungstenite::Message::Close(frame)) => {
+                let _ = client.send(tungstenite::Message::Close(frame)).await;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+async fn execute_antigravity_ws_frame<S>(
+    http: &reqwest::Client,
+    proxy_port: u16,
+    text: &str,
+    client: &mut S,
+) -> Result<(), String>
+where
+    S: futures_util::Sink<tungstenite::Message, Error = tungstenite::Error> + Unpin,
+{
+    let mut frame: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if frame.get("type").and_then(serde_json::Value::as_str) != Some("response.create") {
+        return Ok(());
+    }
+    let mut body = frame
+        .get_mut("response")
+        .filter(|value| value.is_object())
+        .map(std::mem::take)
+        .unwrap_or(frame);
+    if body.get("generate").and_then(serde_json::Value::as_bool) == Some(false) {
+        let id = format!("resp_prewarm_{}", uuid::Uuid::new_v4());
+        for event in [
+            serde_json::json!({"type":"response.created","response":{"id":id,"object":"response","status":"in_progress","output":[]}}),
+            serde_json::json!({"type":"response.completed","response":{"id":id,"object":"response","status":"completed","output":[]}}),
+        ] {
+            client
+                .send(tungstenite::Message::Text(event.to_string().into()))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.remove("type");
+        object.insert("stream".to_string(), serde_json::Value::Bool(true));
+    }
+    let response = http
+        .post(format!("http://127.0.0.1:{proxy_port}/v1/responses"))
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("Antigravity HTTP {status}"));
+    }
+    for line in String::from_utf8_lossy(&bytes).lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        client
+            .send(tungstenite::Message::Text(data.to_string().into()))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// 把 WS Message 简单描述成一行：诊断 log 不要打全文（response.created 单帧 >20KB）。
@@ -6838,14 +7568,18 @@ mod tests {
         );
         assert_eq!(
             picked,
-            Some(("current-account".to_string(), ChatInboundPick::FollowCurrent))
+            Some((
+                "current-account".to_string(),
+                ChatInboundPick::FollowCurrent
+            ))
         );
     }
 
     #[test]
     fn unmarked_chat_inbound_still_uses_the_pro_account() {
         // glance 等既有客户端不带标记 → 仍然走 pro 扫描，行为不变。
-        let picked = decide_chat_inbound_pick(false, None, Some("current-account"), Some("pro-account"));
+        let picked =
+            decide_chat_inbound_pick(false, None, Some("current-account"), Some("pro-account"));
         assert_eq!(
             picked,
             Some(("pro-account".to_string(), ChatInboundPick::SparkPro))
@@ -6859,7 +7593,9 @@ mod tests {
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
             hyper::header::USER_AGENT,
-            HeaderValue::from_static("deepseek-harness/0.1.2 (+https://github.com/deepseek-ai/deepseek-harness)"),
+            HeaderValue::from_static(
+                "deepseek-harness/0.1.2 (+https://github.com/deepseek-ai/deepseek-harness)",
+            ),
         );
         headers.insert(
             HeaderName::from_static("x-worker-id"),
@@ -6933,9 +7669,21 @@ mod tests {
     fn only_follow_current_is_allowed_to_refresh_on_401() {
         // 401 时只有 FollowCurrent 分支能刷新（刷的就是它自己用的号）；
         // pro 扫描出来的号和硬路由号都不能触发刷 current，否则就是刷错账号。
-        assert_eq!(matches!(ChatInboundPick::FollowCurrent, ChatInboundPick::FollowCurrent) as u32, 1);
-        assert_eq!(matches!(ChatInboundPick::SparkPro, ChatInboundPick::FollowCurrent) as u32, 0);
-        assert_eq!(matches!(ChatInboundPick::HardRoute, ChatInboundPick::FollowCurrent) as u32, 0);
+        assert_eq!(
+            matches!(
+                ChatInboundPick::FollowCurrent,
+                ChatInboundPick::FollowCurrent
+            ) as u32,
+            1
+        );
+        assert_eq!(
+            matches!(ChatInboundPick::SparkPro, ChatInboundPick::FollowCurrent) as u32,
+            0
+        );
+        assert_eq!(
+            matches!(ChatInboundPick::HardRoute, ChatInboundPick::FollowCurrent) as u32,
+            0
+        );
     }
 
     #[test]
@@ -7183,5 +7931,31 @@ mod tests {
         );
         assert!(detect_ws_rate_limit(&msg));
         assert!(!ws_is_global_capacity_only(&msg));
+    }
+
+    #[test]
+    fn websocket_first_frame_routes_only_declared_antigravity_models() {
+        let gemini = tungstenite::Message::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "gemini-3.7-flash-high",
+                "input": []
+            })
+            .to_string()
+            .into(),
+        );
+        let gpt = tungstenite::Message::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "gpt-5.6-sol",
+                "input": []
+            })
+            .to_string()
+            .into(),
+        );
+        let gemini_model = ws_message_model(&gemini).unwrap();
+        let gpt_model = ws_message_model(&gpt).unwrap();
+        assert!(crate::antigravity::is_antigravity_model(&gemini_model));
+        assert!(!crate::antigravity::is_antigravity_model(&gpt_model));
     }
 }

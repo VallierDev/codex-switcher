@@ -67,7 +67,7 @@ export interface SyncStatus {
     current_id: string | null;
 }
 
-export type AccountKind = 'legacy' | 'chatgpt_oauth' | 'openai_key' | 'relay';
+export type AccountKind = 'legacy' | 'chatgpt_oauth' | 'openai_key' | 'relay' | 'antigravity_oauth';
 
 export interface RelayUsageCache {
     remaining: number;

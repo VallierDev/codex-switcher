@@ -242,7 +242,7 @@ fn process_input_item(item: &Value, messages: &mut Vec<Value>) {
         .unwrap_or("message");
 
     match item_type {
-        "message" | "agentMessage" => process_message_item(item, messages),
+        "message" | "agentMessage" | "agent_message" => process_message_item(item, messages),
         "reasoning" => process_reasoning_item(item, messages),
         "function_call" | "commandExecution" | "local_shell_call" | "fileChange"
         | "custom_tool_call" | "web_search_call" => process_tool_call(item, messages),
