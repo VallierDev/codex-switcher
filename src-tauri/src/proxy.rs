@@ -1345,6 +1345,20 @@ fn decide_chat_inbound_pick(
     spark_pro.map(|id| (id.to_string(), ChatInboundPick::SparkPro))
 }
 
+/// 一条 `chat/completions` 入站请求最多允许因 429 切几次号。
+///
+/// 只有 FollowCurrent 有预算：Worker 明确要求"跟随 current"，切 `store.current`
+/// 之后它下一轮自然跟到新号；SparkPro 是 glance 的通道、HardRoute 是用户点名的
+/// 账号，替它们换号都会让调用方拿到一个它没要的账号。
+///
+/// 2 而不是 1：3022 撞限额时池子里有 5 个号，一次只够跳过一个刚耗尽的号。
+fn quota_switch_budget(pick: ChatInboundPick) -> u32 {
+    match pick {
+        ChatInboundPick::FollowCurrent => 2,
+        ChatInboundPick::HardRoute | ChatInboundPick::SparkPro => 0,
+    }
+}
+
 /// OpenAI `chat/completions` 入站处理：翻成 codex `responses`，用一个账号打 ChatGPT
 /// 上游，缓冲整条 SSE 后组装回单条 chat/completions JSON。
 /// 供 glance 等 OpenAI 兼容客户端复用 ChatGPT 订阅里闲置的 Spark 额度。
@@ -1373,7 +1387,7 @@ async fn handle_chat_inbound(
 
     // 选供号。没带标记 → 只可能落到第一个非 relay 且 plan_type==pro 的账号
     // （Spark 专属），跟这段代码以前的行为逐字相同。
-    let (token, name, pick) = {
+    let (token, name, pick, mut account_id) = {
         let store = match state.store.lock() {
             Ok(s) => s,
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -1419,7 +1433,7 @@ async fn handle_chat_inbound(
                 &format!("chat 入站选中的账号缺 access_token: {}", acc.name),
             );
         };
-        (tok, acc.name.clone(), pick)
+        (tok, acc.name.clone(), pick, account_id)
     };
 
     let want_stream = chat
@@ -1492,6 +1506,19 @@ async fn handle_chat_inbound(
     // 尝试撞 401"消耗掉循环的最后一轮，然后带着 chat_resp=Null 掉出循环，把一个
     // 空的 200 当成成功回给客户端。上界仍然收敛：最多 1 次刷新 + 1 次空响应重试。
     let mut empty_retry_left = 1u32;
+    // 429 切号预算，只给 FollowCurrent 分支。
+    //
+    // 这个函数原本对 429 什么都不做：`/v1/responses` 那条路径撞限额会
+    // `mark_account_quota_depleted` + `pick_next_account` + `do_switch` 一路换到
+    // 健康号，而 chat/completions 入站直接把 429 原样透回。Worker 任务 3022 就
+    // 死在这里 —— 四张生活场景图都已通过验收，营销规划撞到 current 的 5h 限额，
+    // 整个 attempt 被判为「营销构图方案未通过事实合同」，而池子里另外几个号是好的。
+    //
+    // 切的是 `store.current` 本身，不是"这一条请求偷偷换个号"：Worker 跟随
+    // current，所以下一轮自然也走到新号上，这正是 401 分支注释里担心的
+    // "下一轮又打到另一个账号上"的反面。SparkPro 是 glance 的通道，HardRoute 是
+    // 用户明确指定的账号，两者都保持原样透回。
+    let mut quota_switch_left = quota_switch_budget(pick);
     loop {
         let resp = match forward_with_token(
             &state,
@@ -1530,6 +1557,36 @@ async fn handle_chat_inbound(
                     eprintln!("[ChatInbound] current 401 且刷新失败：{}", why);
                 }
             }
+        }
+        if status.as_u16() == 429 && quota_switch_left > 0 {
+            quota_switch_left -= 1;
+            // 先把这个号标成 5h 耗尽并冷却，否则 pick_next_account 可能立刻又选中它。
+            mark_account_quota_depleted(&state, &account_id);
+            match pick_next_account(&state) {
+                PickResult::Found { id, token: next } => {
+                    match do_switch(&state, &id, SwitchReason::Http429) {
+                        Ok(()) => {
+                            println!(
+                                "[ChatInbound] current 429（{}），已切到账号 {} 并重试",
+                                name, id
+                            );
+                            token = next;
+                            account_id = id;
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("[ChatInbound] 429 切号失败：{}", e);
+                        }
+                    }
+                }
+                PickResult::Exhausted { earliest_reset } => {
+                    eprintln!(
+                        "[ChatInbound] current 429 且账号池已全部耗尽，最早恢复：{:?}",
+                        earliest_reset
+                    );
+                }
+            }
+            // 切不动就落到下面把上游 429 原样透回。
         }
         if !status.is_success() {
             let msg = crate::chat_inbound::extract_upstream_error(&raw)
@@ -6746,6 +6803,19 @@ fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 只有 Worker 的 follow-current 请求才允许被换号。
+    ///
+    /// 3022 之前这个函数不存在，429 在 chat/completions 入站是完全无人处理的：
+    /// `/v1/responses` 会一路切到健康号，这条路直接把限额原样透回，四张已通过
+    /// 验收的场景图跟着整个 attempt 一起作废。
+    #[test]
+    fn only_follow_current_may_switch_accounts_on_429() {
+        assert_eq!(quota_switch_budget(ChatInboundPick::FollowCurrent), 2);
+        // glance 的 Spark 通道和用户点名的硬路由都必须拿到它们选中的那个号。
+        assert_eq!(quota_switch_budget(ChatInboundPick::SparkPro), 0);
+        assert_eq!(quota_switch_budget(ChatInboundPick::HardRoute), 0);
+    }
 
     /// 只带 Worker 标记的 header map。
     fn worker_headers() -> hyper::HeaderMap {
