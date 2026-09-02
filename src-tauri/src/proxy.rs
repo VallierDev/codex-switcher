@@ -694,6 +694,40 @@ fn request_model(body: &[u8]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn decode_request_body_for_routing(
+    headers: &hyper::HeaderMap,
+    body: &Bytes,
+) -> Result<Bytes, String> {
+    let encoding = headers
+        .get(hyper::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_ascii_lowercase());
+    match encoding.as_deref() {
+        Some("zstd") | Some("x-zstd") => zstd::decode_all(body.as_ref())
+            .map(Bytes::from)
+            .map_err(|error| format!("zstd request decompression failed: {error}")),
+        Some("gzip") | Some("x-gzip") => {
+            use std::io::Read;
+            let mut decoder = flate2::read::GzDecoder::new(body.as_ref());
+            let mut decoded = Vec::with_capacity(body.len().saturating_mul(4));
+            decoder
+                .read_to_end(&mut decoded)
+                .map(|_| Bytes::from(decoded))
+                .map_err(|error| format!("gzip request decompression failed: {error}"))
+        }
+        Some("deflate") => {
+            use std::io::Read;
+            let mut decoder = flate2::read::DeflateDecoder::new(body.as_ref());
+            let mut decoded = Vec::with_capacity(body.len().saturating_mul(4));
+            decoder
+                .read_to_end(&mut decoded)
+                .map(|_| Bytes::from(decoded))
+                .map_err(|error| format!("deflate request decompression failed: {error}"))
+        }
+        _ => Ok(body.clone()),
+    }
+}
+
 fn antigravity_routes(state: &ProxyState, model_id: &str) -> Vec<AntigravityRoute> {
     let Ok(store) = state.store.lock() else {
         return Vec::new();
@@ -2589,11 +2623,19 @@ async fn handle_request(
 
     // ── 原生 Antigravity 模型路由 ──
     // Client 与 Codex 同构：Mini 只管 RT/ST，请求从当前运行 Codex 的机器直连 Google。
-    if let Some(model) = request_model(&body_bytes) {
+    let body_for_routing = match decode_request_body_for_routing(&req_headers, &body_bytes) {
+        Ok(body) => body,
+        Err(error) => return Ok(error_response(StatusCode::BAD_REQUEST, &error)),
+    };
+    if let Some(model) = request_model(&body_for_routing) {
         if crate::antigravity::is_antigravity_model(&model) {
-            return Ok(
-                handle_antigravity_response(state, method, &path_and_query, body_bytes).await,
-            );
+            return Ok(handle_antigravity_response(
+                state,
+                method,
+                &path_and_query,
+                body_for_routing,
+            )
+            .await);
         }
     }
 
@@ -7928,6 +7970,49 @@ mod tests {
             Some("gemini-3.7-flash-high")
         );
         assert_eq!(ws_message_model(&prewarm), None);
+    }
+
+    #[test]
+    fn routing_detects_model_inside_zstd_desktop_request() {
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "model": "gemini-3.7-flash-high",
+            "input": "hello"
+        }))
+        .unwrap();
+        let compressed = zstd::encode_all(raw.as_slice(), 1).unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_ENCODING,
+            HeaderValue::from_static("zstd"),
+        );
+        let decoded = decode_request_body_for_routing(&headers, &Bytes::from(compressed)).unwrap();
+        assert_eq!(
+            request_model(&decoded).as_deref(),
+            Some("gemini-3.7-flash-high")
+        );
+    }
+
+    #[test]
+    fn routing_detects_model_inside_gzip_desktop_request() {
+        use std::io::Write;
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "model": "gemini-3.7-flash-high",
+            "input": "hello"
+        }))
+        .unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        let decoded = decode_request_body_for_routing(&headers, &Bytes::from(compressed)).unwrap();
+        assert_eq!(
+            request_model(&decoded).as_deref(),
+            Some("gemini-3.7-flash-high")
+        );
     }
 
     #[test]
