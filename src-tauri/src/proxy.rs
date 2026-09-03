@@ -1292,21 +1292,15 @@ fn antigravity_codex_catalog_entry(
     object.insert("slug".into(), serde_json::json!(model.id));
     object.insert("display_name".into(), serde_json::json!(model.display_name));
     object.insert("description".into(), serde_json::json!(model.description));
-    let identity = format!(
-        "You are Codex, a coding agent powered by {} through Google Antigravity.",
-        model.display_name
-    );
+    // Remove the template's model identity without supplying a replacement.
+    // Operational instructions stay intact; the proxy must not script self-identification.
     if let Some(base) = object
         .get("base_instructions")
         .and_then(serde_json::Value::as_str)
     {
         let rewritten = base
-            .replacen(
-                "You are Codex, a coding agent based on GPT-5.",
-                &identity,
-                1,
-            )
-            .replacen("You are Codex, an agent based on GPT-5.", &identity, 1);
+            .replacen("You are Codex, a coding agent based on GPT-5.", "", 1)
+            .replacen("You are Codex, an agent based on GPT-5.", "", 1);
         object.insert(
             "base_instructions".into(),
             serde_json::Value::String(rewritten),
@@ -1323,12 +1317,8 @@ fn antigravity_codex_catalog_entry(
             .and_then(serde_json::Value::as_object_mut)
         {
             let rewritten = template
-                .replacen(
-                    "You are Codex, a coding agent based on GPT-5.",
-                    &identity,
-                    1,
-                )
-                .replacen("You are Codex, an agent based on GPT-5.", &identity, 1);
+                .replacen("You are Codex, a coding agent based on GPT-5.", "", 1)
+                .replacen("You are Codex, an agent based on GPT-5.", "", 1);
             model_messages.insert(
                 "instructions_template".into(),
                 serde_json::Value::String(rewritten),
@@ -7983,18 +7973,15 @@ mod tests {
         assert!(entry["retirement_at"].is_null());
         assert_eq!(entry["prefer_websockets"], true);
         assert_eq!(entry["supports_websockets"], true);
-        assert!(entry["base_instructions"]
+        assert_eq!(entry["base_instructions"], " Keep helping.");
+        assert_eq!(
+            entry["model_messages"]["instructions_template"],
+            " {{ personality }}"
+        );
+        assert!(template["base_instructions"]
             .as_str()
-            .unwrap_or_default()
-            .contains("powered by Gemini 3.7 Flash"));
-        assert!(!entry["base_instructions"]
-            .as_str()
-            .unwrap_or_default()
+            .unwrap()
             .contains("based on GPT-5"));
-        assert!(entry["model_messages"]["instructions_template"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("powered by Gemini 3.7 Flash"));
     }
 
     #[test]
