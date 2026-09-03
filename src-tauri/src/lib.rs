@@ -293,6 +293,10 @@ fn update_settings(
         prev_remote_mode,
     ) = {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        // Routing state is changed only by its dedicated switch command.
+        // A stale settings form must not overwrite a newer selection.
+        settings.current_antigravity_account_id =
+            store.settings.current_antigravity_account_id.clone();
         let prev = (
             store.settings.background_refresh,
             store.settings.proxy_enabled,
@@ -1145,6 +1149,7 @@ async fn finalize_antigravity_oauth_login(
         {
             let mut store = state.store.lock().map_err(|e| e.to_string())?;
             store.accounts.insert(account.id.clone(), account.clone());
+            store.ensure_current_antigravity_account();
             store.save()?;
         }
         let _ = app.emit("accounts-updated", ());
@@ -1182,248 +1187,26 @@ async fn finalize_antigravity_oauth_login(
     Ok(account)
 }
 
-// ============================================================================
-// 邮箱 OTP 批量自动授权
-// ============================================================================
-
-#[derive(serde::Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct OtpBatchProgress {
-    index: usize,
-    total: usize,
-    email: String,
-    /// "pending" | "running" | "ok" | "fail"
-    status: &'static str,
-    /// provider tag (前端进度行徽章用)
-    provider: String,
-    /// 当 status="running" 时阶段文字
-    stage: Option<String>,
-    /// 成功时账号 id
-    account_id: Option<String>,
-    /// 失败 message
-    error: Option<String>,
-}
-
-#[derive(serde::Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct OtpBatchResult {
-    success: Vec<String>,
-    failed: Vec<(String, String)>,
-}
-
-/// 前端传进来的一条 OTP 任务。
-#[derive(serde::Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-struct OtpEntry {
-    email: String,
-    /// "usmail" | "sorryios"，为空按 "usmail" 处理
-    #[serde(default)]
-    provider: Option<String>,
-    /// sorryios 必须提供（32 位 token）
-    #[serde(default)]
-    token: Option<String>,
-}
-
-fn build_mailbox(entry: &OtpEntry) -> Result<Option<mailbox::MailboxProvider>, String> {
-    let provider = entry
-        .provider
-        .as_deref()
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
-    match provider.as_str() {
-        "" | "usmail" => Ok(None), // None = run_login 默认 usmail
-        "sorryios" => {
-            let token = entry
-                .token
-                .as_deref()
-                .ok_or_else(|| "sorryios provider 缺少 token".to_string())?
-                .trim()
-                .to_string();
-            if token.is_empty() {
-                return Err("sorryios provider token 为空".into());
-            }
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .build()
-                .map_err(|e| format!("构建 sorryios HTTP client 失败: {e}"))?;
-            Ok(Some(mailbox::MailboxProvider::Sorryios(
-                mailbox::SorryiosNet::new(client, token).since_now(),
-            )))
-        }
-        "nissanserena" => {
-            // 需要 cookie store 维持 session
-            let client = reqwest::Client::builder()
-                .cookie_store(true)
-                .timeout(std::time::Duration::from_secs(20))
-                .build()
-                .map_err(|e| format!("构建 nissanserena HTTP client 失败: {e}"))?;
-            Ok(Some(mailbox::MailboxProvider::NissanSerena(
-                mailbox::NissanSerena::new(client).since_now(),
-            )))
-        }
-        other => Err(format!("未知的 mailbox provider: {other}")),
-    }
-}
-
-/// 批量邮箱 OTP 自动授权。串行跑，每条都通过 save_token_as_account 落账号。
-/// 进度通过事件 "otp-batch-progress" 实时推到前端。
-#[tauri::command]
-async fn start_otp_login_batch(
-    state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
-    entries: Vec<OtpEntry>,
-    timeout_secs: Option<u64>,
-) -> Result<OtpBatchResult, String> {
-    use tauri::Emitter;
-    let timeout = timeout_secs.unwrap_or(180);
-    let total = entries.len();
-    let mut success = Vec::new();
-    let mut failed = Vec::new();
-
-    let provider_tag = |e: &OtpEntry| -> String {
-        e.provider
-            .as_deref()
-            .map(|s| s.to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "usmail".to_string())
-    };
-
-    // 先把全部以 pending 状态推一次，前端立刻看到列表
-    for (i, entry) in entries.iter().enumerate() {
-        let _ = app.emit(
-            "otp-batch-progress",
-            OtpBatchProgress {
-                index: i,
-                total,
-                email: entry.email.clone(),
-                status: "pending",
-                provider: provider_tag(entry),
-                stage: None,
-                account_id: None,
-                error: None,
-            },
-        );
-    }
-
-    for (i, entry) in entries.iter().enumerate() {
-        let email = entry.email.clone();
-        let tag = provider_tag(entry);
-        let _ = app.emit(
-            "otp-batch-progress",
-            OtpBatchProgress {
-                index: i,
-                total,
-                email: email.clone(),
-                status: "running",
-                provider: tag.clone(),
-                stage: Some("starting".into()),
-                account_id: None,
-                error: None,
-            },
-        );
-
-        let mailbox = match build_mailbox(entry) {
-            Ok(mb) => mb,
-            Err(e) => {
-                failed.push((email.clone(), e.clone()));
-                let _ = app.emit(
-                    "otp-batch-progress",
-                    OtpBatchProgress {
-                        index: i,
-                        total,
-                        email,
-                        status: "fail",
-                        provider: tag,
-                        stage: Some("provider".into()),
-                        account_id: None,
-                        error: Some(e),
-                    },
-                );
-                continue;
-            }
-        };
-
-        let result = otp_login::run_login(
-            otp_login::LoginInput {
-                email: email.clone(),
-                otp_timeout_secs: timeout,
-            },
-            mailbox,
-        )
-        .await;
-
-        match result {
-            Ok(out) => {
-                match save_token_as_account(
-                    &state,
-                    &app,
-                    out.token,
-                    Some("邮箱 OTP 自动授权".to_string()),
-                )
-                .await
-                {
-                    Ok(acc) => {
-                        success.push(email.clone());
-                        let _ = app.emit(
-                            "otp-batch-progress",
-                            OtpBatchProgress {
-                                index: i,
-                                total,
-                                email: email.clone(),
-                                status: "ok",
-                                provider: tag.clone(),
-                                stage: None,
-                                account_id: Some(acc.id),
-                                error: None,
-                            },
-                        );
-                        let _ = app.emit("accounts-updated", ());
-                    }
-                    Err(e) => {
-                        failed.push((email.clone(), e.clone()));
-                        let _ = app.emit(
-                            "otp-batch-progress",
-                            OtpBatchProgress {
-                                index: i,
-                                total,
-                                email: email.clone(),
-                                status: "fail",
-                                provider: tag.clone(),
-                                stage: Some("save".into()),
-                                account_id: None,
-                                error: Some(e),
-                            },
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                failed.push((email.clone(), e.clone()));
-                let _ = app.emit(
-                    "otp-batch-progress",
-                    OtpBatchProgress {
-                        index: i,
-                        total,
-                        email: email.clone(),
-                        status: "fail",
-                        provider: tag.clone(),
-                        stage: Some("login".into()),
-                        account_id: None,
-                        error: Some(e),
-                    },
-                );
-            }
-        }
-    }
-
-    Ok(OtpBatchResult { success, failed })
-}
-
 // 补充 AppState 的辅助方法以方便在 finalize_oauth_login 中获取 AppHandle 是不行的，
 // 因为 finalize_oauth_login 是 async 且 Command 宏会处理。
 // 我们直接给 finalize_oauth_login 增加 AppHandle 参数。
 
 /// 切换到指定账号（异步版本，不做本地 Token 续期）
+#[tauri::command]
+fn switch_antigravity_account(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<(), String> {
+    {
+        let mut store = state.store.lock().map_err(|error| error.to_string())?;
+        store.switch_antigravity_to(&id)?;
+        store.save()?;
+    }
+    let _ = app.emit("accounts-updated", ());
+    Ok(())
+}
+
 #[tauri::command]
 async fn switch_account(
     state: tauri::State<'_, AppState>,
@@ -2467,6 +2250,7 @@ pub fn start_quota_refresh(
                                                 s.current = None;
                                             }
                                         }
+                                        s.ensure_current_antigravity_account();
                                         let _ = s.save();
                                     }
                                     (updated, pruned)
@@ -5494,7 +5278,10 @@ async fn remote_push_account(
                 acc.id = new_id.clone();
                 store.accounts.insert(new_id.clone(), acc);
                 if store.current.as_deref() == Some(id.as_str()) {
-                    store.current = Some(new_id);
+                    store.current = Some(new_id.clone());
+                }
+                if store.settings.current_antigravity_account_id.as_deref() == Some(id.as_str()) {
+                    store.settings.current_antigravity_account_id = Some(new_id);
                 }
                 let _ = store.save();
             }
@@ -6160,7 +5947,7 @@ pub fn run() {
             finalize_oauth_login,
             finalize_antigravity_oauth_login,
             force_overwrite_disk_with_current,
-            start_otp_login_batch,
+            switch_antigravity_account,
             reload_ide_windows,
             get_settings,
             update_settings,

@@ -193,7 +193,7 @@ interface AccountListProps {
     onSwitch: (id: string) => void | Promise<void>;
     onDelete: (id: string) => void;
     onUpdateAccount: (id: string, name?: string, notes?: string, accountExpiresAt?: string) => Promise<void>;
-    onUpdateSettings: (settings: AppSettings) => void;
+    onUpdateSettings: (settings: AppSettings) => void | Promise<void>;
     onRefreshComplete?: () => void;
     onAddAccount?: () => void;
     onAddRelay?: () => void;
@@ -218,7 +218,7 @@ export function AccountList({
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [refreshingIds, setRefreshingIds] = useState<Set<string>>(new Set());
     const [copiedId, setCopiedId] = useState<string | null>(null);
-    const [switchingIds] = useState<Set<string>>(new Set());
+    const [switchingIds, setSwitchingIds] = useState<Set<string>>(new Set());
     const [usageMap, setUsageMap] = useState<Record<string, UsageData>>({});
     const [isRefreshingAll, setIsRefreshingAll] = useState(false);
     const [searchQuery, setSearchQuery] = useState('');
@@ -640,6 +640,25 @@ export function AccountList({
         }
     };
 
+    const handleSwitchAntigravity = async (id: string, name: string) => {
+        if (switchingIds.has(id)) return;
+        setSwitchingIds(prev => new Set(prev).add(id));
+        try {
+            await invoke('switch_antigravity_account', { id });
+            onRefreshComplete?.();
+            setPushToast({ type: 'success', text: `Google 当前账号已切换为 ${name}` });
+        } catch (error) {
+            setPushToast({ type: 'error', text: `Google 切号失败：${String(error)}` });
+        } finally {
+            setSwitchingIds(prev => {
+                const next = new Set(prev);
+                next.delete(id);
+                return next;
+            });
+            setTimeout(() => setPushToast(null), 4000);
+        }
+    };
+
     // 把 Tauri/后端原始报错翻译成人能看懂的一句话。
     const humanizeRefreshError = (raw: string): string => {
         const s = raw.toLowerCase();
@@ -871,7 +890,7 @@ export function AccountList({
                     <button
                         className="toolbar-icon-btn toolbar-icon-btn-primary"
                         onClick={onAddAccount}
-                        title="登录账号 (OpenAI / OTP / 导入)"
+                        title="登录账号 (OpenAI / Google / 导入)"
                     >
                         <Plus size={16} />
                     </button>
@@ -932,6 +951,7 @@ export function AccountList({
                 <div className="account-table-body">
                     {filteredAccounts.map(acc => {
                         const usage = usageMap[acc.id];
+                        const kind = effectiveKind(acc);
                         // 被限流 = 任一额度桶（5H / 周 / Spark）剩余为 0，上游已 429 拒绝请求。
                         // 这一刻消耗一次主动重置回收最大（把 0% 的窗口拉回满）。
                         const rateLimited = !!usage && (
@@ -939,13 +959,17 @@ export function AccountList({
                             usage.weekly_left === 0 ||
                             (!!usage.spark && (usage.spark.five_hour_left === 0 || usage.spark.weekly_left === 0))
                         );
-                        const status = getStatusInfo(acc);
+                        const isCurrent = acc.id === currentId;
+                        const isAntigravityCurrent = kind === 'antigravity_oauth'
+                            && settings.current_antigravity_account_id === acc.id;
+                        const status = isAntigravityCurrent
+                            ? { text: 'Google 当前', warn: false }
+                            : getStatusInfo(acc);
                         const err = acc.keepalive?.last_error;
                         const isPermanentError = err?.toLowerCase().match(/invalidated|expired|invalid_refresh_token|invalid_grant/);
                         const isInvalid = invalidIds.has(acc.id) || !!isPermanentError || acc.is_token_invalid || acc.is_logged_out;
                         const isBanned = bannedIds.has(acc.id);
                         const isLoggedOut = acc.is_logged_out;
-                        const isCurrent = acc.id === currentId;
                         const isRefreshing = refreshingIds.has(acc.id);
                         const expiry = accountExpiryInfo(acc.account_expires_at);
                         const priming = acc.window_priming;
@@ -958,7 +982,7 @@ export function AccountList({
                         const primingLabel = primeMode === 'weekly' ? '7D' : '5H';
 
                         return (
-                            <div key={acc.id} className={`account-row ${isCurrent ? 'current' : ''} ${selectedIds.has(acc.id) ? 'selected' : ''} ${isBanned ? 'banned' : isLoggedOut ? 'logged-out' : isInvalid ? 'expired' : ''}`}>
+                            <div key={acc.id} className={`account-row ${isCurrent || isAntigravityCurrent ? 'current' : ''} ${selectedIds.has(acc.id) ? 'selected' : ''} ${isBanned ? 'banned' : isLoggedOut ? 'logged-out' : isInvalid ? 'expired' : ''}`}>
                                 <div className="col-checkbox">
                                     <input type="checkbox" className="custom-checkbox" checked={selectedIds.has(acc.id)} onChange={() => { const s = new Set(selectedIds); s.has(acc.id) ? s.delete(acc.id) : s.add(acc.id); setSelectedIds(s); }} />
                                 </div>
@@ -1006,6 +1030,7 @@ export function AccountList({
                                         })()}
                                         {copiedId === acc.id && <span className="badge copy-success">已复制</span>}
                                         {isCurrent && <span className="badge current">当前</span>}
+                                        {isAntigravityCurrent && <span className="badge current">Google 当前</span>}
                                         {acc.is_session_anchor && (
                                             <span
                                                 className="badge anchor"
@@ -1145,6 +1170,16 @@ export function AccountList({
                                     )}
                                     {!isCurrent && effectiveKind(acc) !== 'antigravity_oauth' && (
                                         <button className="action-btn switch" onClick={() => onSwitch(acc.id)} disabled={switchingIds.has(acc.id)} title="切换"><ArrowLeftRight size={14} /></button>
+                                    )}
+                                    {kind === 'antigravity_oauth' && !isAntigravityCurrent && (
+                                        <button
+                                            className="action-btn switch"
+                                            onClick={() => handleSwitchAntigravity(acc.id, acc.name)}
+                                            disabled={switchingIds.has(acc.id)}
+                                            title="切换 Google 当前账号（不影响 Codex 当前账号）"
+                                        >
+                                            <ArrowLeftRight size={14} />
+                                        </button>
                                     )}
                                     {effectiveKind(acc) === 'chatgpt_oauth' && (usage?.plan_type ?? '').toLowerCase() !== 'free' && (
                                         <button className="action-btn invite" onClick={() => openInvite(acc.id, acc.name)} title="发送 Codex 邀请"><UserPlus size={14} /></button>

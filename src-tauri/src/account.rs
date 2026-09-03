@@ -118,6 +118,11 @@ pub struct AppSettings {
     #[serde(default)]
     pub remote_shared_secret: String,
 
+    /// Google Antigravity 独立当前账号。
+    /// 与 AccountStore.current（Codex/OpenAI 当前账号）互不影响，也不写 ~/.codex/auth.json。
+    #[serde(default)]
+    pub current_antigravity_account_id: Option<String>,
+
     /// client 模式下，同步到 Server 时要跳过的 skill 目录名
     #[serde(default)]
     pub skills_sync_blacklist: Vec<String>,
@@ -277,6 +282,7 @@ impl Default for AppSettings {
             remote_server_url: String::new(),
             remote_server_url_fallback: String::new(),
             remote_shared_secret: String::new(),
+            current_antigravity_account_id: None,
             skills_sync_blacklist: Vec::new(),
             solo_auto_sync_current: true,
             proxy_bootstrap_byte_cap: default_bootstrap_byte_cap(),
@@ -744,6 +750,9 @@ impl AccountStore {
         if store.migrate_solo_into_client() {
             let _ = store.save();
         }
+        if store.ensure_current_antigravity_account() {
+            let _ = store.save();
+        }
 
         store
     }
@@ -765,6 +774,63 @@ impl AccountStore {
         } else {
             false
         }
+    }
+
+    /// Manual Google selection never writes Codex auth or changes its current pointer.
+    pub fn switch_antigravity_to(&mut self, id: &str) -> Result<(), String> {
+        let account = self.accounts.get(id).ok_or("Google 账号不存在")?;
+        if !account.is_antigravity_oauth() {
+            return Err("只能选择 Google Antigravity 账号".to_string());
+        }
+        if account.is_banned || account.is_logged_out || account.is_token_invalid {
+            return Err("Google 账号不可用，请先重新授权".to_string());
+        }
+        self.settings.current_antigravity_account_id = Some(id.to_string());
+        Ok(())
+    }
+
+    /// 保证 Google 当前号指向一个现存的 Antigravity 账号；升级旧配置时自动补首个号。
+    pub fn ensure_current_antigravity_account(&mut self) -> bool {
+        let current_is_valid = self
+            .settings
+            .current_antigravity_account_id
+            .as_deref()
+            .and_then(|id| self.accounts.get(id))
+            .map(Account::is_antigravity_oauth)
+            .unwrap_or(false);
+        if current_is_valid {
+            return false;
+        }
+        let next = self
+            .accounts
+            .values()
+            .filter(|account| account.is_antigravity_oauth())
+            .min_by_key(|account| account.created_at)
+            .map(|account| account.id.clone());
+        if self.settings.current_antigravity_account_id == next {
+            return false;
+        }
+        self.settings.current_antigravity_account_id = next;
+        true
+    }
+
+    pub fn adopt_antigravity_after_success(
+        &mut self,
+        id: &str,
+        selected_at_start: Option<&str>,
+    ) -> bool {
+        if self.settings.current_antigravity_account_id.as_deref() != selected_at_start
+            || selected_at_start == Some(id)
+            || !self
+                .accounts
+                .get(id)
+                .map(Account::is_antigravity_oauth)
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        self.settings.current_antigravity_account_id = Some(id.to_string());
+        true
     }
 
     /// 一次性迁移：把"老 legacy 账号但其实是 Relay"的记录升级到 `kind = Relay`。
@@ -1343,6 +1409,9 @@ impl AccountStore {
         };
 
         self.accounts.insert(id, account.clone());
+        if self.settings.current_antigravity_account_id.is_none() {
+            self.settings.current_antigravity_account_id = Some(account.id.clone());
+        }
         account
     }
 
@@ -1403,6 +1472,10 @@ impl AccountStore {
         // 如果删除的是当前账号，清空 current
         if self.current.as_deref() == Some(id) {
             self.current = self.accounts.keys().next().cloned();
+        }
+        if self.settings.current_antigravity_account_id.as_deref() == Some(id) {
+            self.settings.current_antigravity_account_id = None;
+            self.ensure_current_antigravity_account();
         }
 
         Ok(())
@@ -2094,6 +2167,57 @@ mod tests {
 
         assert_eq!(store.accounts.len(), 1);
         assert_eq!(store.current, Some(account.id));
+    }
+
+    #[test]
+    fn antigravity_current_is_independent_and_moves_after_delete() {
+        let mut store = AccountStore::default();
+        let codex = store.add_account(
+            "codex@example.com".to_string(),
+            serde_json::json!({"token": "test"}),
+            None,
+        );
+        let google_one = store.add_antigravity_account(
+            "google-one@example.com".to_string(),
+            serde_json::json!({"provider":"antigravity"}),
+            None,
+        );
+        let google_two = store.add_antigravity_account(
+            "google-two@example.com".to_string(),
+            serde_json::json!({"provider":"antigravity"}),
+            None,
+        );
+
+        assert_eq!(store.current.as_deref(), Some(codex.id.as_str()));
+        assert_eq!(
+            store.settings.current_antigravity_account_id.as_deref(),
+            Some(google_one.id.as_str())
+        );
+
+        assert!(store.switch_antigravity_to(&codex.id).is_err());
+        assert!(store.switch_antigravity_to("missing").is_err());
+        store.switch_antigravity_to(&google_two.id).unwrap();
+        assert_eq!(store.current.as_deref(), Some(codex.id.as_str()));
+        // An older request cannot overwrite a newer manual choice.
+        assert!(!store.adopt_antigravity_after_success(&google_one.id, Some(&google_one.id)));
+        assert_eq!(
+            store.settings.current_antigravity_account_id.as_deref(),
+            Some(google_two.id.as_str())
+        );
+        store.switch_antigravity_to(&google_one.id).unwrap();
+
+        store.delete_account(&google_one.id).unwrap();
+        assert_eq!(store.current.as_deref(), Some(codex.id.as_str()));
+        assert_eq!(
+            store.settings.current_antigravity_account_id.as_deref(),
+            Some(google_two.id.as_str())
+        );
+        let json = serde_json::to_vec(&store).unwrap();
+        let restored: AccountStore = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            restored.settings.current_antigravity_account_id,
+            store.settings.current_antigravity_account_id
+        );
     }
 
     #[test]

@@ -40,6 +40,7 @@ export interface AppSettings {
     relay_auto_switch_out?: boolean;
     relay_auto_switch_in?: boolean;
     client_direct_upstream?: boolean;
+    current_antigravity_account_id?: string | null;
 }
 
 export interface KeepaliveState {
@@ -187,7 +188,7 @@ export function useAccounts() {
         try {
             setError(null);
             await invoke('update_settings', { settings: newSettings });
-            setSettings(newSettings);
+            setSettings(await invoke<AppSettings>('get_settings'));
         } catch (err) {
             setError(String(err));
             throw err;

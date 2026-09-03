@@ -680,6 +680,7 @@ struct RelayRoute {
 #[derive(Debug, Clone)]
 struct AntigravityRoute {
     account_id: String,
+    selected_at_start: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
     project_id: String,
@@ -732,8 +733,13 @@ fn antigravity_routes(state: &ProxyState, model_id: &str) -> Vec<AntigravityRout
     let Ok(store) = state.store.lock() else {
         return Vec::new();
     };
+    antigravity_routes_from_store(&store, model_id)
+}
+
+fn antigravity_routes_from_store(store: &AccountStore, model_id: &str) -> Vec<AntigravityRoute> {
     let client_mode = store.settings.remote_mode == "client";
-    let mut routes: Vec<(f64, Option<chrono::DateTime<Utc>>, AntigravityRoute)> = store
+    let selected_id = store.settings.current_antigravity_account_id.as_deref();
+    let mut routes: Vec<(bool, f64, Option<chrono::DateTime<Utc>>, AntigravityRoute)> = store
         .accounts
         .values()
         .filter(|account| {
@@ -762,10 +768,12 @@ fn antigravity_routes(state: &ProxyState, model_id: &str) -> Vec<AntigravityRout
                 return None;
             }
             Some((
+                selected_id == Some(account.id.as_str()),
                 quota_score,
                 account.last_used,
                 AntigravityRoute {
                     account_id: account.id.clone(),
+                    selected_at_start: selected_id.map(ToOwned::to_owned),
                     access_token,
                     refresh_token,
                     project_id: account.auth_json.get("project_id")?.as_str()?.to_string(),
@@ -781,11 +789,16 @@ fn antigravity_routes(state: &ProxyState, model_id: &str) -> Vec<AntigravityRout
     routes.sort_by(|left, right| {
         right
             .0
-            .partial_cmp(&left.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.1.cmp(&right.1))
+            .cmp(&left.0)
+            .then_with(|| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.2.cmp(&right.2))
     });
-    routes.into_iter().map(|(_, _, route)| route).collect()
+    routes.into_iter().map(|(_, _, _, route)| route).collect()
 }
 
 fn has_antigravity_account(state: &ProxyState) -> bool {
@@ -1081,6 +1094,21 @@ async fn handle_antigravity_response(
             let preview: String = error_body.chars().take(500).collect();
             last_error = format!("Antigravity upstream returned HTTP {status}: {preview}");
             continue;
+        }
+        let selection_changed = if let Ok(mut store) = state.store.lock() {
+            let changed = store.adopt_antigravity_after_success(
+                &route.account_id,
+                route.selected_at_start.as_deref(),
+            );
+            if changed {
+                let _ = store.save();
+            }
+            changed
+        } else {
+            false
+        };
+        if selection_changed {
+            let _ = state.app_handle.emit("accounts-updated", ());
         }
         schedule_antigravity_success_refresh(
             state.clone(),
@@ -7948,6 +7976,39 @@ fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_manual_account_wins_until_that_model_is_exhausted() {
+        let mut store = AccountStore::default();
+        store.settings.remote_mode = "client".into();
+        let first = store.add_antigravity_account(
+            "first".into(),
+            serde_json::json!({"project_id":"p"}),
+            None,
+        );
+        let second = store.add_antigravity_account(
+            "second".into(),
+            serde_json::json!({"project_id":"p"}),
+            None,
+        );
+        let codex_current = store.current.clone();
+        store.switch_antigravity_to(&second.id).unwrap();
+        let routes = antigravity_routes_from_store(&store, "gemini-3.7-flash-high");
+        assert_eq!(routes[0].account_id, second.id);
+        crate::antigravity::quota::mark_model_exhausted(
+            &mut store.accounts.get_mut(&second.id).unwrap().auth_json,
+            "gemini-3.7-flash-high",
+        );
+        assert_eq!(
+            antigravity_routes_from_store(&store, "gemini-3.7-flash-high")[0].account_id,
+            first.id
+        );
+        assert_eq!(
+            antigravity_routes_from_store(&store, "gemini-pro-agent")[0].account_id,
+            second.id
+        );
+        assert_eq!(store.current, codex_current);
+    }
 
     #[test]
     fn antigravity_catalog_never_inherits_template_retirement() {
