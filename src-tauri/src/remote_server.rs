@@ -514,10 +514,33 @@ pub(crate) async fn refresh_antigravity_quota_local(
         .ok_or("Google project_id 缺失")?;
     let client = crate::antigravity::native::build_http_client()?;
     let quotas = crate::antigravity::quota::fetch_model_quotas(&client, token, project).await?;
+    let tier_due = store
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard.accounts.get(id).map(|account| {
+                crate::antigravity::quota::tier_refresh_due(&account.auth_json, chrono::Utc::now())
+            })
+        })
+        .unwrap_or(true);
+    let tier = if tier_due {
+        crate::antigravity::quota::fetch_subscription_tier(&client, token)
+            .await
+            .ok()
+    } else {
+        None
+    };
     {
         let mut guard = store.lock().map_err(|error| error.to_string())?;
         let account = guard.accounts.get_mut(id).ok_or("账号已被删除")?;
         crate::antigravity::quota::write_model_quotas(&mut account.auth_json, &quotas);
+        if let Some(tier) = tier {
+            crate::antigravity::quota::write_subscription_tier(
+                &mut account.auth_json,
+                tier,
+                chrono::Utc::now(),
+            );
+        }
         // Google has its own refresh loop; never enroll it in OpenAI keepalive.
         account.keepalive.inactive_refresh_enabled = false;
         if account
@@ -682,6 +705,8 @@ fn antigravity_account_mirror(account: Account) -> Account {
         "email": mirror.name,
         "project_id": mirror.auth_json.get("project_id").cloned().unwrap_or(Value::Null),
         "model_quotas": mirror.auth_json.get("model_quotas").cloned().unwrap_or(Value::Null),
+        "subscription_tier": mirror.auth_json.get("subscription_tier").cloned().unwrap_or(Value::Null),
+        "subscription_tier_checked_at": mirror.auth_json.get("subscription_tier_checked_at").cloned().unwrap_or(Value::Null),
     });
     mirror
 }

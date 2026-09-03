@@ -302,6 +302,112 @@ struct ProxyState {
     listen_port: u16,
 }
 
+static ACTIVE_PROXY_STATE: std::sync::LazyLock<Mutex<Option<std::sync::Weak<ProxyState>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// Fire-and-forget metadata prewarm for the current or newly selected Google account.
+/// This shares the exact ST cache and HTTP pool used by inference and never calls generateContent.
+pub fn request_antigravity_prewarm(account_id: Option<String>) {
+    let state = ACTIVE_PROXY_STATE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref()?.upgrade());
+    let Some(state) = state else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        let started = std::time::Instant::now();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            prewarm_antigravity_account(&state, account_id),
+        )
+        .await
+        {
+            Ok(Ok(id)) => println!(
+                "[GooglePrewarm] account={} ready in {}ms",
+                id,
+                started.elapsed().as_millis()
+            ),
+            Ok(Err(error)) => eprintln!("[GooglePrewarm] skipped: {error}"),
+            Err(_) => eprintln!("[GooglePrewarm] metadata warmup timed out"),
+        }
+    });
+}
+
+fn google_prewarm_target(store: &AccountStore, requested: Option<&str>) -> Option<String> {
+    if store.settings.remote_mode != "client" || !store.settings.proxy_enabled {
+        return None;
+    }
+    let current = store.settings.current_antigravity_account_id.as_deref()?;
+    if requested.is_some_and(|id| id != current) {
+        return None;
+    }
+    let account = store.accounts.get(current)?;
+    (account.is_antigravity_oauth()
+        && !account.is_banned
+        && !account.is_logged_out
+        && !account.is_token_invalid)
+        .then(|| current.to_string())
+}
+
+async fn prewarm_antigravity_account(
+    state: &ProxyState,
+    account_id: Option<String>,
+) -> Result<String, String> {
+    let (id, primary, fallback, secret) = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        let id = google_prewarm_target(&store, account_id.as_deref())
+            .ok_or("no eligible current Google account")?;
+        let (primary, fallback) = antigravity_remote_urls(&store);
+        (
+            id,
+            primary,
+            fallback,
+            store.settings.remote_shared_secret.clone(),
+        )
+    };
+    let lease = match remote_antigravity_token_cache_get(&id) {
+        Some(lease) => lease,
+        None => {
+            if secret.is_empty() {
+                return Err("missing Mini Server secret".into());
+            }
+            let base = crate::remote_client::resolve_base_url(&primary, &fallback).await?;
+            let leased =
+                crate::remote_client::fetch_antigravity_token(&base, &secret, &id, false).await?;
+            let entry = RemoteAntigravityTokenCacheEntry {
+                access_token: leased.access_token,
+                project_id: leased.project_id,
+                expires_at: leased
+                    .expires_at
+                    .as_deref()
+                    .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                    .map(|value| value.with_timezone(&Utc))
+                    .ok_or("Mini Server Google lease has invalid expiry")?,
+            };
+            remote_antigravity_token_cache_put(&id, entry.clone());
+            entry
+        }
+    };
+    let client = antigravity_http_client(state, &id)?;
+    let user_agent = crate::antigravity::native::request_user_agent(&client).await;
+    let response = client
+        .post(crate::antigravity::native::FETCH_MODELS_URL)
+        .bearer_auth(&lease.access_token)
+        .header("content-type", "application/json")
+        .header("user-agent", user_agent)
+        .json(&serde_json::json!({"project":lease.project_id}))
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("metadata returned HTTP {}", response.status()));
+    }
+    let _ = response.bytes().await.map_err(|error| error.to_string())?;
+    Ok(id)
+}
+
 pub fn effective_listen_port(configured: u16) -> u16 {
     std::env::var("CODEX_SWITCHER_PROXY_PORT_OVERRIDE")
         .ok()
@@ -359,6 +465,10 @@ pub fn start(
             quota_cooldown: Arc::new(Mutex::new(std::collections::HashMap::new())),
             listen_port: port,
         });
+        if let Ok(mut active) = ACTIVE_PROXY_STATE.lock() {
+            *active = Some(Arc::downgrade(&state));
+        }
+        request_antigravity_prewarm(None);
 
         loop {
             let (stream, peer_addr) = match listener.accept().await {
@@ -8020,6 +8130,27 @@ fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prewarm_only_targets_enabled_client_current_google_account() {
+        let mut store = AccountStore::default();
+        store.settings.remote_mode = "client".into();
+        store.settings.proxy_enabled = true;
+        let google = store.add_antigravity_account("google".into(), serde_json::json!({}), None);
+        assert_eq!(google_prewarm_target(&store, None), Some(google.id.clone()));
+        assert!(google_prewarm_target(&store, Some("old-selection")).is_none());
+        store.settings.proxy_enabled = false;
+        assert!(google_prewarm_target(&store, None).is_none());
+        store.settings.proxy_enabled = true;
+        store.settings.remote_mode = "server".into();
+        assert!(google_prewarm_target(&store, None).is_none());
+        store.settings.remote_mode = "client".into();
+        store.accounts.get_mut(&google.id).unwrap().is_banned = true;
+        assert!(google_prewarm_target(&store, None).is_none());
+        store.accounts.get_mut(&google.id).unwrap().is_banned = false;
+        store.accounts.get_mut(&google.id).unwrap().kind = AccountKind::ChatgptOauth;
+        assert!(google_prewarm_target(&store, None).is_none());
+    }
 
     #[test]
     fn google_catalog_and_routes_follow_each_accounts_live_models() {

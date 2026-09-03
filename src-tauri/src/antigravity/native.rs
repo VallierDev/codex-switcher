@@ -8,6 +8,8 @@ pub const FETCH_MODELS_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
 pub const QUOTA_SUMMARY_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+pub const LOAD_CODE_ASSIST_URL: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 pub const STREAM_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
 pub const GOOGLE_API_CLIENT: &str = "gl-node/22.21.1";

@@ -392,6 +392,8 @@ fn tokenless_google_accounts(mut accounts: Vec<Account>) -> Vec<Account> {
             "provider":"antigravity", "email":account.name,
             "project_id":account.auth_json.get("project_id"),
             "model_quotas":account.auth_json.get("model_quotas"),
+            "subscription_tier":account.auth_json.get("subscription_tier"),
+            "subscription_tier_checked_at":account.auth_json.get("subscription_tier_checked_at"),
         });
     }
     accounts
@@ -406,6 +408,7 @@ mod google_mirror_tests {
         let mut store = crate::account::AccountStore::default();
         let google = store.add_antigravity_account("example@gmail.com".into(), serde_json::json!({
             "project_id":"p", "model_quotas":{"gemini-test":{"remaining_fraction":0.9}},
+            "subscription_tier":"pro", "subscription_tier_checked_at":"now",
             "access_token":"top-secret-st", "tokens":{"access_token":"secret-st", "refresh_token":"secret-rt"},
         }), None);
         let mut codex = google.clone();
@@ -414,6 +417,8 @@ mod google_mirror_tests {
         assert_eq!(mirrors.len(), 1);
         assert!(mirrors[0].refresh_token.is_none());
         assert_eq!(mirrors[0].auth_json["project_id"], "p");
+        assert_eq!(mirrors[0].auth_json["subscription_tier"], "pro");
+        assert_eq!(mirrors[0].auth_json["subscription_tier_checked_at"], "now");
         assert_eq!(
             mirrors[0].auth_json["model_quotas"]["gemini-test"]["remaining_fraction"],
             0.9

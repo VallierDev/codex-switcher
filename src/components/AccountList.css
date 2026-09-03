@@ -1,4 +1,7 @@
 .account-list-container {
+    min-width: 0;
+    max-width: 100%;
+    container-type: inline-size;
     display: flex;
     flex-direction: column;
     height: 100%;
@@ -11,6 +14,7 @@
 /* 工具栏 */
 .account-list-toolbar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 12px;
     padding: 12px 16px;
@@ -63,6 +67,8 @@
 /* 筛选按钮组 */
 .filter-group {
     display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
     gap: 2px;
     background: var(--input-bg);
     padding: 3px;
@@ -296,6 +302,7 @@
 /* 表格主体 */
 .account-table-body {
     flex: 1;
+    min-width: 0;
     overflow-y: auto;
 }
 
@@ -342,7 +349,7 @@
 
 .col-email {
     flex: 1;
-    min-width: 200px;
+    min-width: var(--account-email-min, 200px);
     display: flex;
     align-items: center;
     gap: 8px;
@@ -592,13 +599,14 @@
 
 .col-quota-merged {
     width: 380px;
-    flex-shrink: 0;
+    flex: 0 1 auto;
+    min-width: 230px;
     padding-right: 16px;
 }
 
 .quota-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 4px;
     padding: 2px 0;
 }
@@ -721,7 +729,8 @@
 
 .col-time {
     width: 170px;
-    flex-shrink: 0;
+    flex: 0 1 170px;
+    min-width: 110px;
     font-size: 10px;
     color: var(--text-muted);
     display: flex;
@@ -907,9 +916,10 @@
 }
 
 .col-actions {
-    width: 188px;
+    width: 136px;
     flex-shrink: 0;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: flex-end;
     gap: 6px;
@@ -930,6 +940,23 @@
     font-size: 14px;
     transition: all 0.2s ease;
     color: var(--text-muted);
+}
+
+@container (max-width: 900px) {
+    .account-row { --account-email-min: 160px; }
+    .account-row .quota-grid { grid-template-columns: minmax(0, 1fr); }
+    .account-row .col-quota-merged { min-width: 180px; }
+    .account-row .col-email { min-width: 160px; }
+    .account-row, .account-table-header { padding-left: 8px; padding-right: 8px; }
+}
+
+@container (max-width: 800px) {
+    .account-row { --account-email-min: 0px; flex-wrap: wrap; gap: 8px 0; }
+    .account-row .col-email { flex: 1 1 calc(100% - 56px); min-width: 0; padding-right: 0; }
+    .account-row .col-quota-merged { flex: 1 1 100%; min-width: 0; width: 100%; padding-right: 0; }
+    .account-row .col-time { flex: 1 1 110px; }
+    .account-table-header .col-quota-merged, .account-table-header .col-time, .account-table-header .col-actions { display: none; }
+    .google-quota-models { grid-template-columns: minmax(0, 1fr); }
 }
 
 .action-btn:hover:not(:disabled) {
@@ -1290,6 +1317,11 @@
     background: rgba(52, 168, 83, 0.14);
     border-color: rgba(52, 168, 83, 0.32);
 }
+.badge.google-tier { letter-spacing: .02em; }
+.badge.google-tier-free { background: var(--badge-bg); color: var(--text-muted); }
+.badge.google-tier-unknown { background: var(--badge-bg); color: var(--text-muted); text-transform: none; }
+.badge.google-tier-pro { background: color-mix(in srgb, var(--primary-color) 20%, transparent); color: var(--primary-color); }
+.badge.google-tier-ultra { background: color-mix(in srgb, var(--purple-color) 22%, transparent); color: var(--purple-color); }
 
 /* Coding Plan / Token Plan 类（厂商自家订阅） */
 .badge.kind-codingplan {

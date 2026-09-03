@@ -3,6 +3,93 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+pub async fn fetch_subscription_tier(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<&'static str, String> {
+    let response = client
+        .post(super::native::LOAD_CODE_ASSIST_URL)
+        .bearer_auth(access_token)
+        .header(
+            "user-agent",
+            super::native::request_user_agent(client).await,
+        )
+        .json(&serde_json::json!({"metadata":{"ideType":"ANTIGRAVITY"}}))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|error| format!("Google tier request failed: {error}"))?;
+    let status = response.status();
+    let body: Value = response.json().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("Google tier request failed with HTTP {status}"));
+    }
+    Ok(parse_subscription_tier(&body))
+}
+
+fn parse_subscription_tier(body: &Value) -> &'static str {
+    let paid = body
+        .get("paidTier")
+        .filter(|tier| !tier.is_null())
+        .or_else(|| body.get("currentTier"))
+        .unwrap_or(&Value::Null);
+    let identity = format!(
+        "{} {} {}",
+        paid.get("id").and_then(Value::as_str).unwrap_or(""),
+        paid.get("name").and_then(Value::as_str).unwrap_or(""),
+        paid.get("slug").and_then(Value::as_str).unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    if identity.contains("g1-ultra-tier") || identity.contains("google ai ultra") {
+        "ultra"
+    } else if identity.contains("g1-pro-tier") || identity.contains("google ai pro") {
+        "pro"
+    } else if identity.contains("g1-plus-tier") || identity.contains("google ai plus") {
+        "plus"
+    } else if identity.contains("free-tier") || identity.contains("starter quota") {
+        "free"
+    } else {
+        "unknown"
+    }
+}
+
+pub fn tier_refresh_due(auth_json: &Value, now: DateTime<Utc>) -> bool {
+    if auth_json
+        .get("subscription_tier_source")
+        .and_then(Value::as_str)
+        != Some("loadCodeAssist-v2")
+    {
+        return true;
+    }
+    let max_age = if matches!(
+        auth_json.get("subscription_tier").and_then(Value::as_str),
+        None | Some("unknown")
+    ) {
+        chrono::Duration::minutes(5)
+    } else {
+        chrono::Duration::hours(6)
+    };
+    auth_json
+        .get("subscription_tier_checked_at")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_none_or(|checked| checked.with_timezone(&Utc) <= now - max_age)
+}
+
+pub fn write_subscription_tier(auth_json: &mut Value, tier: &str, now: DateTime<Utc>) {
+    if let Some(object) = auth_json.as_object_mut() {
+        object.insert(
+            "subscription_tier_source".into(),
+            Value::String("loadCodeAssist-v2".into()),
+        );
+        object.insert("subscription_tier".into(), Value::String(tier.to_string()));
+        object.insert(
+            "subscription_tier_checked_at".into(),
+            Value::String(now.to_rfc3339()),
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QuotaWindow {
     pub remaining_fraction: f64,
@@ -230,6 +317,39 @@ pub fn mark_model_exhausted(auth_json: &mut Value, model_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_tier_uses_paid_tier_and_defaults_to_free() {
+        assert_eq!(
+            parse_subscription_tier(
+                &serde_json::json!({"currentTier":{"id":"free-tier"},"paidTier":{"id":"g1-pro-tier","name":"Google AI Pro"}})
+            ),
+            "pro"
+        );
+        assert_eq!(
+            parse_subscription_tier(
+                &serde_json::json!({"paidTier":{"id":"g1-ultra-tier","name":"Google AI Ultra"}})
+            ),
+            "ultra"
+        );
+        assert_eq!(
+            parse_subscription_tier(
+                &serde_json::json!({"paidTier":{"id":"free-tier","name":"Antigravity Starter Quota"}})
+            ),
+            "free"
+        );
+        assert_eq!(parse_subscription_tier(&serde_json::json!({})), "unknown");
+        assert_eq!(
+            parse_subscription_tier(
+                &serde_json::json!({"currentTier":{"id":"standard-tier","name":"Antigravity"}})
+            ),
+            "unknown"
+        );
+        assert_eq!(
+            parse_subscription_tier(&serde_json::json!({"paidTier":{"id":"g1-plus-tier"}})),
+            "plus"
+        );
+    }
 
     #[test]
     fn window_summary_keeps_five_hour_and_weekly_independent() {

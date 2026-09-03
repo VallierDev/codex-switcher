@@ -21,20 +21,31 @@ const quotas: Record<string, AntigravityModelQuota> = {
 function Preview() {
     const [live, setLive] = useState(quotas);
     const [dark, setDark] = useState(false);
-    return <main data-theme={dark ? 'dark' : 'light'} style={{ padding: 24, maxWidth: 800, background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>
+    const [width, setWidth] = useState(1200);
+    const actions = (count: number) => <div className="col-actions">{Array.from({length: count}, (_, i) => <button key={i} className="action-btn" aria-label={`操作 ${i + 1}`}>{i + 1}</button>)}</div>;
+    const status = <div className="col-time"><div className="time-item">状态：正常</div><div className="time-item">刷新：09/03 12:00</div></div>;
+    return <main data-theme={dark ? 'dark' : 'light'} style={{ padding: 24, width, maxWidth: '100%', background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>
         <h2>Google 模型额度验收（模拟数据）</h2>
         <button onClick={() => setLive({ ...live, 'new-model-after-refresh': { remaining_fraction: 0.7, reset_time: reset } })}>模拟刷新：新增模型</button>
         <button onClick={() => setDark(value => !value)}>切换深浅色</button>
-        <h3>账号 A · 长邮箱回归</h3><div className="account-list-container"><div className="account-row">
-            <div className="col-email"><span className="email-text">agwffgrtyrdfrebsdtgst@gmail.com</span><div className="badges" style={{ marginLeft: 8 }}>Google</div></div>
+        {[1200, 900, 680].map(size => <button key={size} onClick={() => setWidth(size)}>宽度 {size}</button>)}
+        <h3>账号 A · 完整列宽回归</h3><div className="account-list-container">
+        <div className="account-list-toolbar"><div className="search-box"><input placeholder="搜索邮箱" /></div><div className="filter-group">{['ALL','Sub','Google','PRO','PLUS','TEAM','FREE','中转','Plan','三方'].map(label => <button key={label} className="filter-btn">{label}</button>)}</div></div>
+        <div className="account-table-header"><div className="col-checkbox">□</div><div className="col-drag"/><div className="col-email">账号</div><div className="col-quota-merged">额度</div><div className="col-time">状态</div><div className="col-actions">操作</div></div>
+        <div className="account-table-body"><div className="account-row">
+            <div className="col-checkbox">□</div><div className="col-drag">⋮</div>
+            <div className="col-email"><span className="email-text">agwffgrtyrdfrebsdtgst@gmail.com</span><div className="badges" style={{ marginLeft: 8 }}><span className="badge kind-antigravity">Google</span><span className="badge google-tier google-tier-pro">PRO</span></div></div>
             <div className="col-quota-merged google-quota-column"><AntigravityQuota quotas={live} /></div>
-        </div></div>
+            {status}{actions(3)}
+        </div></div></div>
         <h3>账号 B</h3><div className="col-quota-merged google-quota-column"><AntigravityQuota quotas={quotas} /></div>
         <h3>未同步账号</h3><AntigravityQuota quotas={{}} />
-        <h3>ChatGPT 账号 · 标签换行回归</h3><div className="account-list-container"><div className="account-row">
+        <h3>ChatGPT 账号 · 标签换行回归</h3><div className="account-list-container"><div className="account-table-body"><div className="account-row">
+            <div className="col-checkbox">□</div><div className="col-drag">⋮</div>
             <div className="col-email"><span className="email-text">long-chatgpt-email@example.com</span><div className="badges" style={{ display: 'flex', gap: 4, marginLeft: 8 }}><span className="badge kind-chatgpt">订阅</span><span className="badge plan">Pro</span></div></div>
             <div className="col-quota-merged">5H 100% · 7D 80%（模拟数据）</div>
-        </div></div>
+            {status}{actions(8)}
+        </div></div></div>
     </main>;
 }
 createRoot(document.getElementById('root')!).render(<React.StrictMode><Preview /></React.StrictMode>);

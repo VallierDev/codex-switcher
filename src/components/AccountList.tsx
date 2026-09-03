@@ -31,6 +31,15 @@ function antigravityModelQuotas(account: Account): Record<string, AntigravityMod
     return auth?.model_quotas ?? {};
 }
 
+function antigravityTier(account: Account): { label: string; className: string } {
+    const tier = (account.auth_json as { subscription_tier?: string } | null)?.subscription_tier?.toLowerCase();
+    if (tier?.includes('ultra')) return { label: 'ULTRA', className: 'badge google-tier google-tier-ultra' };
+    if (tier?.includes('pro')) return { label: 'PRO', className: 'badge google-tier google-tier-pro' };
+    if (tier?.includes('plus')) return { label: 'PLUS', className: 'badge google-tier google-tier-pro' };
+    if (tier === 'free' || tier?.includes('starter')) return { label: 'FREE', className: 'badge google-tier google-tier-free' };
+    return { label: '套餐待同步', className: 'badge google-tier google-tier-unknown' };
+}
+
 function antigravityQuotaUpdatedAt(account: Account): string | undefined {
     return Object.values(antigravityModelQuotas(account))
         .map(quota => quota.updated_at)
@@ -1032,6 +1041,10 @@ export function AccountList({
                                         {copiedId === acc.id && <span className="badge copy-success">已复制</span>}
                                         {isCurrent && <span className="badge current">当前</span>}
                                         {isAntigravityCurrent && <span className="badge current">Google 当前</span>}
+                                        {kind === 'antigravity_oauth' && (() => {
+                                            const tier = antigravityTier(acc);
+                                            return <span className={tier.className}>{tier.label}</span>;
+                                        })()}
                                         {acc.is_session_anchor && (
                                             <span
                                                 className="badge anchor"

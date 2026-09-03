@@ -1233,6 +1233,7 @@ fn switch_antigravity_account(
         store.save()?;
     }
     let _ = app.emit("accounts-updated", ());
+    proxy::request_antigravity_prewarm(Some(id));
     Ok(())
 }
 
@@ -2129,6 +2130,16 @@ fn start_antigravity_catalog_refresh(
                                         existing.is_banned = account.is_banned;
                                         existing.is_logged_out = account.is_logged_out;
                                         existing.is_token_invalid = account.is_token_invalid;
+                                        if let Some(object) = existing.auth_json.as_object_mut() {
+                                            for key in [
+                                                "subscription_tier",
+                                                "subscription_tier_checked_at",
+                                            ] {
+                                                if let Some(value) = account.auth_json.get(key) {
+                                                    object.insert(key.to_string(), value.clone());
+                                                }
+                                            }
+                                        }
                                         added = true;
                                     }
                                     _ => {}
