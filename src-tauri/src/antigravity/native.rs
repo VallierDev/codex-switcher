@@ -6,6 +6,8 @@ pub const GENERATE_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent";
 pub const FETCH_MODELS_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
+pub const QUOTA_SUMMARY_URL: &str =
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 pub const STREAM_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
 pub const GOOGLE_API_CLIENT: &str = "gl-node/22.21.1";
@@ -92,6 +94,7 @@ mod tests {
         let origin = url::Url::parse(GENERATE_URL).unwrap().origin();
         assert_eq!(url::Url::parse(FETCH_MODELS_URL).unwrap().origin(), origin);
         assert_eq!(url::Url::parse(STREAM_URL).unwrap().origin(), origin);
+        assert_eq!(url::Url::parse(QUOTA_SUMMARY_URL).unwrap().origin(), origin);
     }
 
     #[test]

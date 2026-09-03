@@ -4,14 +4,46 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuotaWindow {
+    pub remaining_fraction: f64,
+    pub reset_time: Option<String>,
+}
+
+impl QuotaWindow {
+    fn is_available(&self, now: DateTime<Utc>) -> bool {
+        self.remaining_fraction > 0.000_001
+            || self
+                .reset_time
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .is_some_and(|reset| reset.with_timezone(&Utc) <= now)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ModelQuota {
     pub remaining_fraction: f64,
     pub reset_time: Option<String>,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour: Option<QuotaWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly: Option<QuotaWindow>,
 }
 
 impl ModelQuota {
     pub fn is_available(&self, now: DateTime<Utc>) -> bool {
+        if self
+            .five_hour
+            .as_ref()
+            .is_some_and(|window| !window.is_available(now))
+            || self
+                .weekly
+                .as_ref()
+                .is_some_and(|window| !window.is_available(now))
+        {
+            return false;
+        }
         if self.remaining_fraction > 0.000_001 {
             return true;
         }
@@ -33,7 +65,7 @@ pub async fn fetch_model_quotas(
         .post(super::native::FETCH_MODELS_URL)
         .bearer_auth(access_token)
         .header("content-type", "application/json")
-        .header("user-agent", user_agent)
+        .header("user-agent", &user_agent)
         .json(&serde_json::json!({"project": project_id}))
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -46,7 +78,83 @@ pub async fn fetch_model_quotas(
             "Antigravity quota request failed with HTTP {status}"
         ));
     }
-    parse_model_quotas(&body, Utc::now().to_rfc3339())
+    let mut quotas = parse_model_quotas(&body, Utc::now().to_rfc3339())?;
+    // The model catalog reports only one effective quota. Window details come
+    // from the native summary API; never infer 5H/7D from a reset countdown.
+    let summary = client
+        .post(super::native::QUOTA_SUMMARY_URL)
+        .bearer_auth(access_token)
+        .header("user-agent", &user_agent)
+        .json(&serde_json::json!({"project":project_id}))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+    match summary {
+        Ok(response) if response.status().is_success() => {
+            if let Ok(body) = response.json::<Value>().await {
+                attach_group_windows(&mut quotas, &body);
+            }
+        }
+        Ok(response) => eprintln!(
+            "[GoogleQuota] window summary unavailable: HTTP {}",
+            response.status()
+        ),
+        Err(_) => eprintln!("[GoogleQuota] window summary unavailable; keeping model quota only"),
+    }
+    Ok(quotas)
+}
+
+fn attach_group_windows(quotas: &mut HashMap<String, ModelQuota>, summary: &Value) {
+    let mut buckets = HashMap::new();
+    for group in summary
+        .get("groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for bucket in group
+            .get("buckets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let (Some(id), Some(fraction)) = (
+                bucket.get("bucketId").and_then(Value::as_str),
+                bucket.get("remainingFraction").and_then(Value::as_f64),
+            ) else {
+                continue;
+            };
+            let window = bucket.get("window").and_then(Value::as_str);
+            if !matches!(
+                (id, window),
+                ("gemini-5h" | "3p-5h", Some("5h"))
+                    | ("gemini-weekly" | "3p-weekly", Some("weekly"))
+            ) {
+                continue;
+            }
+            buckets.insert(
+                id,
+                QuotaWindow {
+                    remaining_fraction: fraction,
+                    reset_time: bucket
+                        .get("resetTime")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                },
+            );
+        }
+    }
+    for (model, quota) in quotas {
+        let group = if model.starts_with("gemini-") && !model.contains("-image") {
+            "gemini"
+        } else if model.starts_with("claude-") || model.starts_with("gpt-oss-") {
+            "3p"
+        } else {
+            continue;
+        };
+        quota.five_hour = buckets.get(format!("{group}-5h").as_str()).cloned();
+        quota.weekly = buckets.get(format!("{group}-weekly").as_str()).cloned();
+    }
 }
 
 fn parse_model_quotas(body: &Value, now: String) -> Result<HashMap<String, ModelQuota>, String> {
@@ -69,6 +177,7 @@ fn parse_model_quotas(body: &Value, now: String) -> Result<HashMap<String, Model
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned),
                     updated_at: now.clone(),
+                    ..ModelQuota::default()
                 },
             );
         }
@@ -111,6 +220,7 @@ pub fn mark_model_exhausted(auth_json: &mut Value, model_id: &str) {
         remaining_fraction: 0.0,
         reset_time: None,
         updated_at: Utc::now().to_rfc3339(),
+        ..ModelQuota::default()
     });
     entry.remaining_fraction = 0.0;
     entry.updated_at = Utc::now().to_rfc3339();
@@ -120,6 +230,73 @@ pub fn mark_model_exhausted(auth_json: &mut Value, model_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_summary_keeps_five_hour_and_weekly_independent() {
+        let mut quotas = parse_model_quotas(
+            &serde_json::json!({"models":{
+                "gemini-3.8-flash-high":{"quotaInfo":{"remainingFraction":1.0}},
+                "claude-sonnet-4-6":{"quotaInfo":{"remainingFraction":1.0}},
+                "gemini-3.1-flash-image":{"quotaInfo":{"remainingFraction":1.0}}
+            }}),
+            "now".into(),
+        )
+        .unwrap();
+        attach_group_windows(
+            &mut quotas,
+            &serde_json::json!({"groups":[{"buckets":[
+                {"bucketId":"gemini-5h","window":"5h","remainingFraction":1.0},
+                {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.74},
+                {"bucketId":"3p-5h","window":"5h","remainingFraction":1.0},
+                {"bucketId":"3p-weekly","window":"weekly","remainingFraction":0.0,"resetTime":"2099-01-01T00:00:00Z"}
+            ]}]}),
+        );
+        let gemini = &quotas["gemini-3.8-flash-high"];
+        assert_eq!(gemini.five_hour.as_ref().unwrap().remaining_fraction, 1.0);
+        assert_eq!(gemini.weekly.as_ref().unwrap().remaining_fraction, 0.74);
+        assert!(gemini.is_available(Utc::now()));
+        assert!(!quotas["claude-sonnet-4-6"].is_available(Utc::now()));
+        assert!(quotas["gemini-3.1-flash-image"].five_hour.is_none());
+        let mut auth = serde_json::json!({});
+        write_model_quotas(&mut auth, &quotas);
+        assert_eq!(read_model_quotas(&auth), quotas);
+    }
+
+    #[test]
+    fn reset_countdown_does_not_invent_a_window_type() {
+        let quotas = parse_model_quotas(&serde_json::json!({"models":{
+            "gemini-3.8-flash-high":{"quotaInfo":{"remainingFraction":0.5,"resetTime":"2099-01-01T00:00:00Z"}}
+        }}), "now".into()).unwrap();
+        assert!(quotas["gemini-3.8-flash-high"].five_hour.is_none());
+        assert!(quotas["gemini-3.8-flash-high"].weekly.is_none());
+    }
+
+    #[test]
+    fn weekly_only_accounts_do_not_get_a_fabricated_five_hour_quota() {
+        let mut quotas = parse_model_quotas(
+            &serde_json::json!({"models":{
+                "gemini-3.8-flash-high":{"quotaInfo":{"remainingFraction":0.6}}
+            }}),
+            "now".into(),
+        )
+        .unwrap();
+        attach_group_windows(
+            &mut quotas,
+            &serde_json::json!({"groups":[{"buckets":[
+                {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.6},
+                {"bucketId":"gemini-5h","window":"5h","remainingFraction":null}
+            ]}]}),
+        );
+        assert!(quotas["gemini-3.8-flash-high"].five_hour.is_none());
+        assert_eq!(
+            quotas["gemini-3.8-flash-high"]
+                .weekly
+                .as_ref()
+                .unwrap()
+                .remaining_fraction,
+            0.6
+        );
+    }
 
     #[test]
     fn quota_refresh_distinguishes_missing_data_from_zero_quota() {

@@ -50,3 +50,11 @@
 .google-quota-details { background: var(--card-bg); padding: 12px; }
 .google-quota-models { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 6px; }
 .google-model-quota.detail .quota-label > span { white-space: normal; }
+.quota-window-tag { margin-right: 3px; font-size: 9px; color: var(--text-muted); font-weight: 500; }
+.google-model-windows { display: grid; gap: 4px; min-width: 0; padding-bottom: 8px; border-bottom: 1px solid var(--border-color); }
+.google-model-window-name { padding: 3px 2px; font-size: 11px; color: var(--text-primary); overflow-wrap: anywhere; }
+.google-model-quota.google-window-row { min-height: 28px; padding: 4px 6px; }
+.google-model-quota.google-window-row .quota-mini-content { display: flex; }
+.google-model-quota.google-window-row .quota-label { flex: 0 0 24px; }
+.google-model-quota.google-window-row .quota-time { flex: 1; }
+.google-model-quota .quota-time.quota-blocked { color: var(--danger-color); font-weight: 700; }

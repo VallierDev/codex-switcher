@@ -1574,9 +1574,23 @@ async fn handle_models_with_antigravity(
                         .map(ToOwned::to_owned)
                 })
                 .collect();
-            for model in antigravity_models_for_state(&state) {
+            let raw_models = antigravity_models_for_state(&state);
+            let grouped = crate::antigravity::models::grouped_display_models(&raw_models);
+            let visible: std::collections::HashSet<_> =
+                grouped.iter().map(|model| model.id.clone()).collect();
+            for model in grouped {
                 if !existing.contains(&model.id) {
                     models.push(antigravity_codex_catalog_entry(&model, template.as_ref()));
+                }
+            }
+            for model in raw_models
+                .into_iter()
+                .filter(|model| !visible.contains(&model.id))
+            {
+                if !existing.contains(&model.id) {
+                    let mut entry = antigravity_codex_catalog_entry(&model, template.as_ref());
+                    entry["visibility"] = serde_json::json!("hide");
+                    models.push(entry);
                 }
             }
         } else if let Some(models) = catalog
@@ -1592,7 +1606,9 @@ async fn handle_models_with_antigravity(
                         .map(ToOwned::to_owned)
                 })
                 .collect();
-            for model in antigravity_models_for_state(&state) {
+            for model in crate::antigravity::models::grouped_display_models(
+                &antigravity_models_for_state(&state),
+            ) {
                 if !existing.contains(&model.id) {
                     models.push(serde_json::json!({"id": model.id, "object": "model", "owned_by": "antigravity"}));
                 }

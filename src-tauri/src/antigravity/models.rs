@@ -128,9 +128,114 @@ fn humanize_model_id(id: &str) -> String {
         .join(" ")
 }
 
+fn model_family(id: &str) -> &str {
+    for suffix in [
+        "-extra-low",
+        "-thinking",
+        "-tiered",
+        "-medium",
+        "-high",
+        "-low",
+    ] {
+        if let Some(family) = id.strip_suffix(suffix) {
+            return family;
+        }
+    }
+    id
+}
+
+fn preset_priority(id: &str) -> u8 {
+    if id.ends_with("-high") {
+        0
+    } else if id == model_family(id) {
+        1
+    } else if id.ends_with("-thinking") {
+        2
+    } else if id.ends_with("-tiered") {
+        3
+    } else if id.ends_with("-medium") {
+        4
+    } else {
+        5
+    }
+}
+
+fn family_rank(id: &str) -> u8 {
+    if id.starts_with("gemini-") {
+        0
+    } else if id.starts_with("claude-") {
+        1
+    } else {
+        2
+    }
+}
+
+fn version_numbers(id: &str) -> Vec<u32> {
+    id.split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect()
+}
+
+/// One visible entry per model, with effort selected independently. The ID stays
+/// a real advertised upstream ID; hidden presets remain available to old threads.
+pub fn grouped_display_models(models: &[AntigravityModel]) -> Vec<AntigravityModel> {
+    let mut selected = std::collections::BTreeMap::<String, AntigravityModel>::new();
+    for model in models {
+        let family = model_family(&model.id).to_string();
+        let replace = selected.get(&family).is_none_or(|old| {
+            (preset_priority(&model.id), &model.id) < (preset_priority(&old.id), &old.id)
+        });
+        if replace {
+            selected.insert(family, model.clone());
+        }
+    }
+    let mut grouped: Vec<_> = selected
+        .into_iter()
+        .map(|(family, mut model)| {
+            let name = humanize_model_id(&family);
+            model.display_name = format!("{name} (Antigravity)");
+            model.description = format!(
+                "{name} through Google Antigravity OAuth; choose reasoning effort separately"
+            );
+            model
+        })
+        .collect();
+    grouped.sort_by(|a, b| {
+        family_rank(&a.id)
+            .cmp(&family_rank(&b.id))
+            .then_with(|| version_numbers(&b.id).cmp(&version_numbers(&a.id)))
+            .then_with(|| model_family(&a.id).cmp(model_family(&b.id)))
+    });
+    grouped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_menu_groups_effort_presets_and_orders_newest_first() {
+        let raw = catalog_from_live_ids([
+            "gemini-3.7-flash-low",
+            "gemini-3.8-flash-tiered",
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-low",
+            "gemini-3.8-flash-medium",
+            "gemini-3.10-flash-high",
+            "gemini-3.9-flash-high",
+            "claude-opus-4-6-thinking",
+            "gpt-oss-120b-medium",
+        ]);
+        let grouped = grouped_display_models(&raw);
+        assert_eq!(grouped.len(), 6);
+        assert_eq!(grouped[0].id, "gemini-3.10-flash-high");
+        assert_eq!(grouped[1].id, "gemini-3.9-flash-high");
+        assert_eq!(grouped[2].id, "gemini-3.8-flash-high");
+        assert_eq!(grouped[2].display_name, "Gemini 3.8 Flash (Antigravity)");
+        assert_eq!(grouped[2].thinking_levels, vec!["low", "medium", "high"]);
+        assert_eq!(raw.len(), 9); // Raw presets stay available for existing threads.
+    }
 
     #[test]
     fn presets_keep_defaults_but_allow_effort_selection() {

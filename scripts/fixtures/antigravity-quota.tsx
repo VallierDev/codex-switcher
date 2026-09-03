@@ -6,13 +6,14 @@ import '../../src/App.css';
 import '../../src/components/AccountList.css';
 
 const reset = new Date(Date.now() + 4 * 3600_000).toISOString();
+const weeklyReset = new Date(Date.now() + 6 * 24 * 3600_000).toISOString();
 const quotas: Record<string, AntigravityModelQuota> = {
-    'gemini-3.7-flash-high': { remaining_fraction: 0.99, reset_time: reset },
+    'gemini-3.7-flash-high': { remaining_fraction: 0.74, reset_time: reset, five_hour: {remaining_fraction: 1, reset_time: reset}, weekly: {remaining_fraction: 0.74, reset_time: weeklyReset} },
     'gemini-3.6-flash-high': { remaining_fraction: 0.99, reset_time: reset },
     'gemini-pro-agent': { remaining_fraction: 0.99, reset_time: reset },
     'gemini-3.1-pro-low': { remaining_fraction: 0.99, reset_time: reset },
-    'claude-sonnet-4-6': { remaining_fraction: 0, reset_time: reset },
-    'claude-opus-4-6-thinking': { remaining_fraction: 0.35, reset_time: null },
+    'claude-sonnet-4-6': { remaining_fraction: 0, reset_time: reset, five_hour: {remaining_fraction: 1, reset_time: reset}, weekly: {remaining_fraction: 0, reset_time: weeklyReset} },
+    'claude-opus-4-6-thinking': { remaining_fraction: 0.35, reset_time: null, weekly: {remaining_fraction: 0.93, reset_time: weeklyReset} },
     'model-with-unknown-quota': { remaining_fraction: null, reset_time: 'invalid' },
     ...Object.fromEntries(Array.from({ length: 21 }, (_, i) => [`preview-model-${i}`, { remaining_fraction: 0.8, reset_time: reset }])),
 };
