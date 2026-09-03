@@ -466,6 +466,42 @@ pub async fn delete_account(base_url: &str, secret: &str, id: &str) -> Result<()
 }
 
 /// 拉取 Server 上所有账号的配额数据（client 模式下替代本地 quota_refresh）
+pub async fn refresh_antigravity_quota(
+    base_url: &str,
+    secret: &str,
+    id: &str,
+) -> Result<std::collections::HashMap<String, crate::antigravity::quota::ModelQuota>, String> {
+    let response = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(100))
+        .build()
+        .map_err(|error| error.to_string())?
+        .post(format!(
+            "{}/accounts/{}/antigravity-quota",
+            trim_url(base_url),
+            id
+        ))
+        .header(AUTH_HEADER, secret)
+        .send()
+        .await
+        .map_err(|error| format!("Google 额度查询失败: {error}"))?;
+    let status = response.status();
+    let body: Value = response.json().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Server Google 额度查询失败")
+            .to_string());
+    }
+    serde_json::from_value(
+        body.get("model_quotas")
+            .cloned()
+            .ok_or("响应缺少模型额度")?,
+    )
+    .map_err(|error| error.to_string())
+}
+
 pub async fn fetch_all_quota(
     base_url: &str,
     secret: &str,

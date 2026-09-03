@@ -208,6 +208,18 @@ async fn route(
                 (Method::POST, Some("antigravity-token")) => {
                     return handle_antigravity_token(&state, id, true).await;
                 }
+                (Method::POST, Some("antigravity-quota")) => {
+                    return match refresh_antigravity_quota_local(
+                        &state.store,
+                        &state.app_handle,
+                        id,
+                    )
+                    .await
+                    {
+                        Ok(quotas) => json_resp(StatusCode::OK, json!({"model_quotas": quotas})),
+                        Err(error) => json_resp(StatusCode::BAD_GATEWAY, json!({"error": error})),
+                    };
+                }
                 (Method::POST, Some("refresh")) => {
                     return handle_refresh_account(&state, id).await;
                 }
@@ -318,6 +330,14 @@ async fn handle_antigravity_token(
     id: &str,
     force_refresh: bool,
 ) -> Response<ResponseBody> {
+    antigravity_token_for_store(&state.store, id, force_refresh).await
+}
+
+async fn antigravity_token_for_store(
+    store_handle: &Arc<Mutex<AccountStore>>,
+    id: &str,
+    force_refresh: bool,
+) -> Response<ResponseBody> {
     let account_lock = {
         let mut locks = antigravity_refresh_locks().lock().await;
         locks
@@ -328,7 +348,7 @@ async fn handle_antigravity_token(
     let _guard = account_lock.lock().await;
 
     let (mut access_token, mut refresh_token, mut expires_at, project_id) = {
-        let store = match state.store.lock() {
+        let store = match store_handle.lock() {
             Ok(store) => store,
             Err(error) => return err_resp(error.to_string()),
         };
@@ -402,7 +422,7 @@ async fn handle_antigravity_token(
             refresh_token = rotated;
         }
         expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(refreshed.expires_in));
-        let mut store = match state.store.lock() {
+        let mut store = match store_handle.lock() {
             Ok(store) => store,
             Err(error) => return err_resp(error.to_string()),
         };
@@ -444,6 +464,49 @@ async fn handle_antigravity_token(
             "expires_at": expires_at.map(|value| value.to_rfc3339()),
         }),
     )
+}
+
+/// Reuse the serialized ST refresh path; only quota data leaves this operation.
+/// Called in-process by the native UI, or by the authenticated Server quota endpoint.
+pub(crate) async fn refresh_antigravity_quota_local(
+    store: &Arc<Mutex<AccountStore>>,
+    app: &tauri::AppHandle,
+    id: &str,
+) -> Result<std::collections::HashMap<String, crate::antigravity::quota::ModelQuota>, String> {
+    let lease_response = antigravity_token_for_store(store, id, false).await;
+    let status = lease_response.status();
+    let bytes = lease_response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|error| error.to_string())?
+        .to_bytes();
+    let lease: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(lease
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Google ST 获取失败")
+            .to_string());
+    }
+    let token = lease
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or("Google ST 缺失")?;
+    let project = lease
+        .get("project_id")
+        .and_then(Value::as_str)
+        .ok_or("Google project_id 缺失")?;
+    let client = crate::antigravity::native::build_http_client()?;
+    let quotas = crate::antigravity::quota::fetch_model_quotas(&client, token, project).await?;
+    {
+        let mut guard = store.lock().map_err(|error| error.to_string())?;
+        let account = guard.accounts.get_mut(id).ok_or("账号已被删除")?;
+        crate::antigravity::quota::write_model_quotas(&mut account.auth_json, &quotas);
+        guard.save()?;
+    }
+    let _ = app.emit("accounts-updated", ());
+    Ok(quotas)
 }
 
 /// 强制刷新某账号的 access_token，返回刷新后的 auth_json（与 /token 同形）。
@@ -577,15 +640,21 @@ async fn handle_antigravity_oauth_complete(
         }
         account
     };
+    let mirror = antigravity_account_mirror(account);
+    let _ = state.app_handle.emit("accounts-updated", ());
+    json_resp(StatusCode::OK, json!({"account": mirror}))
+}
+
+fn antigravity_account_mirror(account: Account) -> Account {
     let mut mirror = account;
     mirror.refresh_token = None;
     mirror.auth_json = json!({
         "provider": "antigravity",
         "email": mirror.name,
         "project_id": mirror.auth_json.get("project_id").cloned().unwrap_or(Value::Null),
+        "model_quotas": mirror.auth_json.get("model_quotas").cloned().unwrap_or(Value::Null),
     });
-    let _ = state.app_handle.emit("accounts-updated", ());
-    json_resp(StatusCode::OK, json!({"account": mirror}))
+    mirror
 }
 
 async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<ResponseBody> {
@@ -1454,4 +1523,35 @@ fn resp_with_body(status: StatusCode, body: Vec<u8>) -> Response<ResponseBody> {
         .header("Content-Type", "application/json")
         .body(Full::new(Bytes::from(body)))
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+}
+
+#[cfg(test)]
+mod google_quota_tests {
+    use super::*;
+
+    #[test]
+    fn oauth_mirror_keeps_model_quotas_without_tokens() {
+        let mut store = AccountStore::default();
+        let quotas = json!({"gemini-3.7-flash-high": {
+            "remaining_fraction": 0.75, "reset_time": "later", "updated_at": "now"
+        }});
+        let account = store.add_antigravity_account(
+            "test@example.com".into(),
+            json!({
+                "provider": "antigravity", "project_id": "test-project",
+                "tokens": {"access_token": "test-st", "refresh_token": "test-rt"},
+                "model_quotas": quotas
+            }),
+            None,
+        );
+        let mirror = antigravity_account_mirror(account.clone());
+        assert_eq!(mirror.auth_json["model_quotas"], quotas);
+        assert_eq!(mirror.auth_json["project_id"], "test-project");
+        assert!(mirror.auth_json.get("tokens").is_none());
+        assert!(mirror.refresh_token.is_none());
+        assert_eq!(
+            store.accounts[&account.id].auth_json["tokens"]["refresh_token"],
+            "test-rt"
+        );
+    }
 }

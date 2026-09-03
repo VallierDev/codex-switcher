@@ -1193,6 +1193,35 @@ async fn finalize_antigravity_oauth_login(
 
 /// 切换到指定账号（异步版本，不做本地 Token 续期）
 #[tauri::command]
+async fn refresh_antigravity_quota(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<std::collections::HashMap<String, antigravity::quota::ModelQuota>, String> {
+    let client_mode = {
+        let store = state.store.lock().map_err(|error| error.to_string())?;
+        let account = store.accounts.get(&id).ok_or("Google 账号不存在")?;
+        if !account.is_antigravity_oauth() {
+            return Err("该账号不是 Google Antigravity 账号".to_string());
+        }
+        store.settings.remote_mode == "client"
+    };
+    if !client_mode {
+        return remote_server::refresh_antigravity_quota_local(&state.store, &app, &id).await;
+    }
+    let (base, secret) = client_settings_snapshot(&state).await?;
+    let quotas = remote_client::refresh_antigravity_quota(&base, &secret, &id).await?;
+    {
+        let mut store = state.store.lock().map_err(|error| error.to_string())?;
+        let account = store.accounts.get_mut(&id).ok_or("账号已被删除")?;
+        antigravity::quota::write_model_quotas(&mut account.auth_json, &quotas);
+        store.save()?;
+    }
+    let _ = app.emit("accounts-updated", ());
+    Ok(quotas)
+}
+
+#[tauri::command]
 fn switch_antigravity_account(
     state: State<AppState>,
     app: tauri::AppHandle,
@@ -5948,6 +5977,7 @@ pub fn run() {
             finalize_antigravity_oauth_login,
             force_overwrite_disk_with_current,
             switch_antigravity_account,
+            refresh_antigravity_quota,
             reload_ide_windows,
             get_settings,
             update_settings,

@@ -38,6 +38,7 @@ pub async fn fetch_model_quotas(
         .header("content-type", "application/json")
         .header("user-agent", user_agent)
         .json(&serde_json::json!({"project": project_id}))
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(|error| format!("Antigravity quota request failed: {error}"))?;
@@ -48,7 +49,10 @@ pub async fn fetch_model_quotas(
             "Antigravity quota request failed with HTTP {status}"
         ));
     }
-    let now = Utc::now().to_rfc3339();
+    parse_model_quotas(&body, Utc::now().to_rfc3339())
+}
+
+fn parse_model_quotas(body: &Value, now: String) -> Result<HashMap<String, ModelQuota>, String> {
     let mut quotas = HashMap::new();
     if let Some(models) = body.get("models").and_then(Value::as_object) {
         for (model_id, model) in models {
@@ -71,6 +75,9 @@ pub async fn fetch_model_quotas(
                 },
             );
         }
+    }
+    if quotas.is_empty() {
+        return Err("Google 未返回模型额度，请稍后重试；这不表示额度为 0".to_string());
     }
     Ok(quotas)
 }
@@ -116,6 +123,24 @@ pub fn mark_model_exhausted(auth_json: &mut Value, model_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_refresh_distinguishes_missing_data_from_zero_quota() {
+        assert!(parse_model_quotas(&serde_json::json!({"models": {}}), "now".into()).is_err());
+        let quotas = parse_model_quotas(
+            &serde_json::json!({
+                "models": {
+                    "empty-model": {"quotaInfo": {"remainingFraction": 0.0, "resetTime": "later"}},
+                    "full-model": {"quotaInfo": {"remainingFraction": 1.0}}
+                }
+            }),
+            "now".into(),
+        )
+        .unwrap();
+        assert_eq!(quotas["empty-model"].remaining_fraction, 0.0);
+        assert_eq!(quotas["empty-model"].reset_time.as_deref(), Some("later"));
+        assert_eq!(quotas["full-model"].updated_at, "now");
+    }
 
     #[test]
     fn exhausted_model_does_not_disable_other_models() {

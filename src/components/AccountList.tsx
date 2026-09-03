@@ -42,6 +42,13 @@ function antigravityModelQuotas(account: Account): Record<string, AntigravityMod
     const auth = account.auth_json as { model_quotas?: Record<string, AntigravityModelQuota> } | null;
     return auth?.model_quotas ?? {};
 }
+
+function antigravityQuotaUpdatedAt(account: Account): string | undefined {
+    return Object.values(antigravityModelQuotas(account))
+        .map(quota => quota.updated_at)
+        .filter((value): value is string => !!value && Number.isFinite(Date.parse(value)))
+        .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+}
 import { useShortCountdown } from '../hooks/useCountdown';
 import './AccountList.css';
 import { ConfirmModal } from './ConfirmModal';
@@ -194,7 +201,7 @@ interface AccountListProps {
     onDelete: (id: string) => void;
     onUpdateAccount: (id: string, name?: string, notes?: string, accountExpiresAt?: string) => Promise<void>;
     onUpdateSettings: (settings: AppSettings) => void | Promise<void>;
-    onRefreshComplete?: () => void;
+    onRefreshComplete?: () => void | Promise<void>;
     onAddAccount?: () => void;
     onAddRelay?: () => void;
     onRefreshUsage?: () => void;
@@ -680,6 +687,11 @@ export function AccountList({
         const acc = accounts.find(a => a.id === id);
         const accName = acc?.name ?? id;
         try {
+            if (acc && effectiveKind(acc) === 'antigravity_oauth') {
+                await invoke<Record<string, AntigravityModelQuota>>('refresh_antigravity_quota', { id });
+                await onRefreshComplete?.();
+                return;
+            }
             // Relay 账号走专属 fetcher（不查 OpenAI usage）
             if (acc && effectiveKind(acc) === 'relay') {
                 const cache = await invoke<RelayUsageCache>('refresh_relay_usage', { id });
@@ -714,7 +726,7 @@ export function AccountList({
             // 把错误 tip 出来，不再静默失败
             setPushToast({
                 type: 'error',
-                text: `${accName} 刷新失败：${humanizeRefreshError(errMsg)}`,
+                text: `${accName} 刷新失败：${acc && effectiveKind(acc) === 'antigravity_oauth' ? errMsg : humanizeRefreshError(errMsg)}`,
             });
             setTimeout(() => setPushToast(null), 6000);
         } finally {
@@ -909,12 +921,12 @@ export function AccountList({
                         className="toolbar-icon-btn toolbar-icon-btn-accent"
                         onClick={onRefreshUsage}
                         disabled={usageLoading}
-                        title="刷新所有账号配额"
+                        title="刷新 Codex 当前账号额度"
                     >
                         <Gauge className={usageLoading ? 'spinning' : ''} size={16} />
                     </button>
                 )}
-                <button className="btn-refresh" onClick={() => {
+                <button className="btn-refresh" title="刷新当前列表额度" aria-label="刷新当前列表额度" disabled={isRefreshingAll} onClick={() => {
                     // 之前是 Promise.all 一把梭 — N 个账号同时打 OpenAI usage，
                     // 一旦边缘节流单个账号要 10s+，整批的尾延迟会跟着慢账号走。
                     // 改成并发上限 6 的滑动窗口：快账号先回，慢账号自然排队，
@@ -1065,7 +1077,7 @@ export function AccountList({
                                             const entries = Object.entries(ANTIGRAVITY_QUOTA_LABELS)
                                                 .filter(([model]) => quotas[model]);
                                             if (entries.length === 0) {
-                                                return <span className="quota-empty">等待同步模型额度</span>;
+                                                return <span className="quota-empty">暂无模型额度，点击刷新</span>;
                                             }
                                             return (
                                                 <div className="quota-grid">
@@ -1107,7 +1119,7 @@ export function AccountList({
                                     </div>
                                     <div className="time-item refresh">
                                         <span className="time-label">刷新:</span>
-                                        <span className="time-val">{formatDate(acc.cached_quota?.updated_at)}</span>
+                                        <span className="time-val">{formatDate(kind === 'antigravity_oauth' ? antigravityQuotaUpdatedAt(acc) : acc.cached_quota?.updated_at)}</span>
                                     </div>
                                     <div className="time-item account-expiry-row">
                                         <span className="time-label">到期:</span>
@@ -1155,9 +1167,7 @@ export function AccountList({
                                     )}
                                 </div>
                                 <div className="col-actions">
-                                    {effectiveKind(acc) !== 'antigravity_oauth' && (
-                                        <button className="action-btn refresh" onClick={() => handleRefreshOne(acc.id)} disabled={isRefreshing} title="刷新"><RefreshCw size={14} className={isRefreshing ? 'spinning' : ''} /></button>
-                                    )}
+                                    <button className="action-btn refresh" onClick={() => handleRefreshOne(acc.id)} disabled={isRefreshing} title={kind === 'antigravity_oauth' ? '刷新模型额度' : '刷新'}><RefreshCw size={14} className={isRefreshing ? 'spinning' : ''} /></button>
                                     {settings.remote_mode === 'client' && effectiveKind(acc) !== 'antigravity_oauth' && (
                                         <button
                                             className="action-btn push"
