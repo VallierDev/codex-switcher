@@ -18,6 +18,17 @@ function modelName(model: string): string {
     }[word] || word)).join(' ');
 }
 
+function compactModelName(model: string): string {
+    if (model === 'gemini-pro-agent') return 'Gemini Pro';
+    return modelName(model).replace(/^Gemini /, 'G').replace(/^Claude /, '')
+        .replace(/\s*\((Thinking|High|Low|Medium)\)/g, '');
+}
+
+function compactReset(text: string): string {
+    return text.replace(/^(\d+)天 (\d+)时.*$/, '$1d $2h')
+        .replace(/时/g, 'h').replace(/分/g, 'm').replace(/秒/g, 's').replace(/\s+/g, '');
+}
+
 function summaryModels(models: string[]): string[] {
     const newest = [...models].sort((a, b) => b.localeCompare(a, 'en', { numeric: true }));
     const groups = [
@@ -49,9 +60,9 @@ function ModelQuota({ model, quota, compact = false }: {
             <div className="quota-mini-content">
                 <span className="quota-label">
                     {model.startsWith('claude-') ? <Asterisk className="google-provider-icon claude" aria-hidden="true" /> : <Sparkles className="google-provider-icon gemini" aria-hidden="true" />}
-                    <span>{modelName(model)}</span>
+                    <span>{compact ? compactModelName(model) : modelName(model)}</span>
                 </span>
-                <span className="quota-time neutral"><Clock className="icon-tiny" /><span>{resetText}</span></span>
+                <span className="quota-time neutral"><Clock className="icon-tiny" /><span>{compact ? compactReset(resetText) : resetText}</span></span>
                 <span className={`quota-percent ${color}`}>{percentage === undefined ? '未知' : `${Math.round(percentage)}%`}</span>
             </div>
         </div>

@@ -24,7 +24,10 @@ function Preview() {
         <h2>Google 模型额度验收（模拟数据）</h2>
         <button onClick={() => setLive({ ...live, 'new-model-after-refresh': { remaining_fraction: 0.7, reset_time: reset } })}>模拟刷新：新增模型</button>
         <button onClick={() => setDark(value => !value)}>切换深浅色</button>
-        <h3>账号 A</h3><div className="col-quota-merged google-quota-column"><AntigravityQuota quotas={live} /></div>
+        <h3>账号 A · 长邮箱回归</h3><div className="account-list-container"><div className="account-row">
+            <div className="col-email"><span className="email-text">agwffgrtyrdfrebsdtgst@gmail.com</span><div className="badges" style={{ marginLeft: 8 }}>Google</div></div>
+            <div className="col-quota-merged google-quota-column"><AntigravityQuota quotas={live} /></div>
+        </div></div>
         <h3>账号 B</h3><div className="col-quota-merged google-quota-column"><AntigravityQuota quotas={quotas} /></div>
         <h3>未同步账号</h3><AntigravityQuota quotas={{}} />
     </main>;

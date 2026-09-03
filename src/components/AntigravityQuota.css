@@ -24,14 +24,20 @@
 .google-model-quota .quota-percent.neutral { color: var(--text-muted); }
 
 /* Provider quota rows: readable names, warm reset times, aligned percentages. */
-.col-quota-merged.google-quota-column { width: clamp(380px, 43vw, 680px); }
-.account-list-container:has(.google-quota-overview) .col-quota-merged { width: clamp(380px, 43vw, 680px); }
+.col-quota-merged.google-quota-column { width: 400px; }
+.account-list-container:has(.google-quota-overview) .col-quota-merged { width: 400px; }
+.account-row:has(.google-quota-overview) .col-email { flex-direction: column; align-items: flex-start; min-width: 280px; gap: 6px; }
+.account-row:has(.google-quota-overview) .email-text { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.account-row:has(.google-quota-overview) .badges { margin-left: 0 !important; }
 .google-quota-overview .quota-grid { gap: 6px 8px; }
 .google-quota-overview .google-model-quota { border-color: transparent; border-radius: 6px; }
 .google-model-quota.compact { height: 30px; padding: 0 8px; }
 .google-model-quota .quota-mini-content { gap: 6px; font-variant-numeric: tabular-nums; }
 .google-model-quota .quota-label { display: flex; align-items: center; gap: 5px; min-width: 0; font-size: 11px; color: var(--text-primary); }
 .google-model-quota.compact .quota-label { flex: 1; }
+.google-model-quota.compact .quota-mini-content { gap: 4px; }
+.google-model-quota.compact .quota-label { font-size: 10px; gap: 4px; }
+.google-model-quota.compact .quota-time { gap: 2px; }
 .google-model-quota .quota-label > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .google-provider-icon { width: 13px; height: 13px; flex-shrink: 0; }
 .google-provider-icon.gemini { color: var(--primary-color); }

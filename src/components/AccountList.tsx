@@ -1025,6 +1025,7 @@ export function AccountList({
                                     <div className="badges" style={{ display: 'flex', gap: '4px', marginLeft: '8px', flexWrap: 'wrap' }}>
                                         {(() => {
                                             const k = effectiveKind(acc);
+                                            if (k === 'antigravity_oauth' && isAntigravityCurrent) return null;
                                             const meta = k === 'relay' ? relayCategoryBadge(acc) : KIND_BADGE[k];
                                             return <span className={meta.className}>{meta.label}</span>;
                                         })()}

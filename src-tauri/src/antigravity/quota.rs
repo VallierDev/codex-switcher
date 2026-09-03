@@ -3,9 +3,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-const FETCH_MODELS_URL: &str =
-    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelQuota {
     pub remaining_fraction: f64,
@@ -33,7 +30,7 @@ pub async fn fetch_model_quotas(
 ) -> Result<HashMap<String, ModelQuota>, String> {
     let user_agent = super::native::request_user_agent(client).await;
     let response = client
-        .post(FETCH_MODELS_URL)
+        .post(super::native::FETCH_MODELS_URL)
         .bearer_auth(access_token)
         .header("content-type", "application/json")
         .header("user-agent", user_agent)

@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 pub const GENERATE_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent";
+pub const FETCH_MODELS_URL: &str =
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
 pub const STREAM_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
 pub const GOOGLE_API_CLIENT: &str = "gl-node/22.21.1";
@@ -84,6 +86,13 @@ fn is_semver(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_and_inference_use_the_same_service() {
+        let origin = url::Url::parse(GENERATE_URL).unwrap().origin();
+        assert_eq!(url::Url::parse(FETCH_MODELS_URL).unwrap().origin(), origin);
+        assert_eq!(url::Url::parse(STREAM_URL).unwrap().origin(), origin);
+    }
 
     #[test]
     fn validates_antigravity_versions() {
