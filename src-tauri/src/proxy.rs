@@ -1365,38 +1365,15 @@ fn antigravity_codex_catalog_entry(
     object.insert("slug".into(), serde_json::json!(model.id));
     object.insert("display_name".into(), serde_json::json!(model.display_name));
     object.insert("description".into(), serde_json::json!(model.description));
-    // Remove the template's model identity without supplying a replacement.
-    // Operational instructions stay intact; the proxy must not script self-identification.
-    if let Some(base) = object
-        .get("base_instructions")
-        .and_then(serde_json::Value::as_str)
+    // The native GPT template is borrowed only for catalog shape. None of its
+    // system prompt belongs to Google/Claude models: partial phrase stripping
+    // previously leaked later "As Codex" paragraphs and scripted their identity.
+    object.insert("base_instructions".into(), serde_json::json!(""));
+    if let Some(model_messages) = object
+        .get_mut("model_messages")
+        .and_then(serde_json::Value::as_object_mut)
     {
-        let rewritten = base
-            .replacen("You are Codex, a coding agent based on GPT-5.", "", 1)
-            .replacen("You are Codex, an agent based on GPT-5.", "", 1);
-        object.insert(
-            "base_instructions".into(),
-            serde_json::Value::String(rewritten),
-        );
-    }
-    if let Some(template) = object
-        .get("model_messages")
-        .and_then(|messages| messages.get("instructions_template"))
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-    {
-        if let Some(model_messages) = object
-            .get_mut("model_messages")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            let rewritten = template
-                .replacen("You are Codex, a coding agent based on GPT-5.", "", 1)
-                .replacen("You are Codex, an agent based on GPT-5.", "", 1);
-            model_messages.insert(
-                "instructions_template".into(),
-                serde_json::Value::String(rewritten),
-            );
-        }
+        model_messages.insert("instructions_template".into(), serde_json::json!(""));
     }
     object.insert(
         "context_window".into(),
@@ -8138,11 +8115,8 @@ mod tests {
         assert!(entry["retirement_at"].is_null());
         assert_eq!(entry["prefer_websockets"], true);
         assert_eq!(entry["supports_websockets"], true);
-        assert_eq!(entry["base_instructions"], " Keep helping.");
-        assert_eq!(
-            entry["model_messages"]["instructions_template"],
-            " {{ personality }}"
-        );
+        assert_eq!(entry["base_instructions"], "");
+        assert_eq!(entry["model_messages"]["instructions_template"], "");
         assert!(template["base_instructions"]
             .as_str()
             .unwrap()
