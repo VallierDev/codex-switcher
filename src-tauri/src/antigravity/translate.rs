@@ -9,7 +9,11 @@ pub fn responses_to_antigravity(
     let (chat_body, state) = relay_translate::translate_request(codex_body, model)
         .map_err(|e| format!("Responses normalization failed: {e}"))?;
     let chat: Value = serde_json::from_slice(&chat_body).map_err(|e| e.to_string())?;
-    let request = chat_to_gemini_request(&chat)?;
+    let mut request = chat_to_gemini_request(&chat)?;
+    // The shared chat normalizer intentionally doesn't own provider-specific
+    // reasoning settings. Read them from the original Responses request here.
+    let original: Value = serde_json::from_slice(codex_body).map_err(|e| e.to_string())?;
+    apply_thinking_config(&mut request, &original, model)?;
     let envelope = json!({
         "model": model,
         "userAgent": "antigravity",
@@ -21,6 +25,63 @@ pub fn responses_to_antigravity(
     serde_json::to_vec(&envelope)
         .map(|bytes| (bytes, state))
         .map_err(|e| e.to_string())
+}
+
+fn apply_thinking_config(request: &mut Value, original: &Value, model: &str) -> Result<(), String> {
+    let effort = original
+        .pointer("/reasoning/effort")
+        .or_else(|| original.get("reasoning_effort"));
+    let Some(effort) = effort.filter(|value| !value.is_null()) else {
+        return Ok(()); // Preserve the upstream default for existing callers.
+    };
+    let effort = effort
+        .as_str()
+        .ok_or_else(|| "reasoning.effort must be a string".to_string())?;
+    let metadata = super::models::model_for_id(model)
+        .ok_or_else(|| format!("Unknown Antigravity model: {model}"))?;
+    if !metadata.thinking_levels.contains(&effort) {
+        return Err(format!(
+            "{model} supports reasoning effort: {}",
+            metadata.thinking_levels.join(", ")
+        ));
+    }
+    // GPT OSS currently has only its upstream medium preset; do not invent controls.
+    if model.starts_with("gpt-oss-") {
+        return Ok(());
+    }
+    let include_thoughts = original
+        .pointer("/reasoning/summary")
+        .and_then(Value::as_str)
+        != Some("none");
+    let thinking = if model.starts_with("gemini-3") || model == "gemini-pro-agent" {
+        json!({"thinkingLevel": effort.to_ascii_uppercase(), "includeThoughts": include_thoughts})
+    } else {
+        // Antigravity's native Google envelope translates this budget to Claude's
+        // extended-thinking budget. Claude requires >=1024 and maxOutputTokens > budget.
+        let budget = match effort {
+            "low" => 1024,
+            "medium" => 8192,
+            "high" => 24576,
+            _ => unreachable!(),
+        };
+        json!({"thinkingBudget": budget, "includeThoughts": include_thoughts})
+    };
+    let max_output = match original.get("max_output_tokens").filter(|v| !v.is_null()) {
+        Some(value) => value
+            .as_u64()
+            .filter(|v| *v > 0)
+            .ok_or_else(|| "max_output_tokens must be a positive integer".to_string())?,
+        None => metadata.max_completion_tokens,
+    }
+    .min(metadata.max_completion_tokens);
+    if model.starts_with("claude-")
+        && max_output <= thinking["thinkingBudget"].as_u64().unwrap_or(0)
+    {
+        return Err("max_output_tokens must exceed the selected Claude thinking budget; lower effort or raise the output limit".to_string());
+    }
+    request["generationConfig"] =
+        json!({"thinkingConfig": thinking, "maxOutputTokens": max_output});
+    Ok(())
 }
 
 fn chat_to_gemini_request(chat: &Value) -> Result<Value, String> {
@@ -501,6 +562,65 @@ pub fn antigravity_response_to_codex(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_reaches_gemini_level_and_claude_budget() {
+        for (effort, budget) in [("low", 1024), ("medium", 8192), ("high", 24576)] {
+            for model in [
+                "gemini-3.7-flash-high",
+                "gemini-3.7-flash-low",
+                "gemini-pro-agent",
+                "claude-opus-4-6-thinking",
+                "claude-sonnet-4-6",
+                "gemini-2.5-pro",
+            ] {
+                let input = json!({"model":model,"input":"hello","reasoning":{"effort":effort,"summary":"auto"}});
+                let (body, _) =
+                    responses_to_antigravity(&serde_json::to_vec(&input).unwrap(), model, "p")
+                        .unwrap();
+                let value: Value = serde_json::from_slice(&body).unwrap();
+                let config = &value["request"]["generationConfig"]["thinkingConfig"];
+                if model.starts_with("gemini-3") || model == "gemini-pro-agent" {
+                    assert_eq!(config["thinkingLevel"], effort.to_ascii_uppercase());
+                    assert!(config.get("thinkingBudget").is_none());
+                } else {
+                    assert_eq!(config["thinkingBudget"], budget);
+                    assert!(config.get("thinkingLevel").is_none());
+                }
+                assert_eq!(config["includeThoughts"], true);
+                assert_eq!(value["model"], model); // No ID remapping or provider fallback.
+            }
+        }
+    }
+
+    #[test]
+    fn effort_validation_and_no_effort_compatibility() {
+        let mut request = json!({});
+        apply_thinking_config(&mut request, &json!({}), "claude-sonnet-4-6").unwrap();
+        assert!(request.get("generationConfig").is_none());
+        assert!(apply_thinking_config(
+            &mut request,
+            &json!({"reasoning":{"effort":"xhigh"}}),
+            "gemini-3.7-flash-high"
+        )
+        .is_err());
+        assert!(apply_thinking_config(
+            &mut request,
+            &json!({"reasoning":{"effort":"high"},"max_output_tokens":100}),
+            "claude-sonnet-4-6"
+        )
+        .is_err());
+        apply_thinking_config(
+            &mut request,
+            &json!({"reasoning":{"effort":"low","summary":"none"}}),
+            "claude-sonnet-4-6",
+        )
+        .unwrap();
+        assert_eq!(
+            request["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            false
+        );
+    }
 
     #[test]
     fn tool_results_preserve_call_id_for_google_claude_translation() {

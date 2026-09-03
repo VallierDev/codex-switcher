@@ -359,6 +359,71 @@ pub async fn list_accounts(base_url: &str, secret: &str) -> Result<Vec<Account>,
     serde_json::from_value(arr).map_err(|e| format!("反序列化账号列表失败: {}", e))
 }
 
+/// Google-only, token-free mirrors. This must not use the generic credential list.
+pub async fn list_antigravity_accounts(
+    base_url: &str,
+    secret: &str,
+) -> Result<Vec<Account>, String> {
+    let response = client()?
+        .get(format!("{}/antigravity/accounts", trim_url(base_url)))
+        .header(AUTH_HEADER, secret)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Google account sync returned HTTP {}",
+            response.status()
+        ));
+    }
+    let body: Value = response.json().await.map_err(|e| e.to_string())?;
+    let accounts: Vec<Account> =
+        serde_json::from_value(body.get("accounts").cloned().unwrap_or(Value::Null))
+            .map_err(|e| e.to_string())?;
+    Ok(tokenless_google_accounts(accounts))
+}
+
+fn tokenless_google_accounts(mut accounts: Vec<Account>) -> Vec<Account> {
+    accounts.retain(|account| account.is_antigravity_oauth());
+    // Defense in depth: rebuild the allowed metadata even if Server regresses.
+    for account in &mut accounts {
+        account.refresh_token = None;
+        account.auth_json = serde_json::json!({
+            "provider":"antigravity", "email":account.name,
+            "project_id":account.auth_json.get("project_id"),
+            "model_quotas":account.auth_json.get("model_quotas"),
+        });
+    }
+    accounts
+}
+
+#[cfg(test)]
+mod google_mirror_tests {
+    use super::*;
+
+    #[test]
+    fn incoming_mirrors_cannot_carry_tokens_or_codex_accounts() {
+        let mut store = crate::account::AccountStore::default();
+        let google = store.add_antigravity_account("example@gmail.com".into(), serde_json::json!({
+            "project_id":"p", "model_quotas":{"gemini-test":{"remaining_fraction":0.9}},
+            "access_token":"top-secret-st", "tokens":{"access_token":"secret-st", "refresh_token":"secret-rt"},
+        }), None);
+        let mut codex = google.clone();
+        codex.kind = crate::account::AccountKind::ChatgptOauth;
+        let mirrors = tokenless_google_accounts(vec![google, codex]);
+        assert_eq!(mirrors.len(), 1);
+        assert!(mirrors[0].refresh_token.is_none());
+        assert_eq!(mirrors[0].auth_json["project_id"], "p");
+        assert_eq!(
+            mirrors[0].auth_json["model_quotas"]["gemini-test"]["remaining_fraction"],
+            0.9
+        );
+        let encoded = serde_json::to_string(&mirrors).unwrap();
+        assert!(!encoded.contains("secret-st"));
+        assert!(!encoded.contains("secret-rt"));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpsertOutcome {
     #[serde(default)]

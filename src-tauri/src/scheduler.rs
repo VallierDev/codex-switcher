@@ -367,7 +367,10 @@ pub fn start_anchor_refresh(
                     Err(_) => continue,
                 };
                 let mode = store.settings.remote_mode.clone();
-                match store.session_anchor() {
+                match store
+                    .session_anchor()
+                    .filter(|account| account.is_openai_account())
+                {
                     Some(acc) => {
                         let rt = acc
                             .refresh_token

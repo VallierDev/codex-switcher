@@ -1,5 +1,5 @@
 import { useId, useState } from 'react';
-import { ChevronDown, ChevronUp, Clock } from 'lucide-react';
+import { Asterisk, ChevronDown, ChevronUp, Clock, Sparkles } from 'lucide-react';
 import { useShortCountdown } from '../hooks/useCountdown';
 import './AntigravityQuota.css';
 
@@ -9,12 +9,27 @@ export interface AntigravityModelQuota {
     updated_at?: string;
 }
 
-const SUMMARY_LABELS: Record<string, string> = {
-    'gemini-3.7-flash-high': 'G3.7 Flash',
-    'gemini-3.6-flash-high': 'G3.6 Flash',
-    'gemini-pro-agent': 'G3.1 Pro H',
-    'gemini-3.1-pro-low': 'G3.1 Pro L',
-};
+function modelName(model: string): string {
+    return model.replace(/(\d)-(\d)/g, '$1.$2').split('-').map(word => ({
+        gemini: 'Gemini', claude: 'Claude', pro: 'Pro', flash: 'Flash', sonnet: 'Sonnet',
+        opus: 'Opus', thinking: '(Thinking)', high: '(High)', low: '(Low)',
+        medium: '(Medium)', agent: 'Agent', lite: 'Lite', image: 'Image',
+        gpt: 'GPT', oss: 'OSS',
+    }[word] || word)).join(' ');
+}
+
+function summaryModels(models: string[]): string[] {
+    const newest = [...models].sort((a, b) => b.localeCompare(a, 'en', { numeric: true }));
+    const groups = [
+        (id: string) => /^gemini-.*pro/.test(id) && (id.endsWith('-high') || id === 'gemini-pro-agent'),
+        (id: string) => /^gemini-.*flash/.test(id) && !/image|lite|thinking/.test(id) && (id.endsWith('-high') || id.endsWith('-flash')),
+        (id: string) => id.startsWith('claude-sonnet-'),
+        (id: string) => id.startsWith('claude-opus-'),
+    ];
+    const featured = groups.map(matches => newest.find(matches)).filter((id): id is string => !!id);
+    const publicModels = newest.filter(id => /^(gemini-|claude-|gpt-oss-)/.test(id));
+    return [...new Set([...featured, ...publicModels, ...newest])].slice(0, 4);
+}
 
 function ModelQuota({ model, quota, compact = false }: {
     model: string;
@@ -32,7 +47,10 @@ function ModelQuota({ model, quota, compact = false }: {
         <div className={`quota-mini-card google-model-quota ${compact ? 'compact' : 'detail'}`} title={`${model}\n${resetAt === undefined ? '上游未提供重置时间' : `重置时间：${new Date(resetMs).toLocaleString()}`}`}>
             {percentage !== undefined && <div className={`quota-mini-bg ${color}`} style={{ width: `${percentage}%` }} />}
             <div className="quota-mini-content">
-                <span className="quota-label">{compact ? SUMMARY_LABELS[model] || model : model}</span>
+                <span className="quota-label">
+                    {model.startsWith('claude-') ? <Asterisk className="google-provider-icon claude" aria-hidden="true" /> : <Sparkles className="google-provider-icon gemini" aria-hidden="true" />}
+                    <span>{modelName(model)}</span>
+                </span>
                 <span className="quota-time neutral"><Clock className="icon-tiny" /><span>{resetText}</span></span>
                 <span className={`quota-percent ${color}`}>{percentage === undefined ? '未知' : `${Math.round(percentage)}%`}</span>
             </div>
@@ -45,8 +63,7 @@ export function AntigravityQuota({ quotas }: { quotas: Record<string, Antigravit
     const panelId = useId();
     const entries = Object.entries(quotas).filter(([, quota]) => quota && typeof quota === 'object')
         .sort(([a], [b]) => a.localeCompare(b, 'en', { numeric: true }));
-    const preferred = Object.keys(SUMMARY_LABELS).filter(model => quotas[model]);
-    const summary = [...preferred, ...entries.map(([model]) => model).filter(model => !preferred.includes(model))].slice(0, 4);
+    const summary = summaryModels(entries.map(([model]) => model));
     if (!entries.length) return <span className="quota-empty">暂无模型额度，点击刷新</span>;
     return (
         <div className="google-quota-overview">

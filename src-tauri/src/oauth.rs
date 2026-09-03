@@ -201,6 +201,9 @@ pub async fn refresh_access_token_locked_fresh(
             .accounts
             .get(account_id)
             .ok_or_else(|| "账号不存在".to_string())?;
+        if !acc.is_openai_account() {
+            return Err("Non-OpenAI account cannot use OpenAI token refresh".to_string());
+        }
         acc.refresh_token
             .clone()
             .or_else(|| crate::account::AccountStore::extract_refresh_token(&acc.auth_json))

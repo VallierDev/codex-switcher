@@ -1357,7 +1357,7 @@ fn antigravity_codex_catalog_entry(
     model: &crate::antigravity::AntigravityModel,
     template: Option<&serde_json::Value>,
 ) -> serde_json::Value {
-    let default_reasoning_level = model.thinking_levels.last().copied().unwrap_or("high");
+    let default_reasoning_level = model.default_thinking_level;
     let mut entry = template.cloned().unwrap_or_else(|| serde_json::json!({}));
     let Some(object) = entry.as_object_mut() else {
         return serde_json::json!({});

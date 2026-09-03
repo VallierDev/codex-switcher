@@ -2096,6 +2096,58 @@ fn start_antigravity_catalog_refresh(
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         loop {
+            let google_remote = store.lock().ok().and_then(|store| {
+                (store.settings.remote_mode == "client").then(|| {
+                    (
+                        store.settings.remote_server_url.clone(),
+                        store.settings.remote_server_url_fallback.clone(),
+                        store.settings.remote_shared_secret.clone(),
+                    )
+                })
+            });
+            if let Some((primary, fallback, secret)) = google_remote {
+                let result = async {
+                    let base = remote_client::resolve_base_url(&primary, &fallback).await?;
+                    remote_client::list_antigravity_accounts(&base, &secret).await
+                }
+                .await;
+                match result {
+                    Ok(accounts) => {
+                        let mut added = false;
+                        if let Ok(mut store) = store.lock() {
+                            for account in accounts {
+                                match store.accounts.entry(account.id.clone()) {
+                                    std::collections::hash_map::Entry::Vacant(entry) => {
+                                        entry.insert(account);
+                                        added = true;
+                                    }
+                                    std::collections::hash_map::Entry::Occupied(mut entry)
+                                        if entry.get().is_antigravity_oauth() =>
+                                    {
+                                        let existing = entry.get_mut();
+                                        existing.keepalive = account.keepalive;
+                                        existing.is_banned = account.is_banned;
+                                        existing.is_logged_out = account.is_logged_out;
+                                        existing.is_token_invalid = account.is_token_invalid;
+                                        added = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if added {
+                                store.ensure_current_antigravity_account();
+                                if let Err(error) = store.save() {
+                                    eprintln!("[GoogleCatalog] mirror save failed: {error}");
+                                }
+                            }
+                        }
+                        if added {
+                            let _ = app.emit("accounts-updated", ());
+                        }
+                    }
+                    Err(error) => eprintln!("[GoogleCatalog] account mirror sync failed: {error}"),
+                }
+            }
             let ids = store
                 .lock()
                 .map(|store| {

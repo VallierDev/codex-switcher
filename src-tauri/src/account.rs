@@ -1976,6 +1976,9 @@ impl AccountStore {
 
     /// 对非当前账号：是否应触发保活刷新
     pub fn should_refresh_inactive_account(account: &Account, inactive_refresh_days: u32) -> bool {
+        if !account.is_openai_account() {
+            return false;
+        }
         if !account.keepalive.inactive_refresh_enabled {
             return false;
         }
@@ -2133,6 +2136,32 @@ impl AccountStore {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn google_credentials_never_enter_openai_keepalive() {
+        let mut store = super::AccountStore::default();
+        let mut google = store.add_antigravity_account(
+            "google".into(),
+            serde_json::json!({
+                "tokens":{"refresh_token":"test-google-rt"}
+            }),
+            None,
+        );
+        google.keepalive.inactive_refresh_enabled = true;
+        assert!(!super::AccountStore::should_refresh_inactive_account(
+            &google, 1
+        ));
+        let mut openai = google.clone();
+        openai.kind = super::AccountKind::ChatgptOauth;
+        assert!(super::AccountStore::should_refresh_inactive_account(
+            &openai, 1
+        ));
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(store));
+        let error = crate::oauth::refresh_access_token_locked_fresh(&shared, &google.id)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Non-OpenAI account"));
+    }
+
     use super::*;
     use base64::Engine;
 

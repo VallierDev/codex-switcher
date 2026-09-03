@@ -1056,7 +1056,7 @@ export function AccountList({
                                         )}
                                     </div>
                                 </div>
-                                <div className="col-quota-merged">
+                                <div className={`col-quota-merged ${kind === 'antigravity_oauth' ? 'google-quota-column' : ''}`}>
                                     {effectiveKind(acc) === 'relay' ? (
                                         <RelayQuotaItem account={acc} cache={relayUsageMap[acc.id]} />
                                     ) : effectiveKind(acc) === 'antigravity_oauth' ? (

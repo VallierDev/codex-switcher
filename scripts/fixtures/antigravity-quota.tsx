@@ -20,12 +20,12 @@ const quotas: Record<string, AntigravityModelQuota> = {
 function Preview() {
     const [live, setLive] = useState(quotas);
     const [dark, setDark] = useState(false);
-    return <main data-theme={dark ? 'dark' : 'light'} style={{ padding: 24, maxWidth: 650, background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>
+    return <main data-theme={dark ? 'dark' : 'light'} style={{ padding: 24, maxWidth: 800, background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>
         <h2>Google 模型额度验收（模拟数据）</h2>
         <button onClick={() => setLive({ ...live, 'new-model-after-refresh': { remaining_fraction: 0.7, reset_time: reset } })}>模拟刷新：新增模型</button>
         <button onClick={() => setDark(value => !value)}>切换深浅色</button>
-        <h3>账号 A</h3><div className="col-quota-merged"><AntigravityQuota quotas={live} /></div>
-        <h3>账号 B</h3><div className="col-quota-merged"><AntigravityQuota quotas={quotas} /></div>
+        <h3>账号 A</h3><div className="col-quota-merged google-quota-column"><AntigravityQuota quotas={live} /></div>
+        <h3>账号 B</h3><div className="col-quota-merged google-quota-column"><AntigravityQuota quotas={quotas} /></div>
         <h3>未同步账号</h3><AntigravityQuota quotas={{}} />
     </main>;
 }

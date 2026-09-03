@@ -11,6 +11,7 @@ pub struct AntigravityModel {
     pub input_modalities: Vec<&'static str>,
     pub output_modalities: Vec<&'static str>,
     pub thinking_levels: Vec<&'static str>,
+    pub default_thinking_level: &'static str,
 }
 
 pub fn is_public_model_id(id: &str) -> bool {
@@ -48,24 +49,45 @@ pub fn model_for_id(id: &str) -> Option<AntigravityModel> {
     }
     let is_claude = id.starts_with("claude-");
     let display_name = humanize_model_id(id);
-    let thinking_levels = if id.ends_with("-low") || id.ends_with("-extra-low") {
-        vec!["low"]
-    } else if id.ends_with("-medium") {
+    // Suffixes are upstream defaults, not a restriction on selectable effort.
+    // Gemini accepts an explicit thinkingLevel even on a *-high model ID.
+    let thinking_levels = if id.starts_with("gpt-oss-") {
         vec!["medium"]
-    } else if id.ends_with("-high") || id.ends_with("-thinking") {
-        vec!["high"]
-    } else {
+    } else if id.starts_with("gemini-3.6-")
+        || id.starts_with("gemini-3.5-")
+        || id.starts_with("gemini-3-flash")
+    {
         vec!["minimal", "low", "medium", "high"]
+    } else {
+        vec!["low", "medium", "high"]
+    };
+    let default_thinking_level = if id.ends_with("-extra-low") {
+        "minimal"
+    } else if id.ends_with("-low") {
+        "low"
+    } else if id.ends_with("-medium") {
+        "medium"
+    } else {
+        "high"
     };
     Some(AntigravityModel {
         id: id.to_string(),
         display_name: format!("{display_name} (Antigravity)"),
         description: format!("{display_name} through Google Antigravity OAuth"),
         context_length: if is_claude { 200_000 } else { 1_048_576 },
-        max_completion_tokens: 65_536,
+        // Older Gemini routes advertise 65,535, not 65,536. Use the lower
+        // compatible ceiling so adding thinking config doesn't cause HTTP 400.
+        max_completion_tokens: if is_claude {
+            64_000
+        } else if id.starts_with("gpt-oss-") {
+            32_768
+        } else {
+            65_535
+        },
         input_modalities: vec!["text", "image"],
         output_modalities: vec!["text"],
         thinking_levels,
+        default_thinking_level,
     })
 }
 
@@ -109,6 +131,21 @@ fn humanize_model_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presets_keep_defaults_but_allow_effort_selection() {
+        for (id, default) in [
+            ("gemini-3.7-flash-high", "high"),
+            ("gemini-3.7-flash-low", "low"),
+            ("gemini-3.7-flash-medium", "medium"),
+            ("claude-opus-4-6-thinking", "high"),
+            ("claude-sonnet-4-6", "high"),
+        ] {
+            let model = model_for_id(id).unwrap();
+            assert_eq!(model.thinking_levels, vec!["low", "medium", "high"]);
+            assert_eq!(model.default_thinking_level, default);
+        }
+    }
 
     #[test]
     fn live_catalog_adds_claude_and_future_gemini_automatically() {

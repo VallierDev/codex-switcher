@@ -186,6 +186,21 @@ async fn route(
         return handle_antigravity_oauth_complete(&state, req).await;
     }
 
+    if path == "/antigravity/accounts" && method == Method::GET {
+        let store = match state.store.lock() {
+            Ok(store) => store,
+            Err(error) => return err_resp(error.to_string()),
+        };
+        let accounts: Vec<Account> = store
+            .accounts
+            .values()
+            .filter(|account| account.is_antigravity_oauth())
+            .cloned()
+            .map(antigravity_account_mirror)
+            .collect();
+        return json_resp(StatusCode::OK, json!({"accounts": accounts}));
+    }
+
     if path == "/accounts" {
         match method {
             Method::GET => return handle_list(&state),
@@ -503,6 +518,20 @@ pub(crate) async fn refresh_antigravity_quota_local(
         let mut guard = store.lock().map_err(|error| error.to_string())?;
         let account = guard.accounts.get_mut(id).ok_or("账号已被删除")?;
         crate::antigravity::quota::write_model_quotas(&mut account.auth_json, &quotas);
+        // Google has its own refresh loop; never enroll it in OpenAI keepalive.
+        account.keepalive.inactive_refresh_enabled = false;
+        if account
+            .keepalive
+            .last_error
+            .as_deref()
+            .is_some_and(|error| {
+                error.contains("Could not validate your token") && error.contains("token_expired")
+            })
+        {
+            // Only clear the proven cross-provider misroute after Google succeeds.
+            account.keepalive.last_error = None;
+            account.keepalive.last_success_at = Some(chrono::Utc::now());
+        }
         guard.save()?;
     }
     let _ = app.emit("accounts-updated", ());
