@@ -754,6 +754,15 @@ fn antigravity_routes_from_store(store: &AccountStore, model_id: &str) -> Vec<An
                 model_id,
                 Utc::now(),
             )?;
+            if let Some(quotas) = account
+                .auth_json
+                .get("model_quotas")
+                .and_then(serde_json::Value::as_object)
+            {
+                if !quotas.is_empty() && !quotas.contains_key(model_id) {
+                    return None;
+                }
+            }
             let tokens = account.auth_json.get("tokens");
             let access_token = tokens
                 .and_then(|tokens| tokens.get("access_token"))
@@ -814,6 +823,38 @@ fn has_antigravity_account(state: &ProxyState) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+fn antigravity_models_for_state(state: &ProxyState) -> Vec<crate::antigravity::AntigravityModel> {
+    state
+        .store
+        .lock()
+        .map(|store| antigravity_models_from_store(&store))
+        .unwrap_or_default()
+}
+
+fn antigravity_models_from_store(
+    store: &AccountStore,
+) -> Vec<crate::antigravity::AntigravityModel> {
+    let live_ids = store
+        .accounts
+        .values()
+        .filter(|account| {
+            account.is_antigravity_oauth()
+                && !account.is_logged_out
+                && !account.is_banned
+                && !account.is_token_invalid
+        })
+        .flat_map(|account| {
+            crate::antigravity::quota::read_model_quotas(&account.auth_json).into_keys()
+        });
+    crate::antigravity::models::catalog_from_live_ids(live_ids)
+}
+
+fn antigravity_model_available(state: &ProxyState, id: &str) -> bool {
+    antigravity_models_for_state(state)
+        .iter()
+        .any(|model| model.id == id)
 }
 
 fn antigravity_remote_urls(store: &AccountStore) -> (String, String) {
@@ -1007,7 +1048,9 @@ async fn handle_antigravity_response(
         );
     }
     let mut last_error = "Antigravity request failed".to_string();
+    let mut last_status = StatusCode::BAD_GATEWAY;
     for route in routes {
+        last_status = StatusCode::BAD_GATEWAY;
         let mut route = match refresh_antigravity_route_if_needed(&state, route).await {
             Ok(route) => route,
             Err(error) => {
@@ -1079,6 +1122,7 @@ async fn handle_antigravity_response(
         }
         let status = response.status();
         if status.as_u16() == 429 {
+            last_status = StatusCode::TOO_MANY_REQUESTS;
             let _ = response.bytes().await;
             if let Ok(mut store) = state.store.lock() {
                 if let Some(account) = store.accounts.get_mut(&route.account_id) {
@@ -1090,6 +1134,7 @@ async fn handle_antigravity_response(
             continue;
         }
         if !status.is_success() {
+            last_status = status;
             let error_body = response.text().await.unwrap_or_default();
             let preview: String = error_body.chars().take(500).collect();
             last_error = format!("Antigravity upstream returned HTTP {status}: {preview}");
@@ -1171,7 +1216,7 @@ async fn handle_antigravity_response(
                 )
             });
     }
-    error_response(StatusCode::TOO_MANY_REQUESTS, &last_error)
+    error_response(last_status, &last_error)
 }
 
 fn schedule_antigravity_success_refresh(
@@ -1466,6 +1511,12 @@ async fn handle_models_with_antigravity(
             }
         }
     }
+    // This endpoint parses and augments JSON, so do not forward the caller's
+    // compression negotiation (the shared passthrough client doesn't decode it).
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
     let response = match state.client.get(url).headers(headers).send().await {
         Ok(response) => response,
         Err(error) => {
@@ -1523,9 +1574,9 @@ async fn handle_models_with_antigravity(
                         .map(ToOwned::to_owned)
                 })
                 .collect();
-            for model in crate::antigravity::models() {
-                if !existing.contains(model.id) {
-                    models.push(antigravity_codex_catalog_entry(model, template.as_ref()));
+            for model in antigravity_models_for_state(&state) {
+                if !existing.contains(&model.id) {
+                    models.push(antigravity_codex_catalog_entry(&model, template.as_ref()));
                 }
             }
         } else if let Some(models) = catalog
@@ -1541,8 +1592,8 @@ async fn handle_models_with_antigravity(
                         .map(ToOwned::to_owned)
                 })
                 .collect();
-            for model in crate::antigravity::models() {
-                if !existing.contains(model.id) {
+            for model in antigravity_models_for_state(&state) {
+                if !existing.contains(&model.id) {
                     models.push(serde_json::json!({"id": model.id, "object": "model", "owned_by": "antigravity"}));
                 }
             }
@@ -2689,7 +2740,7 @@ async fn handle_request(
         Err(error) => return Ok(error_response(StatusCode::BAD_REQUEST, &error)),
     };
     if let Some(model) = request_model(&body_for_routing) {
-        if crate::antigravity::is_antigravity_model(&model) {
+        if antigravity_model_available(&state, &model) {
             return Ok(handle_antigravity_response(
                 state,
                 method,
@@ -6556,7 +6607,7 @@ async fn bridge_websockets<S1, S2>(
     .flatten();
     if detected_model
         .as_deref()
-        .map(crate::antigravity::is_antigravity_model)
+        .map(|model| antigravity_model_available(&state, model))
         .unwrap_or(false)
     {
         drop(upstream);
@@ -7978,6 +8029,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn google_catalog_and_routes_follow_each_accounts_live_models() {
+        let mut store = AccountStore::default();
+        store.settings.remote_mode = "client".into();
+        let quota =
+            serde_json::json!({"remaining_fraction":0.9,"reset_time":null,"updated_at":"now"});
+        let first = store.add_antigravity_account(
+            "first".into(),
+            serde_json::json!({
+                "project_id":"p", "model_quotas":{"gemini-3.8-flash-high":quota.clone()}
+            }),
+            None,
+        );
+        let second = store.add_antigravity_account(
+            "second".into(),
+            serde_json::json!({
+                "project_id":"p", "model_quotas":{"claude-sonnet-4-6":quota}
+            }),
+            None,
+        );
+        let codex_current = store.current.clone();
+        assert_eq!(antigravity_models_from_store(&store).len(), 2);
+        let routes = antigravity_routes_from_store(&store, "claude-sonnet-4-6");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].account_id, second.id);
+        store.accounts.get_mut(&second.id).unwrap().is_logged_out = true;
+        let catalog = antigravity_models_from_store(&store);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, "gemini-3.8-flash-high");
+        store.accounts.get_mut(&first.id).unwrap().auth_json["model_quotas"] =
+            serde_json::json!({});
+        assert!(antigravity_models_from_store(&store).is_empty());
+        assert_eq!(store.current, codex_current);
+    }
+
+    #[test]
     fn google_manual_account_wins_until_that_model_is_exhausted() {
         let mut store = AccountStore::default();
         store.settings.remote_mode = "client".into();
@@ -7999,6 +8085,8 @@ mod tests {
             &mut store.accounts.get_mut(&second.id).unwrap().auth_json,
             "gemini-3.7-flash-high",
         );
+        store.accounts.get_mut(&second.id).unwrap().auth_json["model_quotas"]["gemini-pro-agent"] =
+            serde_json::json!({"remaining_fraction":0.9,"reset_time":null,"updated_at":"now"});
         assert_eq!(
             antigravity_routes_from_store(&store, "gemini-3.7-flash-high")[0].account_id,
             first.id
@@ -8026,7 +8114,7 @@ mod tests {
             }
         });
         let entry = antigravity_codex_catalog_entry(
-            crate::antigravity::models::find_model("gemini-3.7-flash-high").unwrap(),
+            &crate::antigravity::models::model_for_id("gemini-3.7-flash-high").unwrap(),
             Some(&template),
         );
         assert_eq!(entry["slug"], "gemini-3.7-flash-high");
@@ -8550,7 +8638,9 @@ mod tests {
         );
         let gemini_model = ws_message_model(&gemini).unwrap();
         let gpt_model = ws_message_model(&gpt).unwrap();
-        assert!(crate::antigravity::is_antigravity_model(&gemini_model));
-        assert!(!crate::antigravity::is_antigravity_model(&gpt_model));
+        assert!(crate::antigravity::models::is_public_model_id(
+            &gemini_model
+        ));
+        assert!(!crate::antigravity::models::is_public_model_id(&gpt_model));
     }
 }

@@ -54,7 +54,7 @@ fn chat_to_gemini_request(chat: &Value) -> Result<Value, String> {
             let output = content_as_text(message.get("content"));
             contents.push(json!({
                 "role": "user",
-                "parts": [{"functionResponse": {"name": name, "response": {"output": output}}}],
+                "parts": [{"functionResponse": {"name": name, "id": call_id, "response": {"output": output}}}],
             }));
             continue;
         }
@@ -501,6 +501,27 @@ pub fn antigravity_response_to_codex(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_results_preserve_call_id_for_google_claude_translation() {
+        for model in ["claude-sonnet-4-6", "gemini-3.7-flash-high"] {
+            let input = json!({"model":model,"input":[
+                {"role":"user","content":"Run probe"},
+                {"type":"function_call","call_id":"call_probe","name":"probe","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_probe","output":"OK"}
+            ]});
+            let (body, _) =
+                responses_to_antigravity(&serde_json::to_vec(&input).unwrap(), model, "p").unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            let contents = value["request"]["contents"].as_array().unwrap();
+            assert_eq!(contents[1]["parts"][0]["functionCall"]["id"], "call_probe");
+            assert_eq!(
+                contents[2]["parts"][0]["functionResponse"]["id"],
+                "call_probe"
+            );
+            assert_eq!(contents[2]["parts"][0]["functionResponse"]["name"], "probe");
+        }
+    }
 
     #[test]
     fn converts_text_request_to_antigravity_envelope() {

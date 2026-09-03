@@ -2088,6 +2088,46 @@ fn reserve_window_prime_attempt(account: &mut Account, due: &WindowPrimeDue) -> 
     true
 }
 
+/// Google discovery is independent of OpenAI quota polling. Only the credential
+/// authority fetches Google; Client mode mirrors its cached model IDs via /quotas.
+fn start_antigravity_catalog_refresh(
+    store: std::sync::Arc<std::sync::Mutex<AccountStore>>,
+    app: tauri::AppHandle,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let ids = store
+                .lock()
+                .map(|store| {
+                    if matches!(store.settings.remote_mode.as_str(), "client" | "solo") {
+                        return Vec::new();
+                    }
+                    store
+                        .accounts
+                        .values()
+                        .filter(|account| {
+                            account.is_antigravity_oauth()
+                                && !account.is_logged_out
+                                && !account.is_banned
+                                && !account.is_token_invalid
+                        })
+                        .map(|account| account.id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for id in ids {
+                if let Err(error) =
+                    remote_server::refresh_antigravity_quota_local(&store, &app, &id).await
+                {
+                    // Fetch failure leaves the last successfully fetched catalog intact.
+                    eprintln!("[GoogleCatalog] account={} refresh failed: {}", id, error);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        }
+    })
+}
+
 pub fn start_quota_refresh(
     store: std::sync::Arc<std::sync::Mutex<AccountStore>>,
     app_handle: tauri::AppHandle,
@@ -5817,6 +5857,7 @@ pub fn run() {
             let mut qr = state.quota_refresh_handle.lock().unwrap();
             *qr = Some(handle);
             println!("[QuotaRefresh] 常驻循环启动中（setup 阶段）");
+            start_antigravity_catalog_refresh(state.store.clone(), app.handle().clone());
 
             // 启动时立刻跑一次同步，把 store/disk 不一致 + 落后的 RT 立即对齐
             let store_for_init = state.store.clone();
