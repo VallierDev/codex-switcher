@@ -30,6 +30,10 @@ function Preview() {
         </div></div>
         <h3>账号 B</h3><div className="col-quota-merged google-quota-column"><AntigravityQuota quotas={quotas} /></div>
         <h3>未同步账号</h3><AntigravityQuota quotas={{}} />
+        <h3>ChatGPT 账号 · 标签换行回归</h3><div className="account-list-container"><div className="account-row">
+            <div className="col-email"><span className="email-text">long-chatgpt-email@example.com</span><div className="badges" style={{ display: 'flex', gap: 4, marginLeft: 8 }}><span className="badge kind-chatgpt">订阅</span><span className="badge plan">Pro</span></div></div>
+            <div className="col-quota-merged">5H 100% · 7D 80%（模拟数据）</div>
+        </div></div>
     </main>;
 }
 createRoot(document.getElementById('root')!).render(<React.StrictMode><Preview /></React.StrictMode>);

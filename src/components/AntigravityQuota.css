@@ -24,11 +24,11 @@
 .google-model-quota .quota-percent.neutral { color: var(--text-muted); }
 
 /* Provider quota rows: readable names, warm reset times, aligned percentages. */
-.col-quota-merged.google-quota-column { width: 400px; }
-.account-list-container:has(.google-quota-overview) .col-quota-merged { width: 400px; }
-.account-row:has(.google-quota-overview) .col-email { flex-direction: column; align-items: flex-start; min-width: 280px; gap: 6px; }
-.account-row:has(.google-quota-overview) .email-text { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
-.account-row:has(.google-quota-overview) .badges { margin-left: 0 !important; }
+.col-quota-merged.google-quota-column { width: 460px; }
+.account-list-container:has(.google-quota-overview) .col-quota-merged { width: 460px; }
+.account-row:is(:has(.google-quota-overview), :has(.kind-chatgpt)) .col-email { flex-direction: column; align-items: flex-start; min-width: 280px; gap: 6px; }
+.account-row:is(:has(.google-quota-overview), :has(.kind-chatgpt)) .email-text { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.account-row:is(:has(.google-quota-overview), :has(.kind-chatgpt)) .badges { margin-left: 0 !important; }
 .google-quota-overview .quota-grid { gap: 6px 8px; }
 .google-quota-overview .google-model-quota { border-color: transparent; border-radius: 6px; }
 .google-model-quota.compact { height: 30px; padding: 0 8px; }
