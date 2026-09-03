@@ -1248,6 +1248,11 @@ async fn handle_antigravity_response(
             let error_body = response.text().await.unwrap_or_default();
             let preview: String = error_body.chars().take(500).collect();
             last_error = format!("Antigravity upstream returned HTTP {status}: {preview}");
+            // Invalid request shape is not an account problem. Do not send the
+            // same malformed tool request across every Google identity.
+            if status == reqwest::StatusCode::BAD_REQUEST {
+                return error_response(StatusCode::BAD_REQUEST, &last_error);
+            }
             continue;
         }
         let selection_changed = if let Ok(mut store) = state.store.lock() {
@@ -1363,16 +1368,17 @@ struct AntigravityCodexStream {
     upstream_done: bool,
     finalized: bool,
     failed: bool,
+    finish_reason: Option<String>,
 }
 
 fn antigravity_codex_stream(
     response: reqwest::Response,
-    translator: crate::relay_translate::TranslatorState,
+    mut translator: crate::relay_translate::TranslatorState,
     model: String,
 ) -> ByteStream {
     let mut queued = std::collections::VecDeque::new();
-    queued.push_back(Bytes::from(crate::relay_translate::emit_created(
-        &translator,
+    queued.push_back(Bytes::from(crate::relay_translate::emit_google_created(
+        &mut translator,
     )));
     let state = AntigravityCodexStream {
         upstream: response.bytes_stream().boxed(),
@@ -1383,6 +1389,7 @@ fn antigravity_codex_stream(
         upstream_done: false,
         finalized: false,
         failed: false,
+        finish_reason: None,
     };
     futures_util::stream::unfold(state, |mut state| async move {
         loop {
@@ -1392,7 +1399,26 @@ fn antigravity_codex_stream(
             while let Some(data) = pop_sse_data(&mut state.buffer) {
                 if data == b"[DONE]" {
                     state.upstream_done = true;
+                    if state.finish_reason.is_none() {
+                        state.finish_reason = Some("STOP".into());
+                    }
                     break;
+                }
+                match crate::antigravity::translate::inspect_stream_event(&data) {
+                    Ok(Some(reason)) => state.finish_reason = Some(reason),
+                    Ok(None) => {}
+                    Err(error) => {
+                        state.failed = true;
+                        state.buffer.clear();
+                        state
+                            .queued
+                            .push_back(Bytes::from(crate::relay_translate::emit_failed(
+                                &mut state.translator,
+                                "upstream_error",
+                                &error,
+                            )));
+                        break;
+                    }
                 }
                 if let Some(chat_chunk) =
                     crate::antigravity::translate::antigravity_sse_event_to_chat_chunk(
@@ -1416,16 +1442,24 @@ fn antigravity_codex_stream(
             if state.upstream_done {
                 if !state.finalized {
                     state.finalized = true;
-                    let completed = crate::relay_translate::emit_completed(&mut state.translator);
+                    let completed = crate::antigravity::translate::finish_codex_stream(
+                        &mut state.translator,
+                        state.finish_reason.as_deref(),
+                    );
                     return Some((Ok(Bytes::from(completed)), state));
                 }
                 return None;
             }
             match state.upstream.next().await {
                 Some(Ok(bytes)) => state.buffer.extend_from_slice(&bytes),
-                Some(Err(error)) => {
+                Some(Err(_error)) => {
                     state.failed = true;
-                    return Some((Err(error), state));
+                    let event = crate::relay_translate::emit_failed(
+                        &mut state.translator,
+                        "upstream_connection_error",
+                        "Google stream connection closed before completion",
+                    );
+                    return Some((Ok(Bytes::from(event)), state));
                 }
                 None => {
                     state.upstream_done = true;
@@ -1438,29 +1472,34 @@ fn antigravity_codex_stream(
 }
 
 fn pop_sse_data(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let (end, delimiter_len) = buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|end| (end, 4))
-        .or_else(|| {
-            buffer
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|end| (end, 2))
-        })?;
-    let event: Vec<u8> = buffer.drain(..end).collect();
-    buffer.drain(..delimiter_len);
-    let mut data = Vec::new();
-    for line in event.split(|byte| *byte == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Some(value) = line.strip_prefix(b"data:") {
-            if !data.is_empty() {
-                data.push(b'\n');
+    loop {
+        let (end, delimiter_len) = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|end| (end, 4))
+            .or_else(|| {
+                buffer
+                    .windows(2)
+                    .position(|window| window == b"\n\n")
+                    .map(|end| (end, 2))
+            })?;
+        let event: Vec<u8> = buffer.drain(..end).collect();
+        buffer.drain(..delimiter_len);
+        let mut data = Vec::new();
+        for line in event.split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if let Some(value) = line.strip_prefix(b"data:") {
+                if !data.is_empty() {
+                    data.push(b'\n');
+                }
+                data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
             }
-            data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
         }
+        if !data.is_empty() {
+            return Some(data);
+        }
+        // Skip comments/heartbeats without hiding a subsequent event already buffered.
     }
-    (!data.is_empty()).then_some(data)
 }
 
 fn antigravity_codex_catalog_entry(
@@ -7156,7 +7195,9 @@ where
         .map(std::mem::take)
         .unwrap_or(frame);
     if body.get("generate").and_then(serde_json::Value::as_bool) == Some(false) {
-        let id = format!("resp_prewarm_{}", uuid::Uuid::new_v4());
+        // This bridge is stateless. A nonempty synthetic id would invite Codex
+        // to send incremental input for a server-side history we never stored.
+        let id = String::new();
         for event in [
             serde_json::json!({"type":"response.created","response":{"id":id,"object":"response","status":"in_progress","output":[]}}),
             serde_json::json!({"type":"response.completed","response":{"id":id,"object":"response","status":"completed","output":[]}}),
@@ -8336,6 +8377,8 @@ mod tests {
         let mut buffer = b"event: message\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\nrest".to_vec();
         assert_eq!(pop_sse_data(&mut buffer), Some(b"{\"a\":\n1}".to_vec()));
         assert_eq!(buffer, b"rest");
+        let mut buffer = b": heartbeat\n\ndata: {\"ok\":true}\n\n".to_vec();
+        assert_eq!(pop_sse_data(&mut buffer), Some(b"{\"ok\":true}".to_vec()));
     }
 
     /// 只有 Worker 的 follow-current 请求才允许被换号。

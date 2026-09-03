@@ -6,14 +6,66 @@ pub fn responses_to_antigravity(
     model: &str,
     project_id: &str,
 ) -> Result<(Vec<u8>, TranslatorState), String> {
-    let (chat_body, state) = relay_translate::translate_request(codex_body, model)
+    let original: Value = serde_json::from_slice(codex_body).map_err(|e| e.to_string())?;
+    let mut normalized = original.clone();
+    let tool_specs = super::tools::prepare_request(&mut normalized)?;
+    let normalized_bytes = serde_json::to_vec(&normalized).map_err(|e| e.to_string())?;
+    let (chat_body, mut state) = relay_translate::translate_request(&normalized_bytes, model)
         .map_err(|e| format!("Responses normalization failed: {e}"))?;
-    let chat: Value = serde_json::from_slice(&chat_body).map_err(|e| e.to_string())?;
+    state.set_tool_wire_specs(tool_specs);
+    state.request_metadata["tools"] = original.get("tools").cloned().unwrap_or(json!([]));
+    if let Some(choice) = original.get("tool_choice") {
+        state.request_metadata["tool_choice"] = choice.clone();
+    }
+    let mut chat: Value = serde_json::from_slice(&chat_body).map_err(|e| e.to_string())?;
+    if let Some(tools) = chat.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            if tool
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| state.is_custom_tool(name))
+            {
+                tool["function"]["parameters"]["required"] = json!(["input"]);
+            }
+        }
+    }
     let mut request = chat_to_gemini_request(&chat)?;
+    if let Some(choice) = normalized.get("tool_choice").filter(|v| !v.is_null()) {
+        let config = match choice.as_str() {
+            Some("auto") => json!({"mode":"AUTO"}),
+            Some("none") => json!({"mode":"NONE"}),
+            Some("required") => json!({"mode":"ANY"}),
+            None if choice.get("type").and_then(Value::as_str) == Some("allowed_tools") => {
+                let mode = match choice.get("mode").and_then(Value::as_str) {
+                    Some("auto") => "AUTO",
+                    Some("required") => "ANY",
+                    _ => return Err("Unsupported allowed_tools mode".into()),
+                };
+                json!({"mode":mode,"allowedFunctionNames":choice["names"]})
+            }
+            None if choice.pointer("/function/name").is_some() => {
+                json!({"mode":"ANY", "allowedFunctionNames":[choice["function"]["name"]]})
+            }
+            _ => return Err("Unsupported Google tool_choice".into()),
+        };
+        request["toolConfig"] = json!({"functionCallingConfig":config});
+    }
     // The shared chat normalizer intentionally doesn't own provider-specific
     // reasoning settings. Read them from the original Responses request here.
-    let original: Value = serde_json::from_slice(codex_body).map_err(|e| e.to_string())?;
     apply_thinking_config(&mut request, &original, model)?;
+    if model.starts_with("claude-")
+        && request
+            .pointer("/toolConfig/functionCallingConfig/mode")
+            .and_then(Value::as_str)
+            == Some("ANY")
+        && request
+            .pointer("/generationConfig/thinkingConfig/thinkingBudget")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0
+    {
+        return Err("Claude extended thinking cannot be combined with forced tool_choice; use tool_choice auto".into());
+    }
     let envelope = json!({
         "model": model,
         "userAgent": "antigravity",
@@ -346,6 +398,7 @@ fn sanitize_schema_node(value: Value, property_map: bool) -> Value {
                 "dependentRequired",
                 "unevaluatedProperties",
                 "propertyNames",
+                "encrypted",
             ];
             object.retain(|key, _| !UNSUPPORTED.contains(&key.as_str()) && !key.starts_with("x-"));
             for (key, value) in object.iter_mut() {
@@ -499,6 +552,47 @@ pub fn antigravity_sse_event_to_chat_chunk(raw: &[u8], model: &str) -> Option<Ve
     serde_json::to_vec(&chunk).ok()
 }
 
+/// Inspect provider termination before translating it. Never turn every finish
+/// reason (including malformed tool calls) into a successful OpenAI "stop".
+pub fn inspect_stream_event(raw: &[u8]) -> Result<Option<String>, String> {
+    let envelope: Value =
+        serde_json::from_slice(raw).map_err(|_| "Google sent malformed stream JSON".to_string())?;
+    let response = envelope.get("response").unwrap_or(&envelope);
+    if let Some(error) = envelope
+        .get("error")
+        .or_else(|| response.get("error"))
+        .filter(|error| !error.is_null())
+    {
+        let status = error
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN");
+        let message: String = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("upstream error")
+            .chars()
+            .take(300)
+            .collect();
+        return Err(format!("Google stream error ({status}): {message}"));
+    }
+    if let Some(reason) = response
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+    {
+        return Err(format!("Google blocked the response: {reason}"));
+    }
+    match response
+        .pointer("/candidates/0/finishReason")
+        .and_then(Value::as_str)
+    {
+        Some("STOP") => Ok(Some("STOP".into())),
+        Some("MAX_TOKENS") => Ok(Some("MAX_TOKENS".into())),
+        Some("" | "FINISH_REASON_UNSPECIFIED") | None => Ok(None),
+        Some(reason) => Err(format!("Google ended the response with {reason}")),
+    }
+}
+
 fn antigravity_usage(response: &Value) -> Option<Value> {
     let usage = response.get("usageMetadata")?;
     let input = usage
@@ -520,18 +614,42 @@ fn antigravity_usage(response: &Value) -> Option<Value> {
     }))
 }
 
+/// Google-only terminal validation. A truncated or reasoning-only response is
+/// not a successful agent turn, even when the HTTP connection ends cleanly.
+pub fn finish_codex_stream(state: &mut TranslatorState, finish: Option<&str>) -> Vec<u8> {
+    if finish == Some("MAX_TOKENS") {
+        return relay_translate::emit_incomplete(state, "max_output_tokens");
+    }
+    // Google sometimes sends a complete tool + usage frame, then clean EOF
+    // without finishReason (also covered by CPA's executor regression tests).
+    if finish != Some("STOP") && !(finish.is_none() && state.has_metered_tool_output()) {
+        return relay_translate::emit_failed(
+            state,
+            "incomplete_upstream_stream",
+            "Google stream ended without a successful finish reason",
+        );
+    }
+    if let Err(error) = state.validate_tool_output() {
+        return relay_translate::emit_failed(state, "invalid_tool_call", &error);
+    }
+    if !state.has_actionable_output() {
+        return relay_translate::emit_failed(
+            state,
+            "empty_model_response",
+            "Google returned reasoning but no answer or tool call",
+        );
+    }
+    relay_translate::emit_completed(state)
+}
+
 pub fn antigravity_response_to_codex(
     raw: &[u8],
     state: &mut TranslatorState,
     model: &str,
     stream: bool,
 ) -> Result<Vec<u8>, String> {
+    let finish = inspect_stream_event(raw)?;
     let chat = antigravity_json_to_chat_response(raw, model)?;
-    if !stream {
-        return relay_translate::translate_sync_response(state, &chat)
-            .map_err(|e| format!("Antigravity response translation failed: {e}"));
-    }
-
     let value: Value = serde_json::from_slice(&chat).map_err(|e| e.to_string())?;
     let message = &value["choices"][0]["message"];
     let mut delta = Map::new();
@@ -549,13 +667,31 @@ pub fn antigravity_response_to_codex(
     }
     let chunk = format!(
         "data: {}\n\n",
-        json!({"choices":[{"index":0,"delta":delta,"finish_reason":Value::Null}]})
+        json!({"choices":[{"index":0,"delta":delta,"finish_reason":Value::Null}],"usage":value["usage"]})
     );
-    let mut output = relay_translate::emit_created(state);
+    let mut output = relay_translate::emit_google_created(state);
     for event in relay_translate::handle_chunk(state, chunk.as_bytes()) {
         output.extend_from_slice(&event);
     }
-    output.extend_from_slice(&relay_translate::emit_completed(state));
+    output.extend_from_slice(&finish_codex_stream(state, finish.as_deref()));
+    if !stream {
+        let response = std::str::from_utf8(&output)
+            .map_err(|e| e.to_string())?
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .filter_map(|event| event.get("response").cloned())
+            .last()
+            .ok_or("Missing Google terminal response")?;
+        if response.get("status").and_then(Value::as_str) == Some("failed") {
+            return Err(response
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("Google response failed")
+                .to_owned());
+        }
+        return serde_json::to_vec(&response).map_err(|e| e.to_string());
+    }
     Ok(output)
 }
 
@@ -682,7 +818,7 @@ mod tests {
             "p1",
         )
         .unwrap();
-        let raw = json!({"response":{"candidates":[{"content":{"parts":[{"text":"world"}]}}]}});
+        let raw = json!({"response":{"candidates":[{"content":{"parts":[{"text":"world"}]},"finishReason":"STOP"}]}});
         let out = antigravity_response_to_codex(
             &serde_json::to_vec(&raw).unwrap(),
             &mut state,

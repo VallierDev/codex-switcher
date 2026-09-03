@@ -13,7 +13,7 @@
 //! chunks for thinking. We surface those as `response.reasoning_summary_text.delta`
 //! so codex CLI shows reasoning in real time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
@@ -60,6 +60,16 @@ pub struct TranslatorState {
     reasoning_idx: Option<usize>,
     reasoning_item_id: Option<String>,
     finalized: bool,
+    /// Opt-in for native Google only. Other Relay paths retain their wire format.
+    tool_wire_specs: Option<HashMap<String, ToolWireSpec>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolWireSpec {
+    pub name: String,
+    pub namespace: Option<String>,
+    pub custom: bool,
+    pub local_shell: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +78,7 @@ struct ToolCallInProgress {
     call_id: String,
     name: String,
     arguments: String,
+    custom_input: Option<String>,
 }
 
 impl TranslatorState {
@@ -93,8 +104,105 @@ impl TranslatorState {
             reasoning_idx: None,
             reasoning_item_id: None,
             finalized: false,
+            tool_wire_specs: None,
         }
     }
+
+    pub fn set_tool_wire_specs(&mut self, specs: HashMap<String, ToolWireSpec>) {
+        self.tool_wire_specs = Some(specs);
+    }
+
+    pub fn is_custom_tool(&self, name: &str) -> bool {
+        self.tool_wire_specs
+            .as_ref()
+            .and_then(|specs| specs.get(name))
+            .is_some_and(|spec| spec.custom)
+    }
+
+    pub fn validate_tool_output(&self) -> Result<(), String> {
+        if let Some(specs) = &self.tool_wire_specs {
+            for call in self.tool_calls.values() {
+                let spec = specs
+                    .get(&call.name)
+                    .ok_or_else(|| format!("Google returned an undeclared tool: {}", call.name))?;
+                if spec.custom && custom_input(&call.arguments).is_none() {
+                    return Err(format!(
+                        "Google returned invalid custom tool input for {}",
+                        spec.name
+                    ));
+                }
+                if !spec.custom && serde_json::from_str::<Value>(&call.arguments).is_err() {
+                    return Err(format!(
+                        "Google returned invalid JSON arguments for {}",
+                        spec.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn has_actionable_output(&self) -> bool {
+        !self.full_content.trim().is_empty() || !self.tool_calls.is_empty()
+    }
+
+    pub fn has_metered_tool_output(&self) -> bool {
+        !self.tool_calls.is_empty() && self.total_tokens > 0
+    }
+
+    fn reasoning_carrier(&self) -> String {
+        if self.tool_wire_specs.is_some() {
+            if let Some(signature) = &self.thought_signature {
+                return crate::antigravity::tools::signature_carrier(
+                    signature,
+                    &self.full_reasoning_content,
+                    self.tool_calls
+                        .values()
+                        .map(|call| call.call_id.clone())
+                        .collect(),
+                );
+            }
+        }
+        self.full_reasoning_content.clone()
+    }
+
+    fn restore_tool_item(&self, item: &mut Value) {
+        let Some(spec) = item
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| self.tool_wire_specs.as_ref()?.get(name))
+        else {
+            return;
+        };
+        if let Some(object) = item.as_object_mut() {
+            object.insert("name".into(), json!(spec.name));
+            if let Some(namespace) = &spec.namespace {
+                object.insert("namespace".into(), json!(namespace));
+            }
+            if spec.custom {
+                let input = object
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .and_then(custom_input)
+                    .unwrap_or_default();
+                object.insert("type".into(), json!("custom_tool_call"));
+                object.insert("input".into(), json!(input));
+                object.remove("arguments");
+                object.remove("action");
+            } else if !spec.local_shell {
+                object.insert("type".into(), json!("function_call"));
+                object.remove("action");
+            }
+        }
+    }
+}
+
+fn custom_input(arguments: &str) -> Option<String> {
+    serde_json::from_str::<Value>(arguments)
+        .ok()?
+        .get("input")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn unix_secs() -> u64 {
@@ -885,6 +993,12 @@ pub fn emit_created(state: &TranslatorState) -> Vec<u8> {
     )
 }
 
+/// Google keeps an actual event sequence; leave legacy Relay emission unchanged.
+pub fn emit_google_created(state: &mut TranslatorState) -> Vec<u8> {
+    let response = build_response_skeleton(state, "in_progress", json!([]));
+    encode_event(state, "response.created", json!({"response":response}))
+}
+
 fn build_response_skeleton(state: &TranslatorState, status: &str, output: Value) -> Value {
     let md = state
         .request_metadata
@@ -998,10 +1112,41 @@ pub fn handle_chunk(state: &mut TranslatorState, chunk: &[u8]) -> Vec<Vec<u8>> {
         state.thought_signature = Some(signature.clone());
     }
 
+    // Codex preserves encrypted_content, but discards arbitrary signature fields.
+    // Open a carrier even when Google returns a signature without visible thought.
+    if state.tool_wire_specs.is_some()
+        && state.thought_signature.is_some()
+        && state.reasoning_idx.is_none()
+    {
+        let idx = state.next_idx;
+        state.next_idx += 1;
+        let id = format!("rs_{}_{}", unix_ms(), idx);
+        state.reasoning_idx = Some(idx);
+        state.reasoning_item_id = Some(id.clone());
+        out.push(encode_event(
+            state,
+            "response.output_item.added",
+            json!({
+                "output_index":idx, "item":{"id":id,"type":"reasoning","summary":[]}
+            }),
+        ));
+    }
+
     // 1) Tool calls (incremental)
     if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
         for tc_delta in tcs {
-            let idx = tc_delta.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let mut idx = tc_delta.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if state.tool_wire_specs.is_some() {
+                if let Some(id) = tc_delta.get("id").and_then(Value::as_str) {
+                    if let Some((existing, _)) =
+                        state.tool_calls.iter().find(|(_, call)| call.call_id == id)
+                    {
+                        idx = *existing;
+                    } else if state.tool_calls.contains_key(&idx) {
+                        idx = state.tool_calls.keys().next_back().copied().unwrap_or(0) + 1;
+                    }
+                }
+            }
 
             if !state.tool_calls.contains_key(&idx) {
                 let output_idx = state.next_idx;
@@ -1018,9 +1163,10 @@ pub fn handle_chunk(state: &mut TranslatorState, chunk: &[u8]) -> Vec<Vec<u8>> {
                         call_id: call_id.clone(),
                         name: String::new(),
                         arguments: String::new(),
+                        custom_input: None,
                     },
                 );
-                let item_view = json!({
+                let mut item_view = json!({
                     "id": call_id,
                     "type": "function_call",
                     "status": "in_progress",
@@ -1028,6 +1174,12 @@ pub fn handle_chunk(state: &mut TranslatorState, chunk: &[u8]) -> Vec<Vec<u8>> {
                     "arguments": "",
                     "call_id": call_id,
                 });
+                if state.tool_wire_specs.is_some() {
+                    if let Some(name) = tc_delta.pointer("/function/name") {
+                        item_view["name"] = name.clone();
+                        state.restore_tool_item(&mut item_view);
+                    }
+                }
                 out.push(encode_event(
                     state,
                     "response.output_item.added",
@@ -1039,6 +1191,16 @@ pub fn handle_chunk(state: &mut TranslatorState, chunk: &[u8]) -> Vec<Vec<u8>> {
                 ));
             }
 
+            let current_name = state
+                .tool_calls
+                .get(&idx)
+                .map(|call| call.name.as_str())
+                .unwrap_or("");
+            let incoming_name = tc_delta
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let is_custom = state.is_custom_tool(&format!("{current_name}{incoming_name}"));
             let tc = state.tool_calls.get_mut(&idx).expect("just inserted");
             if let Some(fn_delta) = tc_delta.get("function") {
                 if let Some(name_part) = fn_delta.get("name").and_then(Value::as_str) {
@@ -1053,18 +1215,34 @@ pub fn handle_chunk(state: &mut TranslatorState, chunk: &[u8]) -> Vec<Vec<u8>> {
                         let output_idx = tc.output_index;
                         let call_id = tc.call_id.clone();
                         tc.arguments.push_str(&appended);
+                        let emitted = if is_custom {
+                            custom_input(&tc.arguments).and_then(|input| {
+                                let previous = tc.custom_input.as_deref().unwrap_or("");
+                                let delta = input.strip_prefix(previous)?.to_string();
+                                tc.custom_input = Some(input);
+                                Some(delta)
+                            })
+                        } else {
+                            Some(appended)
+                        };
                         // Emit incremental delta — codex CLI uses this to stream
                         // tool-call argument JSON live.
-                        out.push(encode_event(
-                            state,
-                            "response.function_call_arguments.delta",
-                            json!({
-                                "response_id": state.response_id,
-                                "item_id": call_id,
-                                "output_index": output_idx,
-                                "delta": appended,
-                            }),
-                        ));
+                        if let Some(emitted) = emitted.filter(|text| !text.is_empty()) {
+                            out.push(encode_event(
+                                state,
+                                if is_custom {
+                                    "response.custom_tool_call_input.delta"
+                                } else {
+                                    "response.function_call_arguments.delta"
+                                },
+                                json!({
+                                    "response_id": state.response_id,
+                                    "item_id": call_id,
+                                    "output_index": output_idx,
+                                    "delta": emitted,
+                                }),
+                            ));
+                        }
                     }
                 }
             }
@@ -1182,6 +1360,38 @@ fn trim_ascii(b: &[u8]) -> &[u8] {
 
 /// Emit terminator events: `response.output_item.done` per opened item, then
 /// `response.completed`.
+pub fn emit_failed(state: &mut TranslatorState, code: &str, message: &str) -> Vec<u8> {
+    if state.finalized {
+        return Vec::new();
+    }
+    state.finalized = true;
+    let mut response = build_response_skeleton(state, "failed", json!([]));
+    response["error"] = json!({"code":code,"message":message});
+    encode_event(state, "response.failed", json!({"response":response}))
+}
+
+pub fn emit_incomplete(state: &mut TranslatorState, reason: &str) -> Vec<u8> {
+    if state.finalized {
+        return Vec::new();
+    }
+    state.finalized = true;
+    let output = collect_final_output(state)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("message" | "reasoning")
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut response = build_response_skeleton(state, "incomplete", json!(output));
+    response["incomplete_details"] = json!({"reason":reason});
+    encode_event(state, "response.incomplete", json!({"response":response}))
+}
+
 pub fn emit_completed(state: &mut TranslatorState) -> Vec<u8> {
     if state.finalized {
         return Vec::new();
@@ -1222,7 +1432,7 @@ pub fn emit_completed(state: &mut TranslatorState) -> Vec<u8> {
             "id": item_id,
             "type": "reasoning",
             "summary": [{"type": "summary_text", "text": state.full_reasoning_content.clone()}],
-            "encrypted_content": state.full_reasoning_content.clone(),
+            "encrypted_content": state.reasoning_carrier(),
         });
         if let (Some(signature), Some(object)) = (
             state.thought_signature.clone(),
@@ -1270,6 +1480,28 @@ pub fn emit_completed(state: &mut TranslatorState) -> Vec<u8> {
     closing.sort_by_key(|(idx, _)| *idx);
 
     for (idx, item) in closing {
+        let mut item = item;
+        state.restore_tool_item(&mut item);
+        if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+            out.extend(encode_event(
+                state,
+                "response.custom_tool_call_input.done",
+                json!({
+                    "response_id":state.response_id, "item_id":item["id"], "output_index":idx,
+                    "call_id":item["call_id"], "input":item["input"]
+                }),
+            ));
+        } else if state.tool_wire_specs.is_some()
+            && item.get("type").and_then(Value::as_str) == Some("function_call")
+        {
+            out.extend(encode_event(
+                state,
+                "response.function_call_arguments.done",
+                json!({
+                    "item_id":item["id"], "output_index":idx, "arguments":item["arguments"]
+                }),
+            ));
+        }
         out.extend(encode_event(
             state,
             "response.output_item.done",
@@ -1336,7 +1568,7 @@ fn collect_final_output(state: &TranslatorState) -> Value {
             "id": item_id,
             "type": "reasoning",
             "summary": [{"type": "summary_text", "text": state.full_reasoning_content.clone()}],
-            "encrypted_content": state.full_reasoning_content.clone(),
+            "encrypted_content": state.reasoning_carrier(),
         });
         if let (Some(signature), Some(object)) = (
             state.thought_signature.clone(),
@@ -1378,6 +1610,7 @@ fn collect_final_output(state: &TranslatorState) -> Value {
                 }
             }
         }
+        state.restore_tool_item(&mut item);
         closing.push((tc.output_index, item));
     }
     closing.sort_by_key(|(idx, _)| *idx);
@@ -1465,6 +1698,14 @@ pub fn translate_sync_response(
                     }
                 }
             }
+            if state.is_custom_tool(name.as_str().unwrap_or(""))
+                && custom_input(&args_string).is_none()
+            {
+                return Err(TranslateError::InvalidJson(
+                    "Invalid custom tool input returned by Google".into(),
+                ));
+            }
+            state.restore_tool_item(&mut item);
             output_items.push(item);
         }
     }
