@@ -1,0 +1,24 @@
+.google-quota-overview { width: 100%; min-width: 0; }
+.google-quota-toggle {
+    display: inline-flex; align-items: center; gap: 4px; padding: 5px 0 2px;
+    border: 0; background: transparent; color: var(--text-muted); font-size: 11px; cursor: pointer;
+}
+.google-quota-toggle:hover { color: var(--text-primary); }
+.google-quota-toggle:focus-visible, .google-quota-models:focus-visible {
+    outline: 2px solid var(--accent-color, #3b82f6); outline-offset: 2px; border-radius: 4px;
+}
+.google-quota-details {
+    margin-top: 6px; padding: 10px; border: 1px solid var(--border-color);
+    border-radius: 8px; background: var(--input-bg);
+}
+.google-quota-heading { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--text-primary); }
+.google-quota-heading span, .google-quota-note { color: var(--text-muted); font-size: 10px; }
+.google-quota-note { margin: 6px 0 8px; line-height: 1.5; }
+.google-quota-models { display: grid; gap: 5px; max-height: 320px; overflow-y: auto; overscroll-behavior: contain; padding-right: 3px; }
+.google-model-quota.detail { min-height: 42px; height: auto; padding: 6px 8px; }
+.google-model-quota.detail .quota-mini-content { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; }
+.google-model-quota.detail .quota-label { grid-column: 1 / -1; overflow-wrap: anywhere; color: var(--text-primary); }
+.google-model-quota.detail .quota-time { justify-content: flex-start; }
+.google-model-quota.compact .quota-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.google-model-quota .quota-percent { flex-shrink: 0; }
+.google-model-quota .quota-percent.neutral { color: var(--text-muted); }

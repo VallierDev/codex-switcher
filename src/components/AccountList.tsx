@@ -3,6 +3,7 @@ import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge
 import { Account, AppSettings, RelayUsageCache, SparkWindows, effectiveKind } from '../hooks/useAccounts';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { AntigravityQuota, type AntigravityModelQuota } from './AntigravityQuota';
 
 const KIND_BADGE: Record<ReturnType<typeof effectiveKind>, { label: string; className: string }> = {
     chatgpt_oauth: { label: '订阅', className: 'badge kind-chatgpt' },
@@ -24,19 +25,6 @@ function relayCategoryBadge(account: Account): { label: string; className: strin
             return { label: '中转', className: 'badge kind-relay' };
     }
 }
-
-interface AntigravityModelQuota {
-    remaining_fraction: number;
-    reset_time?: string | null;
-    updated_at?: string;
-}
-
-const ANTIGRAVITY_QUOTA_LABELS: Record<string, string> = {
-    'gemini-3.7-flash-high': 'G3.7 Flash',
-    'gemini-3.6-flash-high': 'G3.6 Flash',
-    'gemini-pro-agent': 'G3.1 Pro H',
-    'gemini-3.1-pro-low': 'G3.1 Pro L',
-};
 
 function antigravityModelQuotas(account: Account): Record<string, AntigravityModelQuota> {
     const auth = account.auth_json as { model_quotas?: Record<string, AntigravityModelQuota> } | null;
@@ -1072,31 +1060,7 @@ export function AccountList({
                                     {effectiveKind(acc) === 'relay' ? (
                                         <RelayQuotaItem account={acc} cache={relayUsageMap[acc.id]} />
                                     ) : effectiveKind(acc) === 'antigravity_oauth' ? (
-                                        (() => {
-                                            const quotas = antigravityModelQuotas(acc);
-                                            const entries = Object.entries(ANTIGRAVITY_QUOTA_LABELS)
-                                                .filter(([model]) => quotas[model]);
-                                            if (entries.length === 0) {
-                                                return <span className="quota-empty">暂无模型额度，点击刷新</span>;
-                                            }
-                                            return (
-                                                <div className="quota-grid">
-                                                    {entries.map(([model, label]) => {
-                                                        const quota = quotas[model];
-                                                        const resetAt = quota.reset_time
-                                                            ? Math.floor(new Date(quota.reset_time).getTime() / 1000)
-                                                            : undefined;
-                                                        return <QuotaItem
-                                                            key={model}
-                                                            label={label}
-                                                            percentage={Math.max(0, Math.min(100, quota.remaining_fraction * 100))}
-                                                            reset=""
-                                                            resetAt={resetAt}
-                                                        />;
-                                                    })}
-                                                </div>
-                                            );
-                                        })()
+                                        <AntigravityQuota quotas={antigravityModelQuotas(acc)} />
                                     ) : usage ? (
                                         <div className="quota-grid">
                                             <QuotaItem label={usage.five_hour_label} percentage={usage.five_hour_left} reset={usage.five_hour_reset} resetAt={usage.five_hour_reset_at} />

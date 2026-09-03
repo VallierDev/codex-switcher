@@ -1,0 +1,70 @@
+import { useId, useState } from 'react';
+import { ChevronDown, ChevronUp, Clock } from 'lucide-react';
+import { useShortCountdown } from '../hooks/useCountdown';
+import './AntigravityQuota.css';
+
+export interface AntigravityModelQuota {
+    remaining_fraction?: number | null;
+    reset_time?: string | null;
+    updated_at?: string;
+}
+
+const SUMMARY_LABELS: Record<string, string> = {
+    'gemini-3.7-flash-high': 'G3.7 Flash',
+    'gemini-3.6-flash-high': 'G3.6 Flash',
+    'gemini-pro-agent': 'G3.1 Pro H',
+    'gemini-3.1-pro-low': 'G3.1 Pro L',
+};
+
+function ModelQuota({ model, quota, compact = false }: {
+    model: string;
+    quota: AntigravityModelQuota;
+    compact?: boolean;
+}) {
+    const resetMs = quota.reset_time ? Date.parse(quota.reset_time) : NaN;
+    const resetAt = Number.isFinite(resetMs) ? Math.floor(resetMs / 1000) : undefined;
+    const countdown = useShortCountdown(resetAt);
+    const percentage = typeof quota.remaining_fraction === 'number' && Number.isFinite(quota.remaining_fraction)
+        ? Math.max(0, Math.min(100, quota.remaining_fraction * 100)) : undefined;
+    const color = percentage === undefined ? 'neutral' : percentage > 50 ? 'green' : percentage > 20 ? 'orange' : 'red';
+    const resetText = resetAt === undefined ? '重置未知' : countdown === '--' ? '待刷新' : countdown || '…';
+    return (
+        <div className={`quota-mini-card google-model-quota ${compact ? 'compact' : 'detail'}`} title={`${model}\n${resetAt === undefined ? '上游未提供重置时间' : `重置时间：${new Date(resetMs).toLocaleString()}`}`}>
+            {percentage !== undefined && <div className={`quota-mini-bg ${color}`} style={{ width: `${percentage}%` }} />}
+            <div className="quota-mini-content">
+                <span className="quota-label">{compact ? SUMMARY_LABELS[model] || model : model}</span>
+                <span className="quota-time neutral"><Clock className="icon-tiny" /><span>{resetText}</span></span>
+                <span className={`quota-percent ${color}`}>{percentage === undefined ? '未知' : `${Math.round(percentage)}%`}</span>
+            </div>
+        </div>
+    );
+}
+
+export function AntigravityQuota({ quotas }: { quotas: Record<string, AntigravityModelQuota> }) {
+    const [expanded, setExpanded] = useState(false);
+    const panelId = useId();
+    const entries = Object.entries(quotas).filter(([, quota]) => quota && typeof quota === 'object')
+        .sort(([a], [b]) => a.localeCompare(b, 'en', { numeric: true }));
+    const preferred = Object.keys(SUMMARY_LABELS).filter(model => quotas[model]);
+    const summary = [...preferred, ...entries.map(([model]) => model).filter(model => !preferred.includes(model))].slice(0, 4);
+    if (!entries.length) return <span className="quota-empty">暂无模型额度，点击刷新</span>;
+    return (
+        <div className="google-quota-overview">
+            <div className="quota-grid">
+                {summary.map(model => <ModelQuota key={model} model={model} quota={quotas[model]} compact />)}
+            </div>
+            <button type="button" className="google-quota-toggle" aria-expanded={expanded} aria-controls={panelId}
+                onClick={event => { event.stopPropagation(); setExpanded(value => !value); }}>
+                {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                {expanded ? '收起全部模型' : '查看全部模型'}（{entries.length}）
+            </button>
+            {expanded && <section id={panelId} className="google-quota-details" aria-label="全部模型额度">
+                <div className="google-quota-heading"><strong>全部模型额度</strong><span>剩余额度 · 重置倒计时</span></div>
+                <p className="google-quota-note">各模型独立显示；5h 等窗口以 Google 返回的实际重置时间为准。</p>
+                <div className="google-quota-models" tabIndex={0} role="region" aria-label="模型额度列表">
+                    {entries.map(([model, quota]) => <ModelQuota key={model} model={model} quota={quota} />)}
+                </div>
+            </section>}
+        </div>
+    );
+}
