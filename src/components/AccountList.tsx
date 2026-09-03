@@ -4,6 +4,7 @@ import { Account, AppSettings, RelayUsageCache, SparkWindows, effectiveKind } fr
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { AntigravityQuota, type AntigravityModelQuota } from './AntigravityQuota';
+import { RelayQuotaWindows } from './RelayQuotaWindows';
 
 const KIND_BADGE: Record<ReturnType<typeof effectiveKind>, { label: string; className: string }> = {
     chatgpt_oauth: { label: '订阅', className: 'badge kind-chatgpt' },
@@ -799,6 +800,7 @@ export function AccountList({
                 </div>
             );
         }
+        if (cache.windows?.length) return <RelayQuotaWindows cache={cache} />;
         const unit = cache.unit ?? '';
         const isPercent = unit === '%' || unit.includes('%');
         if (isPercent) {

@@ -13,7 +13,7 @@ interface AddRelayModalProps {
 
 const GROUPS: Array<{ id: NonNullable<RelayPreset['group']>; note: string }> = [
     { id: '通用中转', note: '基于 new-api / CLIProxyAPI / sub2api 的第三方中转，原生 /v1/responses' },
-    { id: 'CODING PLAN', note: '厂商自家订阅（GLM / MiMo / 火山 / UCloud），走 chat_completions 翻译' },
+    { id: 'CODING PLAN', note: '厂商编程订阅，按服务支持选择 Responses 或 Chat Completions' },
     { id: '三方模型', note: '厂商按量付费 API（DeepSeek / Kimi / 通义 / OpenRouter 等）' },
     { id: '自定义', note: '手动填 base_url' },
 ];
@@ -247,6 +247,7 @@ function Step2Form(props: Step2Props) {
                         <option value="new_api_dashboard">new_api_dashboard · /v1/dashboard/billing/*</option>
                         <option value="openai_compat">openai_compat · GET /v1/usage</option>
                         <option value="glm_zhipu">glm_zhipu · GLM 自家 quota</option>
+                        <option value="kimi_coding">kimi_coding · Kimi 编程套餐 5H / 7D</option>
                         <option value="mimo_token_plan">mimo_token_plan · 需 Cookie</option>
                         <option value="">不拉取</option>
                     </select>

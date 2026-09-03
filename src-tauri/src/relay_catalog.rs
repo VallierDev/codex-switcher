@@ -7,6 +7,7 @@ pub const PREFIX: &str = "relay-model:";
 
 #[derive(Clone, Debug)]
 pub struct Model {
+    pub kimi_coding: bool,
     pub slug: String,
     pub account_id: String,
     pub account_name: String,
@@ -26,6 +27,11 @@ pub fn models(store: &AccountStore) -> Vec<Model> {
             .collect();
         for id in ids {
             result.push(Model {
+                kimi_coding: account
+                    .relay_base_url
+                    .as_deref()
+                    .is_some_and(crate::kimi_quota::is_official_coding_url)
+                    || account.relay_usage_preset.as_deref() == Some("kimi_coding"),
                 slug: format!("{PREFIX}{}:{id}", account.id),
                 account_id: account.id.clone(),
                 account_name: account.name.clone(),
@@ -66,9 +72,16 @@ pub fn catalog_entry(model: &Model, template: Option<&Value>) -> Value {
         .filter(Value::is_object)
         .unwrap_or(json!({}));
     let kimi = model.upstream == "kimi-k3";
+    let coding_k3 = model.kimi_coding && matches!(model.upstream.as_str(), "k3" | "k3-256k");
     let deepseek = model.upstream.starts_with("deepseek-v4-");
     let display = if kimi {
         "Kimi K3".to_string()
+    } else if coding_k3 {
+        if model.upstream == "k3-256k" {
+            "Kimi K3 256K (Coding)".into()
+        } else {
+            "Kimi K3 (Coding)".into()
+        }
     } else if deepseek {
         model.upstream.replace("deepseek-v4-", "DeepSeek V4 ")
     } else {
@@ -83,16 +96,16 @@ pub fn catalog_entry(model: &Model, template: Option<&Value>) -> Value {
         "prefer_websockets":false,"supports_websockets":false,"use_responses_lite":false,
         "tool_mode":null,"shell_type":"shell_command","apply_patch_tool_type":"freeform",
         "multi_agent_version":"v2","supports_parallel_tool_calls":true,
-        "supported_reasoning_levels":if kimi || deepseek {
+        "supported_reasoning_levels":if kimi || deepseek || coding_k3 {
             json!([{"effort":"low","description":"Low"},{"effort":"high","description":"High"},{"effort":"max","description":"Max"}])
         } else { json!([]) },
         "default_reasoning_level":if kimi {"max"} else {"high"},
         "default_reasoning_summary":"none","support_verbosity":false,
         "additional_speed_tiers":[],"service_tiers":[],
-        "input_modalities":if kimi || model.upstream.ends_with("-vision-exp") {json!(["text","image"])} else {json!(["text"])},
+        "input_modalities":if kimi || model.kimi_coding || model.upstream.ends_with("-vision-exp") {json!(["text","image"])} else {json!(["text"])},
         "supports_image_detail_original":false,
-        "context_window":if kimi || deepseek {1_048_576} else {128_000},
-        "max_context_window":if kimi || deepseek {1_048_576} else {128_000},
+        "context_window":if kimi || deepseek {1_048_576} else if model.kimi_coding {262_144} else {128_000},
+        "max_context_window":if kimi || deepseek {1_048_576} else if model.kimi_coding {262_144} else {128_000},
         "effective_context_window_percent":95
     });
     entry

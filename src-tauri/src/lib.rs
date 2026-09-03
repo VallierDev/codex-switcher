@@ -20,6 +20,7 @@ mod quota_snapshot;
 mod refresh_lock;
 pub mod relay_translate;
 pub mod relay_catalog;
+pub mod kimi_quota;
 mod remote_client;
 mod remote_server;
 mod scheduler;
@@ -912,6 +913,9 @@ async fn refresh_relay_usage(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<account::RelayUsageCache, String> {
+    let is_kimi = state.store.lock().map_err(|e| e.to_string())?.accounts.get(&id)
+        .is_some_and(kimi_quota::is_coding_account);
+    if is_kimi { return kimi_quota::refresh_account(&state.store, &id).await; }
     let (base_url, api_key, preset, usage_cookie) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let acc = store.accounts.get(&id).ok_or("账号不存在")?;
@@ -5922,6 +5926,7 @@ pub fn run() {
             *qr = Some(handle);
             println!("[QuotaRefresh] 常驻循环启动中（setup 阶段）");
             start_antigravity_catalog_refresh(state.store.clone(), app.handle().clone());
+            kimi_quota::start_refresh(state.store.clone(), app.handle().clone());
 
             // 启动时立刻跑一次同步，把 store/disk 不一致 + 落后的 RT 立即对齐
             let store_for_init = state.store.clone();

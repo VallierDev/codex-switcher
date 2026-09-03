@@ -699,6 +699,7 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                                     <option value="">不拉取</option>
                                     <option value="openai_compat">openai_compat (GET /v1/usage)</option>
                                     <option value="glm_zhipu">glm_zhipu (GLM 自家 quota 接口)</option>
+                                    <option value="kimi_coding">kimi_coding (Kimi 编程套餐 5H / 7D)</option>
                                     <option value="mimo_token_plan">mimo_token_plan (MiMo 控制台 Cookie)</option>
                                 </select>
                             </div>

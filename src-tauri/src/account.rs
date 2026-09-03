@@ -595,6 +595,8 @@ impl Default for KeepaliveState {
 /// 中转站账号的余额缓存（与 `CachedQuota` 平行；语义上一个是 USD 余额，一个是 5h+周窗口）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayUsageCache {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<RelayQuotaWindow>,
     /// 剩余额度（原始数值；单位看 `unit`）
     pub remaining: f64,
     /// 单位字符串（"USD" / "CNY" / "USDcent" / "tokens" 等，由上游决定）
@@ -606,6 +608,13 @@ pub struct RelayUsageCache {
     pub next_reset_at: Option<i64>,
     /// 抓取时刻
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayQuotaWindow {
+    pub label: String,
+    pub remaining_percent: Option<f64>,
+    pub reset_at: Option<i64>,
 }
 
 /// 缓存的配额信息

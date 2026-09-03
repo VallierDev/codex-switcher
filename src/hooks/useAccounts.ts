@@ -71,6 +71,7 @@ export interface SyncStatus {
 export type AccountKind = 'legacy' | 'chatgpt_oauth' | 'openai_key' | 'relay' | 'antigravity_oauth';
 
 export interface RelayUsageCache {
+    windows?: { label: string; remaining_percent: number | null; reset_at: number | null }[];
     remaining: number;
     unit: string;
     is_active: boolean;

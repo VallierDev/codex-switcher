@@ -52,6 +52,15 @@ export interface RelayPreset {
 
 export const RELAY_PRESETS: RelayPreset[] = [
     {
+        id: 'kimi_coding', name: '月之暗面（Kimi）',
+        base_url: 'https://api.kimi.com/coding/v1',
+        homepage: 'https://www.kimi.com/code/console',
+        usage_preset: 'kimi_coding', relay_protocol: 'responses',
+        model_fallback: 'k3-256k', model_map: null,
+        description: '编程套餐：5H / 7D 额度；使用 Kimi Code Key，模型按会员权限选择',
+        mark: 'K', color: '#0F0F10', group: 'CODING PLAN', auth_prefix: 'sk-kimi-', category: 'coding_plan',
+    },
+    {
         id: 'glm',
         name: '智谱',
         base_url: 'https://open.bigmodel.cn/api/paas/v4',

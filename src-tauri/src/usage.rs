@@ -652,6 +652,7 @@ impl UsageFetcher {
             .unwrap_or(true);
 
         Ok(crate::account::RelayUsageCache {
+            windows: Vec::new(),
             remaining,
             unit,
             is_active,
@@ -727,6 +728,7 @@ impl UsageFetcher {
         let remaining_usd = (soft_limit_usd - total_usage_cents / 100.0).max(0.0);
 
         Ok(crate::account::RelayUsageCache {
+            windows: Vec::new(),
             remaining: remaining_usd,
             unit: "USD".to_string(),
             is_active: remaining_usd > 0.0,
@@ -897,6 +899,7 @@ impl UsageFetcher {
             .map(|ms| ms / 1000);
 
         Ok(crate::account::RelayUsageCache {
+            windows: Vec::new(),
             remaining: remaining_pct,
             unit: "%".to_string(),
             is_active: remaining_pct > 0.0,
@@ -984,6 +987,7 @@ impl UsageFetcher {
             .and_then(Self::parse_mimo_period_end);
 
         Ok(crate::account::RelayUsageCache {
+            windows: Vec::new(),
             remaining: remaining_pct,
             unit: "% MiMo Credits".to_string(),
             is_active: remaining_pct > 0.0,
