@@ -44,9 +44,7 @@ function ProviderCard({
     selected: boolean;
     onSelect: (p: RelayPreset) => void;
 }) {
-    const isSubscription = preset.relay_protocol === 'chat_completions'
-        || preset.id === 'mimo_token_plan_sgp'
-        || preset.id === 'glm_coding';
+    const isSubscription = preset.category === 'coding_plan';
     return (
         <button
             type="button"
@@ -151,9 +149,12 @@ function Step2Form(props: Step2Props) {
                 <div className="cs-selected-card__body">
                     <div className="cs-selected-card__top">
                         <span className="cs-selected-card__name">{preset.name}</span>
-                        <ProtocolBadge proto={preset.relay_protocol} />
+                        <ProtocolBadge proto={protocol} />
                     </div>
                     <div className="cs-selected-card__url">{baseUrl || '（自定义 base URL）'}</div>
+                    {protocol === 'responses' && modelFallback && (
+                        <div className="cs-rfield__hint">保存后可在 Codex 中选择此中转的模型，无需切换 ChatGPT 账号。</div>
+                    )}
                 </div>
                 <button type="button" className="cs-selected-card__change" onClick={onChangeProvider}>
                     切换服务
@@ -191,7 +192,7 @@ function Step2Form(props: Step2Props) {
 
                 <div className="cs-rfield cs-rfield--full">
                     <label className="cs-rfield__label" htmlFor="cs-relay-base">
-                        Base URL<span className="cs-rfield__req">*</span>
+                        API 地址（可修改）<span className="cs-rfield__req">*</span>
                     </label>
                     <input
                         id="cs-relay-base"
@@ -200,7 +201,20 @@ function Step2Form(props: Step2Props) {
                         onChange={(e) => setBaseUrl(e.target.value)}
                         placeholder="https://api.example.com/v1"
                     />
+                    <span className="cs-rfield__hint">预设仅提供默认地址；使用自有中转时，请填写该中转的 API 地址和对应 Key。</span>
                 </div>
+
+                {protocol === 'responses' && (
+                    <div className="cs-rfield cs-rfield--full">
+                        <label className="cs-rfield__label" htmlFor="cs-relay-model">
+                            默认模型 ID（可修改）
+                        </label>
+                        <input id="cs-relay-model" className="cs-rinput cs-rinput--mono"
+                            value={modelFallback} onChange={(e) => setModelFallback(e.target.value)}
+                            placeholder="填写此 API 实际支持的模型 ID" />
+                        <span className="cs-rfield__hint">会显示在 Codex 模型列表；高级设置可添加其他模型。</span>
+                    </div>
+                )}
 
                 <div className="cs-rfield">
                     <label className="cs-rfield__label" htmlFor="cs-relay-proto">
@@ -271,7 +285,7 @@ function Step2Form(props: Step2Props) {
                 </button>
                 {advOpen && (
                     <div className="cs-radv__body">
-                        <div className="cs-rfield">
+                        {protocol !== 'responses' && <div className="cs-rfield">
                             <label className="cs-rfield__label" htmlFor="cs-relay-fallback">
                                 模型兜底
                                 <span className="cs-rfield__hint">客户端发的 model 未命中映射时统一替换</span>
@@ -283,7 +297,7 @@ function Step2Form(props: Step2Props) {
                                 onChange={(e) => setModelFallback(e.target.value)}
                                 placeholder={preset.model_fallback ?? '留空 = 透传不替换'}
                             />
-                        </div>
+                        </div>}
                         <div className="cs-rfield">
                             <label className="cs-rfield__label" htmlFor="cs-relay-modelmap">
                                 模型映射表

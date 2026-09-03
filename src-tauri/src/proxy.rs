@@ -1596,6 +1596,45 @@ async fn handle_models_with_antigravity(
     req_headers: &hyper::HeaderMap,
     path_and_query: &str,
 ) -> Response<ProxyBody> {
+    // Native relays do not necessarily implement Codex's /models metadata API.
+    // If a relay is current, serve its configured catalog locally. The normal
+    // ChatGPT-current path below still fetches and preserves the native GPT list.
+    let local_relay_catalog = state.store.lock().ok().and_then(|store| {
+        let current = store
+            .current
+            .as_ref()
+            .and_then(|id| store.accounts.get(id))?;
+        if !current.is_relay() {
+            return None;
+        }
+        let configured = crate::relay_catalog::models(&store);
+        if configured.is_empty() {
+            return None;
+        }
+        Some(configured)
+    });
+    if let Some(configured) = local_relay_catalog {
+        let mut models: Vec<serde_json::Value> = configured
+            .iter()
+            .map(|model| crate::relay_catalog::catalog_entry(model, None))
+            .collect();
+        if has_antigravity_account(&state) {
+            models.extend(
+                crate::antigravity::models::grouped_display_models(&antigravity_models_for_state(
+                    &state,
+                ))
+                .iter()
+                .map(|model| antigravity_codex_catalog_entry(model, None)),
+            );
+        }
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(full_body(Bytes::from(
+                serde_json::json!({"models":models}).to_string(),
+            )))
+            .unwrap();
+    }
     let (token, is_chatgpt) = match get_current_token(&state).await {
         Ok(value) => value,
         Err(error) => return error_response(StatusCode::UNAUTHORIZED, &error),
@@ -1741,6 +1780,36 @@ async fn handle_models_with_antigravity(
             }
         }
     }
+    let relay_models = state
+        .store
+        .lock()
+        .map(|s| crate::relay_catalog::models(&s))
+        .unwrap_or_default();
+    if let Some(models) = catalog
+        .get_mut("models")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        let template = models.first().cloned();
+        for model in &relay_models {
+            if !models.iter().any(|entry| {
+                entry.get("slug").and_then(serde_json::Value::as_str) == Some(model.slug.as_str())
+            }) {
+                models.push(crate::relay_catalog::catalog_entry(
+                    model,
+                    template.as_ref(),
+                ));
+            }
+        }
+    } else if let Some(models) = catalog
+        .get_mut("data")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for model in &relay_models {
+            models.push(
+                serde_json::json!({"id":model.slug,"object":"model","owned_by":model.account_name}),
+            );
+        }
+    }
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
@@ -1751,6 +1820,62 @@ async fn handle_models_with_antigravity(
                 "models response build failed",
             )
         })
+}
+
+fn has_named_relay_models(state: &ProxyState) -> bool {
+    state
+        .store
+        .lock()
+        .map(|s| !crate::relay_catalog::models(&s).is_empty())
+        .unwrap_or(false)
+}
+
+async fn handle_named_relay_response(
+    state: Arc<ProxyState>,
+    method: Method,
+    path: &str,
+    body: Bytes,
+    slug: &str,
+) -> Response<ProxyBody> {
+    if method != Method::POST || !path.split('?').next().unwrap_or("").ends_with("/responses") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Selected relay model requires the Responses API",
+        );
+    }
+    let target = state.store.lock().ok().and_then(|s| {
+        let model = crate::relay_catalog::resolve(&s, slug)?;
+        let account = s.accounts.get(&model.account_id)?;
+        Some((
+            model,
+            account.relay_base_url.clone()?,
+            AccountStore::extract_access_token(&account.auth_json)?,
+        ))
+    });
+    let Some((model, base, key)) = target else {
+        // Never silently send a removed/disabled relay model to the ChatGPT account.
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Selected relay model is unavailable; check its account, API key and protocol",
+        );
+    };
+    // Fresh headers: do not leak a ChatGPT bearer, account id, cookies or private
+    // routing headers to a third-party API. Native Responses body/events pass through.
+    let response =
+        match crate::relay_catalog::forward_native(&state.client, &base, &key, &body, &model).await
+        {
+            Ok(response) => response,
+            Err(error) => return error_response(StatusCode::BAD_GATEWAY, &error),
+        };
+    if response.status().is_success() {
+        if let Ok(mut store) = state.store.lock() {
+            if let Some(account) = store.accounts.get_mut(&model.account_id) {
+                account.last_used = Some(Utc::now());
+            }
+            let _ = store.save();
+        }
+    }
+    build_stream_response(response, None, None)
 }
 
 /// 取 store.current 的 Relay 路由信息（仅 Relay 类型；其它 None）。
@@ -2783,7 +2908,7 @@ async fn handle_request(
     if req.method() == Method::GET
         && (req.uri().path() == "/v1/models" || req.uri().path().ends_with("/models"))
     {
-        if has_antigravity_account(&state) {
+        if has_antigravity_account(&state) || has_named_relay_models(&state) {
             let headers = req.headers().clone();
             let path_and_query = req
                 .uri()
@@ -2882,6 +3007,16 @@ async fn handle_request(
         Err(error) => return Ok(error_response(StatusCode::BAD_REQUEST, &error)),
     };
     if let Some(model) = request_model(&body_for_routing) {
+        if model.starts_with(crate::relay_catalog::PREFIX) {
+            return Ok(handle_named_relay_response(
+                state,
+                method,
+                &path_and_query,
+                body_for_routing,
+                &model,
+            )
+            .await);
+        }
         if antigravity_model_available(&state, &model) {
             return Ok(handle_antigravity_response(
                 state,
@@ -6749,7 +6884,10 @@ async fn bridge_websockets<S1, S2>(
     .flatten();
     if detected_model
         .as_deref()
-        .map(|model| antigravity_model_available(&state, model))
+        .map(|model| {
+            antigravity_model_available(&state, model)
+                || model.starts_with(crate::relay_catalog::PREFIX)
+        })
         .unwrap_or(false)
     {
         drop(upstream);
@@ -7222,7 +7360,7 @@ where
         .map_err(|e| e.to_string())?;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("Antigravity HTTP {status}"));
+        return Err(format!("Model upstream HTTP {status}"));
     }
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();

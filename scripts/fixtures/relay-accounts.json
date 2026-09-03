@@ -1,0 +1,26 @@
+{
+  "accounts": {
+    "fixture-current": {
+      "id": "fixture-current", "name": "Current fixture", "kind": "relay",
+      "created_at": "2026-09-03T00:00:00Z",
+      "auth_json": {"tokens": {"access_token": "fixture-current-key"}},
+      "relay_base_url": "http://127.0.0.1:18090/catalog/v1"
+    },
+    "fixture-kimi": {
+      "id": "fixture-kimi", "name": "Kimi fixture", "kind": "relay",
+      "created_at": "2026-09-03T00:00:00Z",
+      "auth_json": {"tokens": {"access_token": "fixture-kimi-key"}},
+      "relay_base_url": "http://127.0.0.1:18090/kimi/v1", "relay_model_fallback": "kimi-k3"
+    },
+    "fixture-deepseek": {
+      "id": "fixture-deepseek", "name": "DeepSeek fixture", "kind": "relay",
+      "created_at": "2026-09-03T00:00:00Z",
+      "auth_json": {"tokens": {"access_token": "fixture-deepseek-key"}},
+      "relay_base_url": "http://127.0.0.1:18090/custom/deepseek/v1", "relay_model_fallback": "deepseek-v4-pro",
+      "relay_model_map": {"deepseek-v4-flash": "deepseek-v4-flash"}
+    }
+  },
+  "current": "fixture-current", "version": 3,
+  "settings": {"remote_mode": "off", "proxy_enabled": true, "proxy_port": 18082,
+    "background_refresh": false, "quota_refresh_enabled": false, "auto_reload_ide": false}
+}

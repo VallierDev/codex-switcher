@@ -19,6 +19,7 @@ mod proxy;
 mod quota_snapshot;
 mod refresh_lock;
 pub mod relay_translate;
+pub mod relay_catalog;
 mod remote_client;
 mod remote_server;
 mod scheduler;

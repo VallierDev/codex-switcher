@@ -53,7 +53,7 @@ export interface RelayPreset {
 export const RELAY_PRESETS: RelayPreset[] = [
     {
         id: 'glm',
-        name: '智谱 GLM',
+        name: '智谱',
         base_url: 'https://open.bigmodel.cn/api/paas/v4',
         homepage: 'https://docs.bigmodel.cn/cn/guide/develop/openai/introduction',
         // GLM 余额走自家 monitor 接口（不是 OpenAI /v1/usage）
@@ -70,13 +70,13 @@ export const RELAY_PRESETS: RelayPreset[] = [
             'o1': 'glm-5.1',
             'o1-mini': 'glm-5.1-x',
         },
-        description: 'GLM-5.1，OpenAI 兼容；模型自动映射 gpt-* → glm-*',
+        description: '开放平台 API；OpenAI 兼容，支持模型映射',
         mark: 'GLM', color: '#4F46E5', group: '三方模型', auth_prefix: 'sk-',
         category: 'third_party',
     },
     {
         id: 'glm_coding',
-        name: 'GLM Coding Plan',
+        name: '智谱',
         // GLM Coding 套餐专属端点（与普通 paas/v4 不同）；只暴露 /chat/completions
         base_url: 'https://open.bigmodel.cn/api/coding/paas/v4',
         homepage: 'https://docs.bigmodel.cn/cn/guide/start/coding-plan',
@@ -98,7 +98,7 @@ export const RELAY_PRESETS: RelayPreset[] = [
     },
     {
         id: 'mimo_token_plan_sgp',
-        name: 'Xiaomi MiMo Token Plan',
+        name: '小米',
         // MiMo Token Plan 专属端点；官方文档说明 MiMo 暂不适配 Responses API，只适用于 Chat Completions。
         base_url: 'https://token-plan-sgp.xiaomimimo.com/v1',
         homepage: 'https://platform.xiaomimimo.com/console/plan-manage',
@@ -114,13 +114,13 @@ export const RELAY_PRESETS: RelayPreset[] = [
             'o1': 'mimo-v2.5-pro',
             'o1-mini': 'mimo-v2.5-pro',
         },
-        description: 'Xiaomi MiMo-V2.5 Token Plan（tp-key；配额用控制台 Cookie）',
+        description: 'Token Plan 订阅（tp-key；配额用控制台 Cookie）',
         mark: 'Mi', color: '#FF6900', group: 'CODING PLAN', auth_prefix: 'tp-',
         category: 'coding_plan',
     },
     {
         id: 'mimo_api_pay',
-        name: 'Xiaomi MiMo (按量付费 API)',
+        name: '小米',
         // MiMo 按量付费独立端点；跟 Token Plan 的 base + key 形式不同。
         base_url: 'https://api.xiaomimimo.com/v1',
         homepage: 'https://platform.xiaomimimo.com/console/api-keys',
@@ -146,7 +146,7 @@ export const RELAY_PRESETS: RelayPreset[] = [
     // ────────────────────────────────────────────────────────────────
     {
         id: 'generic_responses_relay',
-        name: '通用 Responses 中转（new-api / CLIProxyAPI / sub2api）',
+        name: '通用中转',
         base_url: '',
         // "auto" → 后端 probe_relay_usage_preset 自动探测：
         //   new-api → /v1/dashboard/billing/* ；sub2api → /v1/usage ；CLIProxyAPI → 不拉取
@@ -166,44 +166,31 @@ export const RELAY_PRESETS: RelayPreset[] = [
     {
         id: 'deepseek_api',
         name: 'DeepSeek',
-        base_url: 'https://api.deepseek.com/v1',
-        homepage: 'https://api-docs.deepseek.com/',
+        base_url: 'https://api.deepseek.com',
+        homepage: 'https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/codex',
         usage_preset: null,
-        relay_protocol: 'chat_completions',
-        // 顶端用 V4 Pro（含 thinking）；轻量请求映到 V4 Flash 节省费用。
-        // 实测：gpt-5 / gpt-5.5 / gpt-5-codex / o1 走 Pro；gpt-4o / gpt-4o-mini / o1-mini 走 Flash。
+        relay_protocol: 'responses',
+        // Models are selectable independently; never advertise them as GPT aliases.
         model_fallback: 'deepseek-v4-pro',
         model_map: {
-            'gpt-5.5': 'deepseek-v4-pro',
-            'gpt-5': 'deepseek-v4-pro',
-            'gpt-5-codex': 'deepseek-v4-pro',
-            'gpt-4o': 'deepseek-v4-flash',
-            'gpt-4o-mini': 'deepseek-v4-flash',
-            'o1': 'deepseek-v4-pro',
-            'o1-mini': 'deepseek-v4-flash',
+            'deepseek-v4-pro': 'deepseek-v4-pro',
+            'deepseek-v4-flash': 'deepseek-v4-flash',
+            'deepseek-v4-flash-vision-exp': 'deepseek-v4-flash-vision-exp',
         },
-        description: 'DeepSeek 按量付费（V4 Pro / V4 Flash）；OpenAI Chat 兼容',
+        description: '原生 Responses API；支持官网或自有中转，API 地址和模型 ID 均可修改',
         mark: 'DS', color: '#1E40AF', group: '三方模型', auth_prefix: 'sk-',
         category: 'third_party',
     },
     {
         id: 'moonshot_kimi',
-        name: 'Moonshot Kimi',
+        name: '月之暗面（Kimi）',
         base_url: 'https://api.moonshot.cn/v1',
-        homepage: 'https://platform.moonshot.cn/docs',
+        homepage: 'https://platform.kimi.com/docs/guide/codex-kimi',
         usage_preset: null,
-        relay_protocol: 'chat_completions',
-        model_fallback: 'kimi-k2-0905-preview',
-        model_map: {
-            'gpt-5.5': 'kimi-k2-0905-preview',
-            'gpt-5': 'kimi-k2-0905-preview',
-            'gpt-5-codex': 'kimi-k2-0905-preview',
-            'gpt-4o': 'kimi-k2-0905-preview',
-            'gpt-4o-mini': 'kimi-k2-0905-preview',
-            'o1': 'kimi-k2-0905-preview',
-            'o1-mini': 'kimi-k2-0905-preview',
-        },
-        description: 'Moonshot Kimi K2（按量付费 / 中国订阅 / 国际订阅），OpenAI Chat 兼容',
+        relay_protocol: 'responses',
+        model_fallback: 'kimi-k3',
+        model_map: null,
+        description: '开放平台 API，原生 Responses；使用平台 API Key，非 Kimi Code 订阅密钥',
         mark: 'K', color: '#0F0F10', group: '三方模型', auth_prefix: 'sk-',
         category: 'third_party',
     },
@@ -224,13 +211,13 @@ export const RELAY_PRESETS: RelayPreset[] = [
             'o1': 'MiniMax-M2',
             'o1-mini': 'MiniMax-M2',
         },
-        description: 'MiniMax M2（按量付费 / 中国订阅 / 国际订阅），OpenAI Chat 兼容',
+        description: '按量付费 / 订阅服务；OpenAI Chat 兼容',
         mark: 'MM', color: '#7C3AED', group: '三方模型', auth_prefix: 'sk-',
         category: 'third_party',
     },
     {
         id: 'alibaba_dashscope',
-        name: '阿里 DashScope (通义千问)',
+        name: '阿里云',
         base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
         homepage: 'https://help.aliyun.com/zh/dashscope/',
         usage_preset: null,
@@ -245,13 +232,13 @@ export const RELAY_PRESETS: RelayPreset[] = [
             'o1': 'qwen3-max',
             'o1-mini': 'qwen-plus',
         },
-        description: '阿里百炼 / 通义千问，OpenAI 兼容模式；qwen3-max 兜底',
+        description: '百炼开放平台；OpenAI 兼容模式',
         mark: '通义', color: '#FF6A00', group: '三方模型', auth_prefix: 'sk-',
         category: 'third_party',
     },
     {
         id: 'volcengine_ark',
-        name: '火山方舟 (ByteDance Doubao)',
+        name: '字节跳动',
         base_url: 'https://ark.cn-beijing.volces.com/api/v3',
         homepage: 'https://www.volcengine.com/docs/82379',
         usage_preset: null,
@@ -265,7 +252,7 @@ export const RELAY_PRESETS: RelayPreset[] = [
     },
     {
         id: 'tencent_hunyuan',
-        name: '腾讯混元',
+        name: '腾讯',
         base_url: 'https://api.hunyuan.cloud.tencent.com/v1',
         homepage: 'https://cloud.tencent.com/document/product/1729',
         usage_preset: null,
@@ -286,7 +273,7 @@ export const RELAY_PRESETS: RelayPreset[] = [
     },
     {
         id: 'baidu_qianfan',
-        name: '百度千帆 (ERNIE)',
+        name: '百度',
         base_url: 'https://qianfan.baidubce.com/v2',
         homepage: 'https://cloud.baidu.com/doc/WENXINWORKSHOP/index.html',
         usage_preset: null,
@@ -307,7 +294,7 @@ export const RELAY_PRESETS: RelayPreset[] = [
     },
     {
         id: 'ucloud_modelverse',
-        name: '优云智算 UCloud Modelverse',
+        name: '优刻得（UCloud）',
         base_url: 'https://deepseek.uk-tokyo.ucloud-global.com/v1',
         homepage: 'https://www.ucloud.cn/site/active/modelverse.html',
         usage_preset: null,
@@ -339,7 +326,7 @@ export const RELAY_PRESETS: RelayPreset[] = [
     },
     {
         id: 'stepfun_step',
-        name: '阶跃星辰 Stepfun',
+        name: '阶跃星辰',
         base_url: 'https://api.stepfun.com/v1',
         homepage: 'https://platform.stepfun.com/docs/',
         usage_preset: null,
@@ -360,20 +347,20 @@ export const RELAY_PRESETS: RelayPreset[] = [
     },
     {
         id: 'openrouter',
-        name: 'OpenRouter (500+ 模型聚合)',
+        name: 'OpenRouter',
         base_url: 'https://openrouter.ai/api/v1',
         homepage: 'https://openrouter.ai/docs',
         usage_preset: null,
         relay_protocol: 'chat_completions',
         // OpenRouter 用 vendor/model 形式；不设兜底，让用户自己选
         model_fallback: 'openai/gpt-5.5',
-        description: 'OpenRouter 聚合 500+ 模型；模型 id 形如 anthropic/claude-sonnet-4.6',
+        description: '多模型聚合 API；可配置厂商模型 ID',
         mark: 'OR', color: '#10B981', group: '三方模型', auth_prefix: 'sk-or-',
         category: 'third_party',
     },
     {
         id: 'aiberm',
-        name: 'Aiberm (按量付费聚合)',
+        name: 'Aiberm',
         // Aiberm 同时支持 OpenAI /v1/chat/completions 和 Anthropic /v1/messages，
         // cc-router 走 Anthropic 路径，我们走 OpenAI 路径。
         // 实际可用模型清单由 key 所属 token group 决定，需用 /v1/models 探测。
@@ -411,7 +398,7 @@ export const RELAY_PRESETS: RelayPreset[] = [
     },
     {
         id: 'modelscope',
-        name: '魔搭 ModelScope',
+        name: '魔搭（阿里云）',
         base_url: 'https://api-inference.modelscope.cn/v1',
         homepage: 'https://modelscope.cn/docs/model-service/api-inference/intro',
         usage_preset: null,
