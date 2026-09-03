@@ -122,6 +122,9 @@ pub struct AppSettings {
     /// 与 AccountStore.current（Codex/OpenAI 当前账号）互不影响，也不写 ~/.codex/auth.json。
     #[serde(default)]
     pub current_antigravity_account_id: Option<String>,
+    /// Native Relay current account, independently keyed by upstream model ID.
+    #[serde(default)]
+    pub current_relay_accounts: HashMap<String, String>,
 
     /// client 模式下，同步到 Server 时要跳过的 skill 目录名
     #[serde(default)]
@@ -283,6 +286,7 @@ impl Default for AppSettings {
             remote_server_url_fallback: String::new(),
             remote_shared_secret: String::new(),
             current_antigravity_account_id: None,
+            current_relay_accounts: HashMap::new(),
             skills_sync_blacklist: Vec::new(),
             solo_auto_sync_current: true,
             proxy_bootstrap_byte_cap: default_bootstrap_byte_cap(),
@@ -762,6 +766,7 @@ impl AccountStore {
         if store.ensure_current_antigravity_account() {
             let _ = store.save();
         }
+        if crate::relay_catalog::ensure_currents(&mut store) { let _ = store.save(); }
 
         store
     }
@@ -1371,7 +1376,9 @@ impl AccountStore {
         };
 
         self.accounts.insert(id.clone(), account.clone());
-        if self.current.is_none() {
+        crate::relay_catalog::ensure_currents(self);
+        // Native model-routed relays never replace the Codex current identity.
+        if self.current.is_none() && account.relay_protocol_or_default() != "responses" {
             self.current = Some(id);
         }
         account
@@ -1477,6 +1484,7 @@ impl AccountStore {
         }
 
         self.accounts.remove(id);
+        crate::relay_catalog::ensure_currents(self);
 
         // 如果删除的是当前账号，清空 current
         if self.current.as_deref() == Some(id) {

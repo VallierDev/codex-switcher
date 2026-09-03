@@ -1600,11 +1600,8 @@ async fn handle_models_with_antigravity(
     // If a relay is current, serve its configured catalog locally. The normal
     // ChatGPT-current path below still fetches and preserves the native GPT list.
     let local_relay_catalog = state.store.lock().ok().and_then(|store| {
-        let current = store
-            .current
-            .as_ref()
-            .and_then(|id| store.accounts.get(id))?;
-        if !current.is_relay() {
+        let current = store.current.as_ref().and_then(|id| store.accounts.get(id));
+        if current.is_some_and(|a| !a.is_relay()) {
             return None;
         }
         let configured = crate::relay_catalog::models(&store);
@@ -1618,6 +1615,13 @@ async fn handle_models_with_antigravity(
             .iter()
             .map(|model| crate::relay_catalog::catalog_entry(model, None))
             .collect();
+        if let Ok(store) = state.store.lock() {
+            for model in crate::relay_catalog::candidates(&store) {
+                let mut entry = crate::relay_catalog::catalog_entry(&model, None);
+                entry["visibility"] = serde_json::json!("hide");
+                models.push(entry);
+            }
+        }
         if has_antigravity_account(&state) {
             models.extend(
                 crate::antigravity::models::grouped_display_models(&antigravity_models_for_state(
@@ -1785,6 +1789,11 @@ async fn handle_models_with_antigravity(
         .lock()
         .map(|s| crate::relay_catalog::models(&s))
         .unwrap_or_default();
+    let relay_aliases = state
+        .store
+        .lock()
+        .map(|s| crate::relay_catalog::candidates(&s))
+        .unwrap_or_default();
     if let Some(models) = catalog
         .get_mut("models")
         .and_then(serde_json::Value::as_array_mut)
@@ -1798,6 +1807,15 @@ async fn handle_models_with_antigravity(
                     model,
                     template.as_ref(),
                 ));
+            }
+        }
+        for model in &relay_aliases {
+            if !models.iter().any(|entry| {
+                entry.get("slug").and_then(serde_json::Value::as_str) == Some(model.slug.as_str())
+            }) {
+                let mut entry = crate::relay_catalog::catalog_entry(model, template.as_ref());
+                entry["visibility"] = serde_json::json!("hide");
+                models.push(entry);
             }
         }
     } else if let Some(models) = catalog
@@ -2949,6 +2967,18 @@ async fn handle_request(
                 }
             }
         }
+        // Desktop provides the selected model in a local routing hint. Route
+        // provider models before opening any ChatGPT socket; the old late probe
+        // added an avoidable handshake and could strand the first turn.
+        if routing_hint_model(req.headers())
+            .as_deref()
+            .is_some_and(|model| {
+                antigravity_model_available(&state, model)
+                    || crate::relay_catalog::is_relay_model_slug(model)
+            })
+        {
+            return handle_model_routed_websocket(state, req).await;
+        }
         // Hard route 优先：WS upgrade body 是空的，只查 headers（codex 用
         // session_id / x-session-id / Session_id header 透 session_key 出来）。
         if let Some((_sk, account_id)) = resolve_hard_route(&state, &[], req.headers()) {
@@ -3007,7 +3037,7 @@ async fn handle_request(
         Err(error) => return Ok(error_response(StatusCode::BAD_REQUEST, &error)),
     };
     if let Some(model) = request_model(&body_for_routing) {
-        if model.starts_with(crate::relay_catalog::PREFIX) {
+        if crate::relay_catalog::is_relay_model_slug(&model) {
             return Ok(handle_named_relay_response(
                 state,
                 method,
@@ -6564,6 +6594,42 @@ async fn handle_websocket(
     Ok(response)
 }
 
+async fn handle_model_routed_websocket(
+    state: Arc<ProxyState>,
+    mut req: Request<Incoming>,
+) -> Result<Response<ProxyBody>, Infallible> {
+    let model_hint = routing_hint_model(req.headers());
+    let key = req
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+    let upgrade = hyper::upgrade::on(&mut req);
+    let response = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Accept", accept)
+        .body(full_body(Bytes::new()))
+        .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "101 构建失败"));
+    tokio::spawn(async move {
+        let Ok(upgraded) = upgrade.await else {
+            return;
+        };
+        let client = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            TokioIo::new(upgraded),
+            tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        bridge_antigravity_websocket(client, std::collections::VecDeque::new(), state, model_hint)
+            .await;
+    });
+    Ok(response)
+}
+
 // ────────────────────────────────────────────────────────────────
 // 错误关键词分类
 // ────────────────────────────────────────────────────────────────
@@ -6886,12 +6952,12 @@ async fn bridge_websockets<S1, S2>(
         .as_deref()
         .map(|model| {
             antigravity_model_available(&state, model)
-                || model.starts_with(crate::relay_catalog::PREFIX)
+                || crate::relay_catalog::is_relay_model_slug(model)
         })
         .unwrap_or(false)
     {
         drop(upstream);
-        bridge_antigravity_websocket(client, pending, state).await;
+        bridge_antigravity_websocket(client, pending, state, detected_model).await;
         return;
     }
 
@@ -7257,10 +7323,54 @@ fn ws_message_model(message: &tungstenite::Message) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn routing_hint_model(headers: &hyper::HeaderMap) -> Option<String> {
+    headers
+        .get("x-codex-routing-hint")?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|part| {
+            part.trim()
+                .strip_prefix("model=")
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+fn model_ws_body(
+    text: &str,
+    model_hint: Option<&str>,
+) -> Result<Option<serde_json::Value>, String> {
+    let mut frame: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    match frame.get("type").and_then(serde_json::Value::as_str) {
+        Some("response.create") => {}
+        Some("response.append") => {
+            return Err("This provider bridge requires response.create with complete input".into())
+        }
+        _ => return Ok(None),
+    }
+    let mut body = frame
+        .get_mut("response")
+        .filter(|v| v.is_object())
+        .map(std::mem::take)
+        .unwrap_or(frame);
+    if body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        if let Some(model) = model_hint {
+            body["model"] = serde_json::json!(model);
+        }
+    }
+    Ok(Some(body))
+}
+
 async fn bridge_antigravity_websocket<S>(
     mut client: S,
     mut pending: std::collections::VecDeque<Result<tungstenite::Message, tungstenite::Error>>,
     state: Arc<ProxyState>,
+    mut model_hint: Option<String>,
 ) where
     S: futures_util::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
         + futures_util::Sink<tungstenite::Message, Error = tungstenite::Error>
@@ -7283,22 +7393,32 @@ async fn bridge_antigravity_websocket<S>(
         let Some(message) = message else {
             break;
         };
+        if let Some(model) = message.as_ref().ok().and_then(ws_message_model) {
+            model_hint = Some(model);
+        }
         match message {
             Ok(tungstenite::Message::Text(text)) => {
-                if let Err(error) =
-                    execute_antigravity_ws_frame(&http, proxy_port, text.as_str(), &mut client)
-                        .await
+                if let Err(error) = execute_antigravity_ws_frame(
+                    &http,
+                    proxy_port,
+                    text.as_str(),
+                    &mut client,
+                    model_hint.as_deref(),
+                )
+                .await
                 {
                     let _ = client
                         .send(tungstenite::Message::Text(
                             serde_json::json!({
-                                "type":"error",
-                                "error":{"type":"proxy_error","message":error}
+                                "type":"response.failed", "sequence_number":0,
+                                "response":{"id":"","object":"response","status":"failed","output":[],
+                                    "error":{"code":"server_error","message":error}}
                             })
                             .to_string()
                             .into(),
                         ))
                         .await;
+                    break;
                 }
             }
             Ok(tungstenite::Message::Ping(payload)) => {
@@ -7319,19 +7439,27 @@ async fn execute_antigravity_ws_frame<S>(
     proxy_port: u16,
     text: &str,
     client: &mut S,
+    model_hint: Option<&str>,
 ) -> Result<(), String>
 where
     S: futures_util::Sink<tungstenite::Message, Error = tungstenite::Error> + Unpin,
 {
-    let mut frame: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    if frame.get("type").and_then(serde_json::Value::as_str) != Some("response.create") {
+    let Some(mut body) = model_ws_body(text, model_hint)? else {
         return Ok(());
-    }
-    let mut body = frame
-        .get_mut("response")
-        .filter(|value| value.is_object())
-        .map(std::mem::take)
-        .unwrap_or(frame);
+    };
+    println!(
+        "[ModelWS] model={} generate={} input_items={}",
+        body.get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing"),
+        body.get("generate")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        body.get("input")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0)
+    );
     if body.get("generate").and_then(serde_json::Value::as_bool) == Some(false) {
         // This bridge is stateless. A nonempty synthetic id would invite Codex
         // to send incremental input for a server-side history we never stored.
@@ -8309,6 +8437,32 @@ fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_ws_hint_supplies_omitted_model_without_overriding_explicit_model() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-codex-routing-hint",
+            "model=relay-current:k3".parse().unwrap(),
+        );
+        let hint = routing_hint_model(&headers).unwrap();
+        assert!(crate::relay_catalog::is_relay_model_slug(&hint));
+        let body = model_ws_body(r#"{"type":"response.create","input":"hi"}"#, Some(&hint))
+            .unwrap()
+            .unwrap();
+        assert_eq!(body["model"], "relay-current:k3");
+        let body = model_ws_body(
+            r#"{"type":"response.create","response":{"model":"gpt-5.5","input":"hi"}}"#,
+            Some(&hint),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(body["model"], "gpt-5.5");
+        assert!(model_ws_body(r#"{"type":"response.append","input":[]}"#, Some(&hint)).is_err());
+        assert!(model_ws_body(r#"{"type":"session.update"}"#, Some(&hint))
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn prewarm_only_targets_enabled_client_current_google_account() {

@@ -41,6 +41,7 @@ export interface AppSettings {
     relay_auto_switch_in?: boolean;
     client_direct_upstream?: boolean;
     current_antigravity_account_id?: string | null;
+    current_relay_accounts?: Record<string,string>;
 }
 
 export interface KeepaliveState {
@@ -215,7 +216,6 @@ export function useAccounts() {
         try {
             setError(null);
             await invoke('switch_account', { id });
-            setCurrentId(id);
             await loadData();
         } catch (err) {
             setError(String(err));

@@ -4,6 +4,25 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
 pub const PREFIX: &str = "relay-model:";
+pub const CURRENT_PREFIX: &str = "relay-current:";
+
+pub fn is_relay_model_slug(slug: &str) -> bool {
+    slug.starts_with(PREFIX) || slug.starts_with(CURRENT_PREFIX)
+}
+
+pub fn account_models(account: &Account) -> BTreeSet<String> {
+    if !account.is_relay() || account.relay_protocol_or_default() != "responses" {
+        return BTreeSet::new();
+    }
+    account
+        .relay_model_map
+        .iter()
+        .flat_map(|m| m.values())
+        .chain(account.relay_model_fallback.iter())
+        .map(|m| m.trim().to_owned())
+        .filter(|m| !m.is_empty())
+        .collect()
+}
 
 #[derive(Clone, Debug)]
 pub struct Model {
@@ -14,7 +33,7 @@ pub struct Model {
     pub upstream: String,
 }
 
-pub fn models(store: &AccountStore) -> Vec<Model> {
+pub fn candidates(store: &AccountStore) -> Vec<Model> {
     let mut result = Vec::new();
     for account in store.accounts.values().filter(|a| eligible(a)) {
         let ids: BTreeSet<_> = account
@@ -48,6 +67,86 @@ pub fn models(store: &AccountStore) -> Vec<Model> {
     result
 }
 
+fn choose<'a>(store: &AccountStore, items: &'a [Model], upstream: &str) -> Option<&'a Model> {
+    if let Some(id) = store.settings.current_relay_accounts.get(upstream) {
+        return items
+            .iter()
+            .find(|m| m.upstream == upstream && &m.account_id == id);
+    }
+    items
+        .iter()
+        .filter(|m| m.upstream == upstream)
+        .min_by(|a, b| {
+            store.accounts[&a.account_id]
+                .created_at
+                .cmp(&store.accounts[&b.account_id].created_at)
+                .then(a.account_id.cmp(&b.account_id))
+        })
+}
+
+pub fn models(store: &AccountStore) -> Vec<Model> {
+    let items = candidates(store);
+    let ids: BTreeSet<_> = items.iter().map(|m| m.upstream.as_str()).collect();
+    ids.into_iter()
+        .filter_map(|upstream| choose(store, &items, upstream))
+        .map(|m| {
+            let mut m = m.clone();
+            m.slug = format!("{CURRENT_PREFIX}{}", m.upstream);
+            m
+        })
+        .collect()
+}
+
+pub fn ensure_currents(store: &mut AccountStore) -> bool {
+    let before = store.settings.current_relay_accounts.clone();
+    store.settings.current_relay_accounts.retain(|model, id| {
+        store
+            .accounts
+            .get(id)
+            .is_some_and(|a| account_models(a).contains(model))
+    });
+    for model in models(store) {
+        store
+            .settings
+            .current_relay_accounts
+            .entry(model.upstream)
+            .or_insert(model.account_id);
+    }
+    before != store.settings.current_relay_accounts
+}
+
+pub fn select_current(
+    store: &mut AccountStore,
+    account_id: &str,
+    upstream: Option<&str>,
+) -> Result<(), String> {
+    let account = store
+        .accounts
+        .get(account_id)
+        .filter(|a| eligible(a))
+        .ok_or("中转账号不可用")?;
+    let ids = account_models(account);
+    if ids.is_empty() {
+        return Err("请先配置此中转的模型 ID".into());
+    }
+    let selected = if let Some(model) = upstream {
+        if !ids.contains(model) {
+            return Err("该账号未配置这个模型".into());
+        }
+        vec![model.to_owned()]
+    } else {
+        ids.into_iter().collect()
+    };
+    ensure_currents(store);
+    for model in selected {
+        store
+            .settings
+            .current_relay_accounts
+            .insert(model, account_id.to_owned());
+    }
+    Ok(())
+}
+
 fn eligible(a: &Account) -> bool {
     a.is_relay()
         && a.relay_protocol_or_default() == "responses"
@@ -60,10 +159,15 @@ fn eligible(a: &Account) -> bool {
 }
 
 pub fn resolve(store: &AccountStore, slug: &str) -> Option<Model> {
-    if !slug.starts_with(PREFIX) {
-        return None;
-    }
-    models(store).into_iter().find(|model| model.slug == slug)
+    let items = candidates(store);
+    let upstream = if let Some(model) = slug.strip_prefix(CURRENT_PREFIX) {
+        model
+    } else {
+        items.iter().find(|m| m.slug == slug)?.upstream.as_str()
+    };
+    let mut model = choose(store, &items, upstream)?.clone();
+    model.slug = slug.to_owned();
+    Some(model)
 }
 
 pub fn catalog_entry(model: &Model, template: Option<&Value>) -> Value {
@@ -244,8 +348,9 @@ mod tests {
                 None,
             );
         }
-        let catalog = models(&store);
+        let catalog = candidates(&store);
         assert_eq!(catalog.len(), first + 3);
+        assert_eq!(models(&store).len(), 2); // one visible choice per model
         let unique: std::collections::HashSet<_> = catalog.iter().map(|m| &m.slug).collect();
         assert_eq!(unique.len(), catalog.len());
         assert_eq!(
@@ -260,6 +365,94 @@ mod tests {
             2
         );
         assert_eq!(store.current.as_deref(), Some("existing-chatgpt"));
+    }
+
+    #[test]
+    fn current_accounts_are_per_model_persistent_and_legacy_compatible() {
+        let mut store = store();
+        store.settings.current_antigravity_account_id = Some("existing-google".into());
+        let a = candidates(&store).pop().unwrap();
+        let b = store.add_relay_account(
+            "B".into(),
+            "https://b.example/v1".into(),
+            "key-b".into(),
+            None,
+            None,
+            None,
+            None,
+            Some(std::collections::HashMap::from([(
+                "deepseek-v4-pro".into(),
+                "deepseek-v4-pro".into(),
+            )])),
+            Some("kimi-k3".into()),
+            None,
+            None,
+        );
+        let c = store.add_relay_account(
+            "C".into(),
+            "https://c.example/v1".into(),
+            "key-c".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("deepseek-v4-pro".into()),
+            None,
+            None,
+        );
+        select_current(&mut store, &c.id, Some("deepseek-v4-pro")).unwrap();
+        select_current(&mut store, &b.id, Some("kimi-k3")).unwrap();
+        assert_eq!(
+            resolve(&store, "relay-current:kimi-k3").unwrap().account_id,
+            b.id
+        );
+        assert_eq!(resolve(&store, &a.slug).unwrap().account_id, b.id);
+        assert_eq!(
+            resolve(&store, "relay-current:deepseek-v4-pro")
+                .unwrap()
+                .account_id,
+            c.id
+        );
+        assert_eq!(store.current.as_deref(), Some("existing-chatgpt"));
+        assert_eq!(
+            store.settings.current_antigravity_account_id.as_deref(),
+            Some("existing-google")
+        );
+        let reloaded: AccountStore =
+            serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.settings.current_relay_accounts,
+            store.settings.current_relay_accounts
+        );
+        store.accounts.get_mut(&b.id).unwrap().is_token_invalid = true;
+        assert!(resolve(&store, "relay-current:kimi-k3").is_none()); // no paid-source fallback
+        store.delete_account(&b.id).unwrap();
+        assert_eq!(
+            resolve(&store, "relay-current:kimi-k3").unwrap().account_id,
+            a.account_id
+        );
+        assert!(select_current(&mut store, &c.id, Some("kimi-k3")).is_err());
+    }
+
+    #[test]
+    fn first_native_relay_does_not_become_codex_identity() {
+        let mut store = AccountStore::default();
+        let a = store.add_relay_account(
+            "Kimi".into(),
+            "https://api.kimi.com/coding/v1".into(),
+            "test-key".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("k3".into()),
+            None,
+            None,
+        );
+        assert!(store.current.is_none());
+        assert_eq!(store.settings.current_relay_accounts.get("k3"), Some(&a.id));
     }
     #[test]
     fn provider_metadata_does_not_inherit_gpt_identity_or_retirement() {

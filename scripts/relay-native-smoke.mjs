@@ -4,9 +4,9 @@ import fs from 'node:fs';
 const base='http://127.0.0.1:18082';
 const r=await fetch(base+'/v1/models?client_version=0.151.0',{signal:AbortSignal.timeout(10000)});
 assert.equal(r.status,200); const catalog=await r.json();
-assert.equal(catalog.models.length,3);
+assert.equal(catalog.models.filter(m=>m.visibility!=='hide').length,3);
 assert.ok(catalog.models.some(m=>m.slug==='relay-model:fixture-kimi:kimi-k3' && m.context_window===1048576));
-for(const id of ['relay-model:fixture-kimi:kimi-k3','relay-model:fixture-deepseek:deepseek-v4-pro']) {
+for(const id of ['relay-current:kimi-k3','relay-model:fixture-kimi:kimi-k3','relay-current:deepseek-v4-pro']) {
   for(const input of ['probe',[{type:'custom_tool_call_output',call_id:'mock-call',output:'OK'}]]) {
     const res=await fetch(base+'/v1/responses',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer must-not-leak','chatgpt-account-id':'must-not-leak'},
       body:JSON.stringify({model:id,input,stream:true}),signal:AbortSignal.timeout(10000)});
@@ -32,5 +32,6 @@ await new Promise((resolve,reject)=>{
 if(process.argv[2]) {
   const store=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   assert.equal(store.current,'fixture-current');
+  assert.equal(store.settings.current_relay_accounts['kimi-k3'],'fixture-kimi2');
 }
 console.log('PASS: native catalog, custom endpoint/key isolation, tool continuation, unavailable model rejection, WebSocket, current account unchanged');

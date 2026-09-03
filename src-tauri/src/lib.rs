@@ -190,7 +190,8 @@ fn get_current_account_id(state: State<AppState>) -> Result<Option<String>, Stri
 /// 获取全局设置
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> Result<account::AppSettings, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let mut store = state.store.lock().map_err(|e| e.to_string())?;
+    if relay_catalog::ensure_currents(&mut store) {store.save()?;}
     Ok(store.settings.clone())
 }
 
@@ -299,6 +300,7 @@ fn update_settings(
         // A stale settings form must not overwrite a newer selection.
         settings.current_antigravity_account_id =
             store.settings.current_antigravity_account_id.clone();
+        settings.current_relay_accounts = store.settings.current_relay_accounts.clone();
         let prev = (
             store.settings.background_refresh,
             store.settings.proxy_enabled,
@@ -1243,11 +1245,33 @@ fn switch_antigravity_account(
 }
 
 #[tauri::command]
+fn switch_relay_model_account(state: State<AppState>, app: tauri::AppHandle, id: String, model: Option<String>) -> Result<(),String> {
+    {
+        let mut store=state.store.lock().map_err(|e|e.to_string())?;
+        relay_catalog::select_current(&mut store,&id,model.as_deref())?;
+        store.save()?;
+    }
+    let _=app.emit("accounts-updated",());
+    Ok(())
+}
+
+#[tauri::command]
 async fn switch_account(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
     id: String,
 ) -> Result<(), String> {
+    // Guard other UI entry points too: a native model selection must not switch
+    // the OpenAI identity, write auth.json, or invoke the server's /switch.
+    {
+        let mut store=state.store.lock().map_err(|e|e.to_string())?;
+        if store.accounts.get(&id).is_some_and(|a|!relay_catalog::account_models(a).is_empty()) {
+            relay_catalog::select_current(&mut store,&id,None)?;
+            store.save()?;
+            let _=app.emit("accounts-updated",());
+            return Ok(());
+        }
+    }
     {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         if store
@@ -6087,6 +6111,7 @@ pub fn run() {
             finalize_antigravity_oauth_login,
             force_overwrite_disk_with_current,
             switch_antigravity_account,
+            switch_relay_model_account,
             refresh_antigravity_quota,
             reload_ide_windows,
             get_settings,

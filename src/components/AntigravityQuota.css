@@ -26,7 +26,7 @@
 /* Provider quota rows: readable names, warm reset times, aligned percentages. */
 .col-quota-merged.google-quota-column { width: 460px; }
 .account-list-container:has(.google-quota-overview) .col-quota-merged { width: 460px; }
-.account-row:is(:has(.google-quota-overview), :has(.kind-chatgpt)) .col-email { flex-direction: column; align-items: flex-start; min-width: var(--account-email-min, 200px); gap: 6px; }
+.account-row:is(:has(.google-quota-overview), :has(.kind-chatgpt)) .col-email { flex-direction: column; align-items: flex-start; min-width: var(--account-email-min, 180px); gap: 6px; }
 .account-row:is(:has(.google-quota-overview), :has(.kind-chatgpt)) .email-text { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 .account-row:is(:has(.google-quota-overview), :has(.kind-chatgpt)) .badges { margin-left: 0 !important; }
 .google-quota-overview .quota-grid { gap: 6px 8px; }

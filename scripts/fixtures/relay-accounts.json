@@ -12,6 +12,12 @@
       "auth_json": {"tokens": {"access_token": "fixture-kimi-key"}},
       "relay_base_url": "http://127.0.0.1:18090/kimi/v1", "relay_model_fallback": "kimi-k3"
     },
+    "fixture-kimi2": {
+      "id": "fixture-kimi2", "name": "Kimi second source", "kind": "relay",
+      "created_at": "2026-09-03T00:00:01Z",
+      "auth_json": {"tokens": {"access_token": "fixture-kimi2-key"}},
+      "relay_base_url": "http://127.0.0.1:18090/kimi2/v1", "relay_model_fallback": "kimi-k3"
+    },
     "fixture-deepseek": {
       "id": "fixture-deepseek", "name": "DeepSeek fixture", "kind": "relay",
       "created_at": "2026-09-03T00:00:00Z",
@@ -21,6 +27,6 @@
     }
   },
   "current": "fixture-current", "version": 3,
-  "settings": {"remote_mode": "off", "proxy_enabled": true, "proxy_port": 18082,
+  "settings": {"current_relay_accounts":{"kimi-k3":"fixture-kimi2"},"remote_mode": "off", "proxy_enabled": true, "proxy_port": 18082,
     "background_refresh": false, "quota_refresh_enabled": false, "auto_reload_ide": false}
 }

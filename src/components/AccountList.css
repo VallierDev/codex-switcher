@@ -348,8 +348,9 @@
 }
 
 .col-email {
-    flex: 1;
-    min-width: var(--account-email-min, 200px);
+    flex: 0 1 220px;
+    width: 220px;
+    min-width: var(--account-email-min, 180px);
     display: flex;
     align-items: center;
     gap: 8px;
@@ -359,11 +360,23 @@
     transition: background-color 0.2s ease;
 }
 
+.account-row .col-email {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+}
+
+.account-row .col-email > .badges {
+    margin-left: 0 !important;
+    max-width: 100%;
+}
+
 .col-email:hover {
     background: rgba(255, 255, 255, 0.05);
 }
 
 .email-text {
+    max-width: 100%;
     font-size: 13px;
     color: var(--text-primary);
     overflow: hidden;
@@ -599,7 +612,7 @@
 
 .col-quota-merged {
     width: 380px;
-    flex: 0 1 auto;
+    flex: 1 1 380px;
     min-width: 230px;
     padding-right: 16px;
 }
@@ -946,7 +959,7 @@
     .account-row { --account-email-min: 160px; }
     .account-row .quota-grid { grid-template-columns: minmax(0, 1fr); }
     .account-row .col-quota-merged { min-width: 180px; }
-    .account-row .col-email { min-width: 160px; }
+    .account-row .col-email, .account-table-header .col-email { flex: 0 0 180px; width: 180px; min-width: 180px; }
     .account-row, .account-table-header { padding-left: 8px; padding-right: 8px; }
 }
 

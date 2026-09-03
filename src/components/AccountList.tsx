@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { AntigravityQuota, type AntigravityModelQuota } from './AntigravityQuota';
 import { RelayQuotaWindows } from './RelayQuotaWindows';
+import { relayCurrentState } from '../utils/relayCurrent';
 
 const KIND_BADGE: Record<ReturnType<typeof effectiveKind>, { label: string; className: string }> = {
     chatgpt_oauth: { label: '订阅', className: 'badge kind-chatgpt' },
@@ -664,6 +665,17 @@ export function AccountList({
         }
     };
 
+    const handleSwitchRelayModel = async (id: string, name: string) => {
+        if(switchingIds.has(id))return;
+        setSwitchingIds(prev=>new Set(prev).add(id));
+        try {
+            await invoke('switch_relay_model_account',{id,model:null});
+            onRefreshComplete?.();
+            setPushToast({type:'success',text:`已将 ${name} 设为其模型的当前账号（Codex / Google 不变）`});
+        }catch(error){setPushToast({type:'error',text:`模型切号失败：${String(error)}`});}
+        finally{setSwitchingIds(prev=>{const next=new Set(prev);next.delete(id);return next;});setTimeout(()=>setPushToast(null),4000);}
+    };
+
     // 把 Tauri/后端原始报错翻译成人能看懂的一句话。
     const humanizeRefreshError = (raw: string): string => {
         const s = raw.toLowerCase();
@@ -971,11 +983,13 @@ export function AccountList({
                             (!!usage.spark && (usage.spark.five_hour_left === 0 || usage.spark.weekly_left === 0))
                         );
                         const isCurrent = acc.id === currentId;
+                        const relayCurrent = relayCurrentState(acc,settings.current_relay_accounts);
+                        const isModelRelay = relayCurrent.models.length>0;
                         const isAntigravityCurrent = kind === 'antigravity_oauth'
                             && settings.current_antigravity_account_id === acc.id;
                         const status = isAntigravityCurrent
                             ? { text: 'Google 当前', warn: false }
-                            : getStatusInfo(acc);
+                            : relayCurrent.isCurrent ? {text:relayCurrent.label,warn:false} : getStatusInfo(acc);
                         const err = acc.keepalive?.last_error;
                         const isPermanentError = err?.toLowerCase().match(/invalidated|expired|invalid_refresh_token|invalid_grant/);
                         const isInvalid = invalidIds.has(acc.id) || !!isPermanentError || acc.is_token_invalid || acc.is_logged_out;
@@ -993,7 +1007,7 @@ export function AccountList({
                         const primingLabel = primeMode === 'weekly' ? '7D' : '5H';
 
                         return (
-                            <div key={acc.id} className={`account-row ${isCurrent || isAntigravityCurrent ? 'current' : ''} ${selectedIds.has(acc.id) ? 'selected' : ''} ${isBanned ? 'banned' : isLoggedOut ? 'logged-out' : isInvalid ? 'expired' : ''}`}>
+                            <div key={acc.id} className={`account-row ${isCurrent || isAntigravityCurrent || relayCurrent.isCurrent ? 'current' : ''} ${selectedIds.has(acc.id) ? 'selected' : ''} ${isBanned ? 'banned' : isLoggedOut ? 'logged-out' : isInvalid ? 'expired' : ''}`}>
                                 <div className="col-checkbox">
                                     <input type="checkbox" className="custom-checkbox" checked={selectedIds.has(acc.id)} onChange={() => { const s = new Set(selectedIds); s.has(acc.id) ? s.delete(acc.id) : s.add(acc.id); setSelectedIds(s); }} />
                                 </div>
@@ -1041,7 +1055,8 @@ export function AccountList({
                                             return <span className={meta.className}>{meta.label}</span>;
                                         })()}
                                         {copiedId === acc.id && <span className="badge copy-success">已复制</span>}
-                                        {isCurrent && <span className="badge current">当前</span>}
+                                        {isCurrent && !isModelRelay && <span className="badge current">当前</span>}
+                                        {relayCurrent.isCurrent && <span className="badge current" title={`当前模型：${relayCurrent.active.join('、')}`}>{relayCurrent.label}</span>}
                                         {isAntigravityCurrent && <span className="badge current">Google 当前</span>}
                                         {kind === 'antigravity_oauth' && (() => {
                                             const tier = antigravityTier(acc);
@@ -1158,9 +1173,12 @@ export function AccountList({
                                             <UploadCloud size={14} className={pushingIds.has(acc.id) ? 'spinning' : ''} />
                                         </button>
                                     )}
-                                    {!isCurrent && effectiveKind(acc) !== 'antigravity_oauth' && (
+                                    {!isCurrent && !isModelRelay && effectiveKind(acc) !== 'antigravity_oauth' && (
                                         <button className="action-btn switch" onClick={() => onSwitch(acc.id)} disabled={switchingIds.has(acc.id)} title="切换"><ArrowLeftRight size={14} /></button>
                                     )}
+                                    {isModelRelay && !relayCurrent.allCurrent && <button className="action-btn switch"
+                                        onClick={()=>handleSwitchRelayModel(acc.id,acc.name)} disabled={switchingIds.has(acc.id)}
+                                        title={`设为这些模型的当前号：${relayCurrent.models.join('、')}（不影响 Codex / Google）`}><ArrowLeftRight size={14}/></button>}
                                     {kind === 'antigravity_oauth' && !isAntigravityCurrent && (
                                         <button
                                             className="action-btn switch"
