@@ -1,7 +1,7 @@
 //! Skills 管理模块
 //!
 //! SSOT 目录: ~/.codex/skills/
-//! 同步到: ~/.claude/skills/, ~/.gemini/skills/, ~/.config/opencode/skills/, ~/.agents/skills/, ~/.grok/skills/, ~/.kimi-code/skills/, ~/.gemini/antigravity/.agents/skills/
+//! 同步到: ~/.claude/skills/, ~/.gemini/skills/, ~/.gemini/config/skills/, ~/.config/opencode/skills/, ~/.agents/skills/, ~/.grok/skills/, ~/.kimi-code/skills/
 //! 数据存储: ~/.codex-switcher/skills.json
 
 use chrono::{DateTime, Utc};
@@ -132,12 +132,9 @@ fn app_skills_dir(app: &str) -> Option<PathBuf> {
         "zcode" => Some(home.join(".agents").join("skills")),
         "grok" => Some(home.join(".grok").join("skills")),
         "kimi" => Some(home.join(".kimi-code").join("skills")),
-        "antigravity" => Some(
-            home.join(".gemini")
-                .join("antigravity")
-                .join(".agents")
-                .join("skills"),
-        ),
+        // Antigravity 的全局用户 skills 由 ~/.gemini/config/ 扫描。
+        // ~/.gemini/antigravity/builtin/skills 是只读内置挂载点，不要写入。
+        "antigravity" => Some(home.join(".gemini").join("config").join("skills")),
         "opencode" => {
             // Windows: %APPDATA%\opencode\skills, Unix: ~/.config/opencode/skills
             #[cfg(windows)]
@@ -192,7 +189,14 @@ pub fn init_ssot() -> Result<(), String> {
         }
     }
 
-    // 确保各 CLI 的 skills 目录是指向 SSOT 的 symlink
+    // 旧版本错误地把 Antigravity 用户 skills 链到了
+    // ~/.gemini/antigravity/.agents/skills。清理旧目标，避免多个来源；
+    // builtin/skills 始终不触碰。
+    migrate_legacy_antigravity_skills(&ssot)?;
+    cleanup_legacy_antigravity_root_skills()?;
+
+    // 确保各 CLI 的 skills 目录已接入 SSOT。
+    // Antigravity 需要真实目录（不会扫描 symlink），由专用镜像逻辑处理。
     let apps = [
         "codex",
         "claude",
@@ -210,13 +214,215 @@ pub fn init_ssot() -> Result<(), String> {
     Ok(())
 }
 
-/// 将某个 CLI 的 skills 目录 symlink 到 SSOT
+fn legacy_antigravity_skills_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| {
+        home.join(".gemini")
+            .join("antigravity")
+            .join(".agents")
+            .join("skills")
+    })
+}
+
+/// 迁移旧版 Antigravity 用户 skills 目录。
+///
+/// 只处理旧目录本身：不删除 `.agents`，也不触碰 `builtin/skills`。
+fn migrate_legacy_antigravity_skills(ssot: &std::path::Path) -> Result<(), String> {
+    let Some(legacy) = legacy_antigravity_skills_dir() else {
+        return Ok(());
+    };
+
+    if legacy.is_symlink() {
+        if std::fs::read_link(&legacy)
+            .map(|target| target == ssot)
+            .unwrap_or(false)
+        {
+            std::fs::remove_file(&legacy)
+                .map_err(|e| format!("移除旧 Antigravity skills 链接失败: {}", e))?;
+            println!("[Skills] 已移除旧 Antigravity skills 链接");
+        }
+        return Ok(());
+    }
+
+    if legacy.is_dir() {
+        migrate_existing_app_skills_to_ssot("antigravity-legacy", &legacy, ssot)?;
+        std::fs::remove_dir_all(&legacy)
+            .map_err(|e| format!("移除旧 Antigravity skills 目录失败: {}", e))?;
+        println!("[Skills] 已迁移旧 Antigravity skills 目录");
+    }
+
+    Ok(())
+}
+
+/// 清理本项目上一版生成的错误目标 ~/.gemini/antigravity/skills。
+///
+/// 仅清理带有本项目 manifest 的镜像目录；没有 manifest 的目录视为用户
+/// 自己维护的内容，保留不动。builtin/skills 不在这个路径范围内。
+fn cleanup_legacy_antigravity_root_skills() -> Result<(), String> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(());
+    };
+    let legacy = home.join(".gemini").join("antigravity").join("skills");
+    if legacy.is_symlink() {
+        if std::fs::read_link(&legacy)
+            .map(|target| target == ssot_dir())
+            .unwrap_or(false)
+        {
+            std::fs::remove_file(&legacy)
+                .map_err(|e| format!("移除旧 Antigravity skills 链接失败: {}", e))?;
+        }
+        return Ok(());
+    }
+    if !legacy.is_dir() {
+        return Ok(());
+    }
+
+    let manifest = legacy.join(ANTIGRAVITY_MANIFEST);
+    if !manifest.is_file() {
+        return Ok(());
+    }
+    let managed: Vec<String> = std::fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default();
+    for name in managed {
+        let path = legacy.join(name);
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|e| format!("移除旧 Antigravity skill 失败: {}", e))?;
+        } else if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("移除旧 Antigravity skill 失败: {}", e))?;
+        }
+    }
+    std::fs::remove_file(&manifest)
+        .map_err(|e| format!("移除旧 Antigravity skills manifest 失败: {}", e))?;
+    if std::fs::read_dir(&legacy)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+    {
+        std::fs::remove_dir(&legacy)
+            .map_err(|e| format!("移除旧 Antigravity skills 目录失败: {}", e))?;
+    }
+    Ok(())
+}
+
+const ANTIGRAVITY_MANIFEST: &str = ".codex-switcher-managed.json";
+
+/// 将 SSOT 镜像到 Antigravity 的真实全局用户目录。
+///
+/// Antigravity 的全局 customization discovery 扫描 ~/.gemini/config/skills，
+/// 且不会从根 symlink 目录加载用户 skills；因此这里不能复用其他 CLI 的
+/// symlink 策略。builtin/skills 不在这个函数的路径范围内，始终保持平台自带内容。
+fn sync_antigravity_skills_dir(ssot: &std::path::Path) -> Result<(), String> {
+    let target =
+        app_skills_dir("antigravity").ok_or_else(|| "Antigravity skills 目录不可用".to_string())?;
+
+    if target.is_symlink() {
+        std::fs::remove_file(&target)
+            .map_err(|e| format!("移除 Antigravity skills symlink 失败: {}", e))?;
+    } else if target.exists() && !target.is_dir() {
+        return Err(format!("Antigravity skills 路径不是目录: {:?}", target));
+    }
+
+    if !target.exists() {
+        std::fs::create_dir_all(&target)
+            .map_err(|e| format!("创建 Antigravity skills 目录失败: {}", e))?;
+    }
+
+    let manifest = target.join(ANTIGRAVITY_MANIFEST);
+    let previous: std::collections::HashSet<String> = std::fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Vec<String>>(&content).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let names = list_skill_dirs_at(ssot);
+    let current: std::collections::HashSet<_> = names.iter().cloned().collect();
+
+    // 只删除本程序上一次镜像创建的目录，避免误删用户直接放入的内容。
+    for name in previous.difference(&current) {
+        let path = target.join(name);
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|e| format!("移除过期 Antigravity skill {} 失败: {}", name, e))?;
+        } else if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("移除过期 Antigravity skill {} 失败: {}", name, e))?;
+        }
+    }
+
+    for name in &names {
+        let source = ssot.join(name);
+        let destination = target.join(name);
+        if destination.exists() {
+            if destination.is_dir() {
+                std::fs::remove_dir_all(&destination)
+                    .map_err(|e| format!("覆盖 Antigravity skill {} 失败: {}", name, e))?;
+            } else {
+                std::fs::remove_file(&destination)
+                    .map_err(|e| format!("覆盖 Antigravity skill {} 失败: {}", name, e))?;
+            }
+        }
+        copy_dir_recursive(&source, &destination)?;
+    }
+
+    let content = serde_json::to_string_pretty(&names)
+        .map_err(|e| format!("生成 Antigravity skills manifest 失败: {}", e))?;
+    std::fs::write(&manifest, content)
+        .map_err(|e| format!("写入 Antigravity skills manifest 失败: {}", e))?;
+    println!("[Skills] Antigravity 已镜像 {} 个 skill", names.len());
+    Ok(())
+}
+
+fn sync_antigravity_if_enabled() -> Result<(), String> {
+    let Some(target) = app_skills_dir("antigravity") else {
+        return Ok(());
+    };
+    if target.join(ANTIGRAVITY_MANIFEST).is_file() {
+        sync_antigravity_skills_dir(&ssot_dir())?;
+    }
+    Ok(())
+}
+
+fn disable_antigravity_skills() -> Result<(), String> {
+    let Some(target) = app_skills_dir("antigravity") else {
+        return Ok(());
+    };
+    let manifest = target.join(ANTIGRAVITY_MANIFEST);
+    let managed: Vec<String> = std::fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default();
+
+    for name in managed {
+        let path = target.join(name);
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|e| format!("移除 Antigravity skill 失败: {}", e))?;
+        } else if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("移除 Antigravity skill 失败: {}", e))?;
+        }
+    }
+    if manifest.exists() {
+        std::fs::remove_file(&manifest)
+            .map_err(|e| format!("移除 Antigravity skills manifest 失败: {}", e))?;
+    }
+    Ok(())
+}
+
+/// 将某个 CLI 的 skills 目录接入 SSOT
 fn link_app_to_ssot(app: &str) -> Result<(), String> {
     let target = match app_skills_dir(app) {
         Some(d) => d,
         None => return Ok(()),
     };
     let ssot = ssot_dir();
+
+    if app == "antigravity" {
+        return sync_antigravity_skills_dir(&ssot);
+    }
 
     // 已经是正确的 symlink → 跳过
     if target.is_symlink() {
@@ -429,6 +635,9 @@ impl SkillStore {
 
         if enabled {
             link_app_to_ssot(app)?;
+        } else if app == "antigravity" {
+            // Antigravity 的 config/skills 可能还包含其他全局 skill，不能删除整个目录。
+            disable_antigravity_skills()?;
         } else {
             // 移除 symlink / junction
             if target.is_symlink() {
@@ -469,7 +678,9 @@ impl SkillStore {
             "antigravity",
         ] {
             let linked = if let Some(target) = app_skills_dir(app) {
-                if target.is_symlink() {
+                if *app == "antigravity" {
+                    target.join(ANTIGRAVITY_MANIFEST).is_file()
+                } else if target.is_symlink() {
                     std::fs::read_link(&target)
                         .map(|t| t == ssot)
                         .unwrap_or(false)
@@ -596,6 +807,9 @@ impl SkillStore {
         data.skills.retain(|s| s.directory != skill.directory);
         data.skills.push(installed);
 
+        // Antigravity 使用真实目录镜像；安装后立即更新已启用的镜像。
+        sync_antigravity_if_enabled()?;
+
         let _ = std::fs::remove_dir_all(&tmp);
         Ok(())
     }
@@ -617,6 +831,9 @@ impl SkillStore {
 
         // 从数据中移除
         data.skills.retain(|s| s.id != skill_id);
+
+        // Antigravity 使用真实目录镜像；卸载后立即移除镜像中的旧 skill。
+        sync_antigravity_if_enabled()?;
 
         Ok(())
     }

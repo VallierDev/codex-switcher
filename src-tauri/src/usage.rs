@@ -12,7 +12,7 @@ use std::time::Duration;
 ///
 /// `wham/usage` 不在应用层指定代理，由系统网络层（Clash/TUN、250 透明
 /// 接管或环境变量代理）决定实际出口。
-fn usage_client() -> &'static reqwest::Client {
+pub(crate) fn usage_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -593,7 +593,12 @@ impl UsageFetcher {
         base_url: &str,
         api_key: &str,
     ) -> Result<crate::account::RelayUsageCache, String> {
-        let url = format!("{}/v1/usage", base_url.trim_end_matches('/'));
+        let base = base_url.trim_end_matches('/');
+        let url = if base.ends_with("/v1") {
+            format!("{}/usage", base)
+        } else {
+            format!("{}/v1/usage", base)
+        };
         let client = reqwest::Client::new();
         let resp = client
             .get(&url)
@@ -651,8 +656,13 @@ impl UsageFetcher {
             .or_else(|| body.get("isValid").and_then(|v| v.as_bool()))
             .unwrap_or(true);
 
+        let windows = body
+            .get("windows")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+
         Ok(crate::account::RelayUsageCache {
-            windows: Vec::new(),
+            windows,
             remaining,
             unit,
             is_active,
@@ -768,7 +778,11 @@ impl UsageFetcher {
         }
 
         // 2) sub2api / 通用 OpenAI 兼容：/v1/usage
-        let url = format!("{}/v1/usage", base);
+        let url = if base.ends_with("/v1") {
+            format!("{}/usage", base)
+        } else {
+            format!("{}/v1/usage", base)
+        };
         if let Ok(resp) = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", api_key))
@@ -1330,6 +1344,9 @@ pub async fn list_reset_credits(
     }
 
     let json: Value = serde_json::from_str(&raw).map_err(|_| "上游返回非 JSON".to_string())?;
+    if !json.get("credits").is_some_and(Value::is_array) {
+        return Err("上游未返回有效的重置银行明细，当前次数未知（不代表已清空）".to_string());
+    }
     let mut items: Vec<ResetCreditItem> = json
         .get("credits")
         .and_then(|c| c.as_array())

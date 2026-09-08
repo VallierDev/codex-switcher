@@ -10,6 +10,7 @@ mod codex_sessions;
 mod codex_ua;
 mod deep_link;
 mod ide_control;
+pub mod kimi_quota;
 pub mod mailbox;
 pub mod oauth;
 mod oauth_server;
@@ -17,10 +18,10 @@ pub mod otp_login;
 mod provider_quirks;
 mod proxy;
 mod quota_snapshot;
+mod referrals;
 mod refresh_lock;
-pub mod relay_translate;
 pub mod relay_catalog;
-pub mod kimi_quota;
+pub mod relay_translate;
 mod remote_client;
 mod remote_server;
 mod scheduler;
@@ -55,6 +56,16 @@ fn allow_local_refresh_for_quota(is_current: bool) -> bool {
     let _ = is_current;
     // 统一禁用配额查询路径下的本地 refresh。防止非当前账号消耗旧 refresh_token。
     false
+}
+
+/// client 模式默认跟随 Mini Mac Server 的 current；设置手机锚后，
+/// 本机的 current 必须独立保留，否则后台同步会把用户刚切到的账号改回 Server current。
+fn should_follow_server_current(
+    remote_mode: &str,
+    client_owns_current: bool,
+    has_session_anchor: bool,
+) -> bool {
+    remote_mode == "client" && !client_owns_current && !has_session_anchor
 }
 
 fn detect_sync_conflict_for_current(
@@ -191,7 +202,9 @@ fn get_current_account_id(state: State<AppState>) -> Result<Option<String>, Stri
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> Result<account::AppSettings, String> {
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
-    if relay_catalog::ensure_currents(&mut store) {store.save()?;}
+    if relay_catalog::ensure_currents(&mut store) {
+        store.save()?;
+    }
     Ok(store.settings.clone())
 }
 
@@ -915,9 +928,16 @@ async fn refresh_relay_usage(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<account::RelayUsageCache, String> {
-    let is_kimi = state.store.lock().map_err(|e| e.to_string())?.accounts.get(&id)
+    let is_kimi = state
+        .store
+        .lock()
+        .map_err(|e| e.to_string())?
+        .accounts
+        .get(&id)
         .is_some_and(kimi_quota::is_coding_account);
-    if is_kimi { return kimi_quota::refresh_account(&state.store, &id).await; }
+    if is_kimi {
+        return kimi_quota::refresh_account(&state.store, &id).await;
+    }
     let (base_url, api_key, preset, usage_cookie) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let acc = store.accounts.get(&id).ok_or("账号不存在")?;
@@ -1245,13 +1265,18 @@ fn switch_antigravity_account(
 }
 
 #[tauri::command]
-fn switch_relay_model_account(state: State<AppState>, app: tauri::AppHandle, id: String, model: Option<String>) -> Result<(),String> {
+fn switch_relay_model_account(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    id: String,
+    model: Option<String>,
+) -> Result<(), String> {
     {
-        let mut store=state.store.lock().map_err(|e|e.to_string())?;
-        relay_catalog::select_current(&mut store,&id,model.as_deref())?;
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        relay_catalog::select_current(&mut store, &id, model.as_deref())?;
         store.save()?;
     }
-    let _=app.emit("accounts-updated",());
+    let _ = app.emit("accounts-updated", ());
     Ok(())
 }
 
@@ -1264,11 +1289,15 @@ async fn switch_account(
     // Guard other UI entry points too: a native model selection must not switch
     // the OpenAI identity, write auth.json, or invoke the server's /switch.
     {
-        let mut store=state.store.lock().map_err(|e|e.to_string())?;
-        if store.accounts.get(&id).is_some_and(|a|!relay_catalog::account_models(a).is_empty()) {
-            relay_catalog::select_current(&mut store,&id,None)?;
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        if store
+            .accounts
+            .get(&id)
+            .is_some_and(|a| !relay_catalog::account_models(a).is_empty())
+        {
+            relay_catalog::select_current(&mut store, &id, None)?;
             store.save()?;
-            let _=app.emit("accounts-updated",());
+            let _ = app.emit("accounts-updated", ());
             return Ok(());
         }
     }
@@ -1732,7 +1761,7 @@ async fn solo_try_align_current(
 const ANCHOR_DISK_REFRESH_TTL_THRESHOLD_SECS: i64 = 2 * 3600;
 
 pub async fn do_one_fast_auth_sync(store: &std::sync::Arc<std::sync::Mutex<AccountStore>>) -> bool {
-    let (mode, primary, fallback, secret, current_id) = {
+    let (mode, primary, fallback, secret, current_id, client_owns_current, has_session_anchor) = {
         let s = match store.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -1743,6 +1772,8 @@ pub async fn do_one_fast_auth_sync(store: &std::sync::Arc<std::sync::Mutex<Accou
             s.settings.remote_server_url_fallback.clone(),
             s.settings.remote_shared_secret.clone(),
             s.current.clone(),
+            s.settings.client_owns_current,
+            s.session_anchor_id().is_some(),
         )
     };
     if mode != "client" || secret.is_empty() {
@@ -1756,20 +1787,30 @@ pub async fn do_one_fast_auth_sync(store: &std::sync::Arc<std::sync::Mutex<Accou
     };
 
     // 1) 先看 Server 的 current 是不是跟本机 store.current 一致，不一致 → 优先对齐到 Server
-    let target_cid = match remote_client::get_current(&base, &secret).await {
-        Ok(cur) => match cur.current {
-            Some(server_cid) => {
-                if local_cid.as_deref() != Some(server_cid.as_str()) {
-                    println!(
-                        "[FastAuthSync] Server current ({}) 与本机 ({:?}) 不一致，对齐到 Server",
-                        server_cid, local_cid
-                    );
+    let target_cid = if should_follow_server_current(&mode, client_owns_current, has_session_anchor)
+    {
+        match remote_client::get_current(&base, &secret).await {
+            Ok(cur) => match cur.current {
+                Some(server_cid) => {
+                    if local_cid.as_deref() != Some(server_cid.as_str()) {
+                        println!(
+                            "[FastAuthSync] Server current ({}) 与本机 ({:?}) 不一致，对齐到 Server",
+                            server_cid, local_cid
+                        );
+                    }
+                    Some(server_cid)
                 }
-                Some(server_cid)
-            }
-            None => local_cid.clone(),
-        },
-        Err(_) => local_cid.clone(),
+                None => local_cid.clone(),
+            },
+            Err(_) => local_cid.clone(),
+        }
+    } else {
+        if has_session_anchor {
+            println!("[FastAuthSync] 手机锚生效，本机 current 独立于 Server current");
+        } else if client_owns_current {
+            println!("[FastAuthSync] 本机拥有 current，本机 current 独立于 Server current");
+        }
+        local_cid.clone()
     };
     let Some(cid) = target_cid else {
         return false;
@@ -1897,7 +1938,80 @@ struct QuotaRefreshTarget {
     name: String,
     updated_at: chrono::DateTime<chrono::Utc>,
     window_expired: bool,
+    plus_watch: bool,
     prime_due: WindowPrimeDue,
+}
+
+/// Plus 的 5h 窗口回满后立即切过去，不依赖下一次请求触发 429 或其它选号信号。
+/// 额度刷新循环每轮调用一次；只对已确认可用的 Plus 生效，避免把周限额耗尽的号切进来。
+fn switch_to_ready_plus_if_needed(
+    store: &std::sync::Arc<std::sync::Mutex<AccountStore>>,
+    app_handle: &tauri::AppHandle,
+) {
+    let (target_name, from_name, hot) = {
+        let mut s = match store.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let current_id = s.current.clone();
+        let target = s
+            .accounts
+            .values()
+            .filter(|a| Some(&a.id) != current_id.as_ref())
+            .filter(|a| !a.is_banned && !a.is_token_invalid && !a.is_logged_out)
+            .filter(|a| a.is_openai_account())
+            .filter(|a| {
+                a.cached_quota.as_ref().is_some_and(|q| {
+                    q.plan_type.trim().eq_ignore_ascii_case("plus")
+                        && q.five_hour_left >= 100.0
+                        && q.weekly_left > 0.0
+                })
+            })
+            .max_by_key(|a| a.cached_quota.as_ref().map(|q| q.updated_at));
+        let target = match target {
+            Some(a) => a,
+            None => return,
+        };
+        let target_id = target.id.clone();
+        let target_name = target.name.clone();
+        let from_name = current_id
+            .as_ref()
+            .and_then(|id| s.accounts.get(id))
+            .map(|a| a.name.clone());
+        let proxy_running = app_handle.try_state::<AppState>().is_some_and(|state| {
+            state
+                .proxy_handle
+                .lock()
+                .map(|h| h.is_some())
+                .unwrap_or(false)
+        });
+        let hot = account::should_hot_switch(&s.settings, proxy_running);
+        if let Err(error) = s.switch_to(&target_id, hot).and_then(|_| s.save()) {
+            eprintln!("[PlusWatch] 自动切换失败: {}", error);
+            return;
+        }
+        (target_name, from_name, hot)
+    };
+
+    proxy::invalidate_remote_token_cache();
+    if let Some(state) = app_handle.try_state::<AppState>() {
+        state.ws_disconnect.notify_waiters();
+        state.switch_logger.log_switch(
+            from_name,
+            target_name.clone(),
+            switch_log::SwitchReason::AutoQuotaRefresh,
+            None,
+            Some(100.0),
+        );
+        crate::tray::update_tray_menu(app_handle);
+    }
+    let _ = app_handle.emit("proxy-account-switched", &target_name);
+    let _ = app_handle.emit("accounts-updated", ());
+    println!(
+        "[PlusWatch] Plus 5h 已回满，立即切换到 {}（{}切）",
+        target_name,
+        if hot { "热" } else { "冷" }
+    );
 }
 
 fn quota_label_is_weekly(label: &str) -> bool {
@@ -2237,7 +2351,9 @@ pub fn start_quota_refresh(
                 fallback,
                 secret,
                 client_owns_current,
+                has_session_anchor,
                 any_window_priming,
+                any_plus_watch,
             ) = {
                 let mut s = store.lock().unwrap();
                 let mode = s.settings.remote_mode.clone();
@@ -2256,7 +2372,13 @@ pub fn start_quota_refresh(
                     s.settings.remote_server_url_fallback.clone(),
                     s.settings.remote_shared_secret.clone(),
                     s.settings.client_owns_current,
+                    s.session_anchor_id().is_some(),
                     s.accounts.values().any(|a| a.window_priming.enabled()),
+                    s.accounts.values().any(|a| {
+                        a.cached_quota
+                            .as_ref()
+                            .is_some_and(|q| q.plan_type.trim().eq_ignore_ascii_case("plus"))
+                    }),
                 )
             };
 
@@ -2423,7 +2545,11 @@ pub fn start_quota_refresh(
                                 //    规则：若 Server 正常，client 始终跟随 Server 的 current。
                                 //    client_owns_current=true（旧 solo 迁过来的）：本机 codex
                                 //    直接跑，current 由本机用户决定，不被 Server 反向同步。
-                                if remote_mode == "client" && !client_owns_current {
+                                if should_follow_server_current(
+                                    &remote_mode,
+                                    client_owns_current,
+                                    has_session_anchor,
+                                ) {
                                     if let Ok(cur) =
                                         crate::remote_client::get_current(&base, &secret).await
                                     {
@@ -2499,26 +2625,31 @@ pub fn start_quota_refresh(
                                             }
                                         }
                                     }
-                                } // end: if remote_mode == "client" && !client_owns_current
+                                } // end: should_follow_server_current
                                 println!(
                                     "[QuotaRefresh] {} 从 Server 同步 {} 个额度，删除本地残留 {} 个",
                                     remote_mode, updated, pruned
                                 );
                                 let _ = app_handle.emit("accounts-updated", ());
+                                switch_to_ready_plus_if_needed(&store, &app_handle);
                             }
                             Err(e) => println!("[QuotaRefresh] client 拉取 /quotas 失败: {}", e),
                         }
                     }
                     Err(e) => println!("[QuotaRefresh] client Server 不可达: {}", e),
                 }
-                let sync_minutes = u64::from(interval_minutes.max(5)); // client 模式最少 5 分钟
+                let sync_minutes = if any_plus_watch {
+                    5
+                } else {
+                    u64::from(interval_minutes.max(5))
+                }; // Plus 观察固定 5 分钟一轮
                 tokio::time::sleep(tokio::time::Duration::from_secs(sync_minutes * 60)).await;
                 continue;
             }
 
             // 非 client 模式：普通额度轮询遵循 enabled；但只要有账号启用了周期保鲜，
             // 循环仍需运行以观察 reset_at。没有到点时不会发模型请求。
-            if !enabled && !any_window_priming {
+            if !enabled && !any_window_priming && !any_plus_watch {
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                 continue;
             }
@@ -2565,11 +2696,14 @@ pub fn start_quota_refresh(
                         let weekly_expired =
                             weekly_reset > 0 && weekly_reset <= now_ts && updated_ts < weekly_reset;
                         let expired = five_expired || weekly_expired;
+                        let plus_watch =
+                            cq.is_some_and(|q| q.plan_type.trim().eq_ignore_ascii_case("plus"));
                         QuotaRefreshTarget {
                             id: a.id.clone(),
                             name: a.name.clone(),
                             updated_at: updated,
                             window_expired: expired,
+                            plus_watch,
                             prime_due: window_prime_due(a, now_ts),
                         }
                     })
@@ -2580,7 +2714,11 @@ pub fn start_quota_refresh(
                 //    新启用但还没有缓存的账号也先抓一次 baseline，不能凭空猜 reset_at。
                 let mut expired: Vec<_> = candidates
                     .iter()
-                    .filter(|target| target.prime_due.any() || (enabled && target.window_expired))
+                    .filter(|target| {
+                        target.plus_watch
+                            || target.prime_due.any()
+                            || (enabled && target.window_expired)
+                    })
                     .cloned()
                     .collect();
                 expired.sort_by_key(|target| target.updated_at);
@@ -2897,6 +3035,7 @@ pub fn start_quota_refresh(
                         }
 
                         let _ = app_handle.emit("accounts-updated", ());
+                        switch_to_ready_plus_if_needed(&store, &app_handle);
                     }
                     Err(e) => {
                         println!("[QuotaRefresh] {} 额度查询失败: {}", name, e);
@@ -2929,6 +3068,8 @@ pub fn start_quota_refresh(
             // 整轮跑完后再 sleep 到下一周期（没有目标的时候缩短到 60s）
             let next_sleep_secs = if targets.is_empty() {
                 60
+            } else if targets.iter().any(|target| target.plus_watch) {
+                5 * 60
             } else {
                 u64::from(interval_minutes) * 60
             };
@@ -3002,8 +3143,17 @@ pub fn score_candidate_accounts(store: &AccountStore) -> Vec<(String, String, f6
                 if effective <= 0.0 {
                     continue;
                 }
-                // 最终评分 = 额度分 + Plan 加分
-                effective + plan_bonus
+                // Plus 的 5h 窗口一旦回满，优先把它用起来，避免在其它订阅号上
+                // 白白消耗额度。这个是硬优先级，不再让 Pro 的 plan_bonus 压过满额 Plus。
+                // 仍保留 weekly > 0 的前置过滤：周限额已耗尽的 Plus 不是可用候选。
+                let full_plus_bonus = if plan == "plus" && q.five_hour_left >= 100.0 {
+                    1_000_000.0
+                } else {
+                    0.0
+                };
+
+                // 最终评分 = 满额 Plus 硬优先级 + 额度分 + Plan 加分
+                full_plus_bonus + effective + plan_bonus
             }
         };
 
@@ -3278,7 +3428,43 @@ fn usage_to_cached(u: &UsageDisplay) -> crate::account::CachedQuota {
     }
 }
 
-/// 发送 Codex 推荐邀请（POST /backend-api/wham/referrals/invite）。
+#[tauri::command]
+async fn get_desktop_referral_eligibility(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    program: String,
+) -> Result<serde_json::Value, String> {
+    let (token, aid) =
+        resolve_account_access_token(&state, &id, "该账号不支持 ChatGPT Desktop 邀请").await?;
+    referrals::eligibility(&token, aid.as_deref(), &program).await
+}
+
+#[tauri::command]
+async fn get_desktop_referral_tracking(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    program: String,
+    cursor: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let (token, aid) =
+        resolve_account_access_token(&state, &id, "该账号不支持 ChatGPT Desktop 邀请").await?;
+    referrals::tracking(&token, aid.as_deref(), &program, cursor.as_deref()).await
+}
+
+#[tauri::command]
+async fn send_desktop_referral_invite(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    program: String,
+    emails: Vec<String>,
+    expected: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let (token, aid) =
+        resolve_account_access_token(&state, &id, "该账号不支持 ChatGPT Desktop 邀请").await?;
+    referrals::send(&token, aid.as_deref(), &program, emails, expected).await
+}
+
+/// 旧版 Codex 推荐邀请；新版 UI 使用 send_desktop_referral_invite。
 /// 复用账号自身 token，走 quota 同一条出口（Pro 号同 IP 约束见 usage::send_referral_invite）。
 #[tauri::command]
 async fn send_codex_invite(
@@ -5525,7 +5711,9 @@ async fn remote_pull_all_tokens(
             Err(e) => errors.push((id.clone(), e)),
         }
     }
-    // 处理 Server 的 current：若本机有该账号，则写 auth.json + 更新 current
+    // 处理 Server 的 current：若本机有该账号，则写 auth.json + 更新 current。
+    // 手机锚开启后，本机 current 与 Server current 是两条独立维度；否则手工切号
+    // 会在下一次“从 Server 拉全部 Token”时被改回 Server current。
     let cur = remote_client::get_current(&url, &secret).await.ok();
     let mut wrote_auth_json = false;
     let (cur_id, cur_name) = if let Some(c) = cur.as_ref() {
@@ -5533,7 +5721,14 @@ async fn remote_pull_all_tokens(
     } else {
         (None, None)
     };
-    if let Some(cid) = cur_id.as_ref() {
+    let has_session_anchor = state
+        .store
+        .lock()
+        .map(|store| store.session_anchor_id().is_some())
+        .unwrap_or(false);
+    if has_session_anchor {
+        println!("[RemotePull] 手机锚生效，保留本机 current；仅同步 Server 账号 Token");
+    } else if let Some(cid) = cur_id.as_ref() {
         let (auth_opt, allow_disk) = {
             let store = state.store.lock().map_err(|e| e.to_string())?;
             (
@@ -6097,6 +6292,9 @@ pub fn run() {
             check_codex_login,
             get_quota_by_id,
             send_codex_invite,
+            get_desktop_referral_eligibility,
+            get_desktop_referral_tracking,
+            send_desktop_referral_invite,
             send_codex_wakeup,
             consume_reset_credit,
             list_reset_credits,
@@ -6545,6 +6743,14 @@ mod tests {
     }
 
     #[test]
+    fn client_current_follows_server_only_without_phone_anchor() {
+        assert!(should_follow_server_current("client", false, false));
+        assert!(!should_follow_server_current("client", false, true));
+        assert!(!should_follow_server_current("client", true, false));
+        assert!(!should_follow_server_current("solo", false, false));
+    }
+
+    #[test]
     fn quarantine_fix_ticket_can_only_be_used_once() {
         let state = AppState::new();
         let ticket = state.issue_quarantine_fix_ticket().unwrap();
@@ -6576,5 +6782,46 @@ mod tests {
             .consume_quarantine_fix_ticket("expired")
             .expect_err("expired ticket should be rejected");
         assert!(err.contains("过期"));
+    }
+
+    #[test]
+    fn full_plus_is_selected_before_a_higher_quota_pro_account() {
+        let now = Utc::now();
+        let mut store = AccountStore::default();
+        store.current = Some("current".to_string());
+        let quota = |plan_type: &str| account::CachedQuota {
+            five_hour_left: 100.0,
+            five_hour_reset: "".to_string(),
+            five_hour_reset_at: Some(now.timestamp() + 3600),
+            primary_window_seconds: Some(5 * 3600),
+            five_hour_label: "5H".to_string(),
+            weekly_left: 100.0,
+            weekly_reset: "".to_string(),
+            weekly_reset_at: Some(now.timestamp() + 7 * 24 * 3600),
+            secondary_window_seconds: Some(7 * 24 * 3600),
+            weekly_label: "7D".to_string(),
+            plan_type: plan_type.to_string(),
+            is_valid_for_cli: true,
+            reset_credits: None,
+            spark: None,
+            updated_at: now,
+        };
+
+        let mut plus = test_account("plus", "plus-account", "rt-plus");
+        plus.id = "plus".to_string();
+        plus.cached_quota = Some(quota("plus"));
+
+        let mut pro = test_account("pro", "pro-account", "rt-pro");
+        pro.id = "pro".to_string();
+        pro.cached_quota = Some(quota("pro"));
+
+        store.accounts.insert(plus.id.clone(), plus);
+        store.accounts.insert(pro.id.clone(), pro);
+
+        let candidates = score_candidate_accounts(&store);
+        assert_eq!(
+            candidates.first().map(|candidate| candidate.0.as_str()),
+            Some("plus")
+        );
     }
 }

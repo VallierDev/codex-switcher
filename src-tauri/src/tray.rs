@@ -1,5 +1,6 @@
 use tauri::{
     image::Image,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{TrayIcon, TrayIconBuilder, TrayIconEvent},
     webview::WebviewWindowBuilder,
     AppHandle, Manager,
@@ -33,18 +34,50 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let (width, height) = final_img.dimensions();
     let icon = Image::new_owned(final_img.into_raw(), width, height);
 
+    // Windows 右键需要真正挂载 native menu；仅监听 TrayIconEvent 会把右键
+    // 也当成 popup 点击，系统不会自动生成完整托盘菜单。
+    let show_main = MenuItem::with_id(app, "tray-show-main", "打开主窗口", true, None::<&str>)?;
+    let next_account = MenuItem::with_id(
+        app,
+        "tray-next-account",
+        "切换到下一个账号",
+        true,
+        None::<&str>,
+    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit = PredefinedMenuItem::quit(app, Some("退出"))?;
+    let menu = Menu::with_items(app, &[&show_main, &next_account, &separator, &quit])?;
+
     let _tray = TrayIconBuilder::with_id("main")
         .icon(icon)
         .icon_as_template(false)
+        .menu(&menu)
         .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "tray-show-main" => show_main_window_from_cmd(app),
+            "tray-next-account" => {
+                let app_handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app_handle.state::<crate::AppState>();
+                    let call_handle = app_handle.clone();
+                    if let Err(error) =
+                        crate::switch_to_next_account_internal(state, call_handle).await
+                    {
+                        eprintln!("[Tray] 切换下一个账号失败: {}", error);
+                    }
+                });
+            }
+            _ => {}
+        })
         .on_tray_icon_event(|tray: &TrayIcon, event: TrayIconEvent| {
             if let TrayIconEvent::Click {
                 button_state: tauri::tray::MouseButtonState::Up,
+                button: tauri::tray::MouseButton::Left,
                 position,
                 ..
             } = event
             {
-                // 任意点击 → 弹出 popup
+                // 左键 → 弹出 popup；右键交给 native menu（Windows 修复）。
                 toggle_popup(tray.app_handle(), position);
             }
         })

@@ -8,6 +8,26 @@
 
 **中文** | [English](#english) | [Русский](#русский)
 
+## v0.7.11 更新说明
+
+本版本是在 `v0.7.10` 基础上的一次集中更新，重点是让额度窗口真正开始滚动、提高 Plus 账号利用率，并补齐 Google/Antigravity、Kimi/DeepSeek Relay、账号邀请和跨客户端 Skills 能力。
+
+### 配额刷新与账号利用
+
+- 刷新账号额度后，如果发现新的 5 小时或 7 天窗口需要启动，系统会在防重复记录落盘后，向对应账号发送一次极小的 Codex 请求，让该窗口真正开始计时；同一个窗口事件不会重复发送。
+- 当 Plus 和 Pro 账号同时存在时，Plus 的 5 小时窗口回满且周额度仍可用，系统会优先把当前使用切到 Plus，避免 Plus 额度闲置；不会把周额度已经耗尽的 Plus 当作可用账号。
+- 周期保鲜按接口返回的实际窗口识别 5H/7D，不把套餐名称硬编码成窗口类型；client/solo 模式由权威端执行，减少多机重复刷新和 refresh token 冲突。
+
+### 其他更新
+
+- Google Antigravity：原生 OAuth、模型发现、配额展示、工具调用和 Responses 协议转换更加完整。
+- Relay：支持 Kimi Coding Plan 和 DeepSeek 原生模型、5H/周额度展示，以及按模型选择当前账号。
+- 账号管理：补充 ChatGPT Desktop 邀请与奖励入口，改善订阅账号状态、Token 刷新和批量额度读取。
+- Skills：统一 Codex、Claude、Gemini、OpenCode、Grok、Kimi 与 Antigravity 的本地 Skills 管理和同步。
+- 手机锚：设置手机锚后，本机 current 不再被 Mini Mac Server 的后台 current 同步改回，仍可正常切换代理出口账号，同时保持磁盘 auth.json 绑定锚账号。
+- Windows 托盘：右键现在使用完整的原生托盘菜单，左键继续打开快捷面板。
+- 稳定性：修复 WebSocket 路由、跨账号切换、远程同步、额度接口路径和 Tauri APP 构建/签名流程中的问题。
+
 Codex Switcher 是一个面向 Codex CLI / Codex App 多账号工作流的桌面工具。它把账号管理、配额观察、本地代理、无损自动切号、中转站、Coding Plan 接入、远程账号池和 Skills 管理放在同一个 Tauri 应用里，适合长期使用 Codex CLI、Codex App，以及支持 Codex 插件的 VS Code 及其衍生 IDE 的多账号环境。
 
 **一句话：当前账号限额了，前端任务不用停，Codex Switcher 在代理层自动换号、切换中转站或接入 Coding Plan，并自动重发请求。Coding Plan 目前已支持 GLM 和 Xiaomi MiMo Token Plan，其他平台待实测。**
@@ -43,6 +63,7 @@ Codex Switcher 是一个面向 Codex CLI / Codex App 多账号工作流的桌面
 - [界面预览](#界面预览)
 - [为什么需要它](#为什么需要它)
 - [工作方式](#工作方式)
+- [v0.7.11 更新说明](#v0711-更新说明)
 - [周期保鲜](#周期保鲜v0710)
 - [推荐组合：GLM Coding Plan + glance](#推荐组合glm-coding-plan--glance)
 - [核心能力](#核心能力)
