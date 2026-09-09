@@ -74,6 +74,9 @@ Codex Switcher 是一个面向 Codex CLI / Codex App 多账号工作流的桌面
 - **可审计运行状态**：记录 Token 用量、成本、缓存收益、切号原因、会话绑定和额度周期，便于定位账号、模型或全局容量问题。
 - **跨工具 Skills 管理**：统一发现、安装和同步 Codex、Claude、Gemini、OpenCode、Grok、Kimi 与 Antigravity Skills。
 
+<details>
+<summary>历史版本能力说明</summary>
+
 - **手机锚（v0.7.0 新增）**：Codex.app 26.513+ 加了"手机远程连接"功能（手机/Codex.app 桌面端通过 ChatGPT 后端 bridge），但 bridge 鉴权绑死 `auth.json` 的 `chatgpt_account_id`，每次切号必断。手机锚把 disk 锁定在指定订阅号 —— 切到非锚账号时**磁盘不动 / proxy 出口照切**，让 Codex.app 仍以锚账号身份在线，手机端不掉线，而你的 codex CLI 实际跑在切走的那个号上。后台 4 min 独立 tick 保活锚号 token，rt 单写者保持是 Codex Switcher。详见[安装节][#手机锚phone-anchorv070]。
 - **会话路由（v0.6.0 新增）**：UI 一键把 codex 的"当前活跃会话"硬绑到指定账号 —— 这个对话强制走 GLM Coding Plan、那个对话强制走 MiMo、剩下走 ChatGPT。**绑完立刻生效**，不需要关 codex tab、不需要重启 Codex Switcher；底层用 `ws_disconnect` 踢断长连接、让 codex 自动重连进新路由。
 - **无损切号**：限额、封禁、401、全局容量不足时，代理层自动换号并重发请求，前端软件无感知。401 / 429 / 上下文超限 / token 失效 / RT 被轮换都已闭环。
@@ -90,6 +93,8 @@ Codex Switcher 是一个面向 Codex CLI / Codex App 多账号工作流的桌面
 - **周期保鲜**：所有 ChatGPT 订阅号默认自动管理，并按 `/wham/usage` 返回的 `primary_window.limit_window_seconds` 自动识别 5H 或 7D，不绑定 Plus / Pro / Team 套餐名称；可在账号行单独关闭。系统只对无法确认已激活的 100% 窗口生成一次启动事件（极小请求可能因取整仍显示 100%）；明确低于 100% 的窗口不补发。之后额度缓存跨过对应 `reset_at` 时生成下一事件。唯一权威端先持久化防重水位，再发一次极小 Codex 请求并重拉 usage。同一事件即使超时或报错也绝不自动重发；client/solo 模式只由 Server 执行。
 - **长期开发友好**：session affinity 保住 prompt cache，`prompt_cache_key` 按账号隔离，减少切号后的缓存污染。
 - **跨工具 Skills**：把 Codex/Claude/Gemini/OpenCode 的 Skills 统一发现、安装、同步。
+
+</details>
 
 ## 目录
 
