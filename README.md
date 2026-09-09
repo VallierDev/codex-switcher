@@ -8,6 +8,26 @@
 
 **中文** | [English](#english) | [Русский](#русский)
 
+> **Luna Reserve 备用额度现已支持。** 当账号的常规高级模型额度暂时耗尽时，Switcher 会识别该账号可用的 Luna Reserve，并让 `gpt-5.6-luna` 继续使用这部分独立额度，避免因误判常规额度耗尽而提前切换账号。
+
+### Luna Reserve 是什么
+
+Luna Reserve 是 OpenAI 在常规高级模型额度耗尽后，为部分账号提供的独立临时额度。它只适用于 `gpt-5.6-luna`，与普通 5 小时额度、周额度分别计算；因此普通 5H 显示为 `0%` 时，Luna Reserve 仍可能保持可用。
+
+![Luna Reserve 额度详情](docs/assets/luna-reserve-detail.png)
+
+Switcher 会从用量接口读取这项独立额度，并在账号列表中单独展示剩余比例和重置时间：
+
+![账号列表中的 Luna Reserve](docs/assets/luna-reserve-account-card.png)
+
+当 Luna Reserve 仍可用时，使用 `gpt-5.6-luna` 不会因为普通额度耗尽而自动切换账号；Reserve 耗尽、过期或明确不可用后，系统才恢复正常的切号策略。
+
+## v0.7.12 更新说明
+
+- 新增 Luna Reserve 独立额度识别与展示。
+- 当 `gpt-5.6-luna` 的 Luna Reserve 仍可用时，普通 5 小时额度耗尽不会触发自动切号。
+- Luna Reserve 不可用、耗尽或过期后，系统恢复原有的安全切号策略。
+
 ## v0.7.11 更新说明
 
 本版本是在 `v0.7.10` 基础上的一次集中更新，重点是让额度窗口真正开始滚动、提高 Plus 账号利用率，并补齐 Google/Antigravity、Kimi/DeepSeek Relay、账号邀请和跨客户端 Skills 能力。
@@ -63,6 +83,7 @@ Codex Switcher 是一个面向 Codex CLI / Codex App 多账号工作流的桌面
 - [界面预览](#界面预览)
 - [为什么需要它](#为什么需要它)
 - [工作方式](#工作方式)
+- [v0.7.12 更新说明](#v0712-更新说明)
 - [v0.7.11 更新说明](#v0711-更新说明)
 - [周期保鲜](#周期保鲜v0710)
 - [推荐组合：GLM Coding Plan + glance](#推荐组合glm-coding-plan--glance)
