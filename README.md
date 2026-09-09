@@ -59,7 +59,20 @@ Codex Switcher 是一个面向 Codex CLI / Codex App 多账号工作流的桌面
 >
 > 本项目在最终 HTTP / WebSocket 出站前会删除 Desktop 带入的旧工作区身份，并按实际选中的账号重新绑定 `Authorization` 与 `chatgpt-account-id`。因此 Desktop 可以用 Team 维持壳层登录，代理请求仍使用 Codex Switcher 当前选择的 Plus / Pro / Team / Relay 账号；切号、重试和远程 Server 转发也遵循同一规则。
 
-## 亮点
+## 亮点（当前版本）
+
+- **Luna Reserve 备用额度**：自动识别 OpenAI `gpt-reserve` 独立额度。普通高级模型额度耗尽后，只要 `gpt-5.6-luna` 的 Reserve 仍可用，就继续留在当前账号，不误触发切号；状态、剩余比例和重置时间也会单独展示。
+- **手机锚**：将 Codex.app 手机远程连接绑定的磁盘身份与代理出口账号分离，手机端保持在线，CLI/IDE 请求仍可切换到其他账号。
+- **会话级路由**：把单个 Codex 会话固定到 ChatGPT、GLM Coding Plan、MiMo 或其他 Relay，立即生效，无需重启客户端。
+- **无损自动切号**：统一处理额度耗尽、封禁、401、429、Token 失效、上下文超限和全局容量问题，并在 SSE/WS 错误到达客户端前完成重试。
+- **Desktop 身份隔离**：Codex Desktop 可继续使用 Team / Business 登录，代理请求独立使用当前账号的 Token 与 `chatgpt-account-id`，减少假 401 和错误切号。
+- **统一账号池**：集中管理 ChatGPT OAuth、OpenAI API Key、第三方 Relay、Coding Plan 和远程账号池，并支持按类型、套餐和状态筛选。
+- **多协议与模型接入**：支持原生 Responses 转发，也支持转换为 Chat Completions，接入 GLM、Xiaomi MiMo、DeepSeek、Kimi、MiniMax、通义、火山、UCloud、OpenRouter 等服务。
+- **模型级 Relay 路由**：同一 Relay 账号池可按模型选择不同当前账号，支持 WebSocket 与流式 Responses 适配。
+- **主动额度管理**：独立展示 5H/周额度、Spark、Luna Reserve、重置次数和周期状态，并按接口真实窗口识别 5H/7D。
+- **稳定的长任务代理**：提供 SSE bootstrap、流中错误检测、30 秒 keep-alive、WebSocket 双向桥接、session affinity 与 prompt cache 隔离。
+- **可审计运行状态**：记录 Token 用量、成本、缓存收益、切号原因、会话绑定和额度周期，便于定位账号、模型或全局容量问题。
+- **跨工具 Skills 管理**：统一发现、安装和同步 Codex、Claude、Gemini、OpenCode、Grok、Kimi 与 Antigravity Skills。
 
 - **手机锚（v0.7.0 新增）**：Codex.app 26.513+ 加了"手机远程连接"功能（手机/Codex.app 桌面端通过 ChatGPT 后端 bridge），但 bridge 鉴权绑死 `auth.json` 的 `chatgpt_account_id`，每次切号必断。手机锚把 disk 锁定在指定订阅号 —— 切到非锚账号时**磁盘不动 / proxy 出口照切**，让 Codex.app 仍以锚账号身份在线，手机端不掉线，而你的 codex CLI 实际跑在切走的那个号上。后台 4 min 独立 tick 保活锚号 token，rt 单写者保持是 Codex Switcher。详见[安装节][#手机锚phone-anchorv070]。
 - **会话路由（v0.6.0 新增）**：UI 一键把 codex 的"当前活跃会话"硬绑到指定账号 —— 这个对话强制走 GLM Coding Plan、那个对话强制走 MiMo、剩下走 ChatGPT。**绑完立刻生效**，不需要关 codex tab、不需要重启 Codex Switcher；底层用 `ws_disconnect` 踢断长连接、让 codex 自动重连进新路由。
@@ -181,8 +194,8 @@ Codex Switcher 内置一个 OpenAI 兼容的 `chat/completions` 入站端点：�
 - **端点**：`POST http://<host>:18080/v1/chat/completions`（本机用 `localhost:18080`；局域网其它机器指向本机内网 IP）。
 - **接法**：客户端 `base_url` 指向上面、`model` 设 `gpt-5.3-codex-spark`，`api_key` 随便填（桥接用账号自身 token，忽略传入 key）。
 - **工具调用**：完整支持 function calling 多轮往返（chat `tool_calls` ⇄ responses `function_call` / `function_call_output`），glance sub-agent、hermes agent loop 都能透明使用。
-- **视觉自动切换**：Spark 不支持图片；请求带图时桥接自动改用 `gpt-5.4-mini`（有视觉、对主额度消耗更小），纯文本仍走 Spark 的独立免费桶。
-- **省额度**：文本 → Spark（独立闲置桶，不碰主 5h/周）；视觉 → gpt-5.4-mini。
+- **视觉自动切换**：Spark 不支持图片；请求带图时桥接自动改用可配置的视觉模型，默认使用 `gpt-5.6-luna`，纯文本仍走 Spark 的独立免费桶。
+- **省额度**：文本 → Spark（独立闲置桶，不碰主 5h/周）；视觉 → Luna Reserve（可用时不切号）。
 
 > 例：glance 后端 `base_url=http://localhost:18080/v1`、`model=gpt-5.3-codex-spark`；hermes 在 `config.yaml` 用 `provider: custom` + 同样的 base_url/model。多客户端共用同一个 Pro 账号的 Spark 桶，账号列表的 Spark 限额可用来盯用量。
 
