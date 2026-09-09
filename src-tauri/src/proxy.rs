@@ -2332,6 +2332,25 @@ fn current_has_luna_reserve(state: &ProxyState) -> bool {
         .is_some_and(|reserve| reserve.is_available_for("gpt-5.6-luna"))
 }
 
+fn mark_current_luna_reserve_depleted(state: &ProxyState) {
+    if let Ok(mut store) = state.store.lock() {
+        if let Some(current_id) = store.current.clone() {
+            if let Some(account) = store.accounts.get_mut(&current_id) {
+                if let Some(reserve) = account
+                    .cached_quota
+                    .as_mut()
+                    .and_then(|quota| quota.luna_reserve.as_mut())
+                {
+                    reserve.limit_reached = true;
+                    reserve.used_percent = 100;
+                    let _ = store.save();
+                    println!("[Proxy] 当前账号 Luna Reserve 已由上游确认耗尽");
+                }
+            }
+        }
+    }
+}
+
 /// 429 冷却时长（秒）：撞限额后多久内不再选中该号。10min 足以打断「5min 额度刷新
 /// 把 cached 重置 → 立刻又选中 → 又 429」的来回切号；真没额度的号 10min 后再试也无妨。
 const QUOTA_COOLDOWN_SECS: i64 = 600;
@@ -7231,7 +7250,16 @@ async fn bridge_websockets<S1, S2>(
                         } else if ws_is_luna_reserve_r.load(std::sync::atomic::Ordering::Relaxed)
                             && current_has_luna_reserve(&state_clone)
                         {
-                            println!("[Proxy] WebSocket Luna Reserve 可用，不切号，仅关闭此 WS");
+                            // The cached usage may lag behind the upstream decision. A real
+                            // usage_limit_reached is authoritative: mark Reserve depleted and
+                            // switch so Codex reconnects with a usable account instead of
+                            // leaving its send button disabled on a dead WebSocket.
+                            mark_current_luna_reserve_depleted(&state_clone);
+                            mark_current_quota_depleted(&state_clone);
+                            if let PickResult::Found { id, .. } = pick_next_account(&state_clone) {
+                                let _ = do_switch(&state_clone, &id, SwitchReason::WebSocketRateLimit);
+                            }
+                            println!("[Proxy] WebSocket Luna Reserve 已耗尽，切号并关闭此 WS");
                         } else {
                             println!("[Proxy] WebSocket 单号限额，静默切号 + 关 WS");
                             mark_current_quota_depleted(&state_clone);
