@@ -6129,6 +6129,17 @@ async fn handle_websocket(
         Err(e) => return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE, &e)),
     };
 
+    // Codex Desktop sends the model routing hint on the upgrade request, before
+    // the first response.create frame arrives. Use it so Luna Reserve can skip
+    // the ordinary-quota precheck switch instead of being moved to another account.
+    let luna_reserve_requested =
+        routing_hint_model(req.headers())
+            .as_deref()
+            .is_some_and(|model| {
+                model.eq_ignore_ascii_case("gpt-reserve")
+                    || model.eq_ignore_ascii_case("gpt-5.6-luna")
+            });
+
     // 预检：如果当前账号没额度，先切号再连接
     {
         let should_switch = {
@@ -6163,7 +6174,7 @@ async fn handle_websocket(
             }
         };
 
-        if should_switch {
+        if should_switch && !(luna_reserve_requested && current_has_luna_reserve(&state)) {
             println!("[Proxy] WebSocket 预检：当前账号无额度，尝试切号...");
             // 最多尝试 3 个候选号，查 API 确认有额度才切
             for _attempt in 0..3 {
@@ -8536,6 +8547,14 @@ mod tests {
         assert!(model_ws_body(r#"{"type":"session.update"}"#, Some(&hint))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn reserve_routing_hint_is_recognized_before_first_websocket_frame() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-codex-routing-hint", "model=gpt-reserve".parse().unwrap());
+        let hint = routing_hint_model(&headers).unwrap();
+        assert!(hint.eq_ignore_ascii_case("gpt-reserve"));
     }
 
     #[test]
