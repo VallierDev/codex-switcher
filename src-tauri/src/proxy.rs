@@ -2710,7 +2710,12 @@ async fn handle_chat_inbound(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let default_model = "gpt-5.3-codex-spark";
-    let mut responses_body = crate::chat_inbound::chat_to_responses(&chat, default_model);
+    let vision_model = crate::chat_inbound::configured_vision_model();
+    let mut responses_body = crate::chat_inbound::chat_to_responses_with_vision_model(
+        &chat,
+        default_model,
+        &vision_model,
+    );
     let sid = uuid::Uuid::new_v4().to_string();
     if responses_body.get("prompt_cache_key").is_none() {
         responses_body["prompt_cache_key"] = serde_json::Value::String(sid.clone());

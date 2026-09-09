@@ -12,11 +12,17 @@
 
 use serde_json::{json, Value};
 
-/// 有图时强制改用的视觉模型。实测：`gpt-5.3-codex-spark` 不支持图片输入（400
-/// "does not support image inputs"）；`gpt-5.4-mini` / `gpt-5.4` / `gpt-5.5` 同端点
-/// 都支持视觉。选 mini —— 视觉是偶尔用，mini 对主 5h/周额度消耗最小（文本仍走
-/// Spark 的独立免费桶）。glance image_describe 发 glm-4.5v+图 → 这里自动改成它。
-pub const VISION_MODEL: &str = "gpt-5.4-mini";
+/// 有图时默认使用的视觉模型。
+pub const DEFAULT_VISION_MODEL: &str = "gpt-5.6-luna";
+/// 可通过环境变量覆盖视觉模型，便于运行时切换而无需重新编译。
+pub const VISION_MODEL_ENV: &str = "CODEX_SWITCHER_VISION_MODEL";
+
+pub fn configured_vision_model() -> String {
+    std::env::var(VISION_MODEL_ENV)
+        .ok()
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_VISION_MODEL.to_string())
+}
 
 /// 解析一条 message 的 content（字符串 或 OpenAI 数组形态），返回
 /// (拼接文本, 图片 data-url 列表)。
@@ -57,8 +63,16 @@ fn content_parts(content: &Value) -> (String, Vec<String>) {
 
 /// 把 OpenAI chat/completions 请求体翻成 Codex responses 请求体。
 /// `fallback_model` 在请求未带 model 时使用（默认应传 gpt-5.3-codex-spark）。
-/// 若请求含图片，自动把 model 改成 [`VISION_MODEL`]（Spark 无视觉）。
+/// 若请求含图片，自动把 model 改成传入的视觉模型（Spark 无视觉）。
 pub fn chat_to_responses(chat: &Value, fallback_model: &str) -> Value {
+    chat_to_responses_with_vision_model(chat, fallback_model, DEFAULT_VISION_MODEL)
+}
+
+pub fn chat_to_responses_with_vision_model(
+    chat: &Value,
+    fallback_model: &str,
+    vision_model: &str,
+) -> Value {
     let mut model = chat
         .get("model")
         .and_then(|m| m.as_str())
@@ -148,7 +162,7 @@ pub fn chat_to_responses(chat: &Value, fallback_model: &str) -> Value {
     }
     // 有图 → 强制视觉模型（Spark/glm-4.5v 在 codex 端都不支持图片）
     if has_image {
-        model = VISION_MODEL.to_string();
+        model = vision_model.to_string();
     }
 
     if instructions.trim().is_empty() {
@@ -457,11 +471,24 @@ mod tests {
             ]}]
         });
         let r = chat_to_responses(&chat, "gpt-5.3-codex-spark");
-        assert_eq!(r["model"], "gpt-5.4-mini"); // 自动切视觉模型
+        assert_eq!(r["model"], DEFAULT_VISION_MODEL); // 自动切视觉模型
         let content = r["input"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "input_text");
         assert_eq!(content[1]["type"], "input_image");
         assert_eq!(content[1]["image_url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn image_vision_model_can_be_overridden() {
+        let chat = json!({
+            "model": "gpt-5.3-codex-spark",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+            ]}]
+        });
+        let r = chat_to_responses_with_vision_model(&chat, "fallback", "custom-vision");
+        assert_eq!(r["model"], "custom-vision");
     }
 
     #[test]
