@@ -1486,6 +1486,7 @@ async fn switch_account(
                         is_valid_for_cli: usage.is_valid_for_cli,
                         reset_credits: usage.reset_credits,
                         spark: usage.spark.clone(),
+                        luna_reserve: usage.luna_reserve.clone(),
                         updated_at: chrono::Utc::now(),
                     });
                     if let Err(e) = store.save() {
@@ -2181,6 +2182,7 @@ fn cached_quota_from_usage(usage: &usage::UsageDisplay) -> account::CachedQuota 
         is_valid_for_cli: usage.is_valid_for_cli,
         reset_credits: usage.reset_credits,
         spark: usage.spark.clone(),
+        luna_reserve: usage.luna_reserve.clone(),
         updated_at: chrono::Utc::now(),
     }
 }
@@ -3424,6 +3426,7 @@ fn usage_to_cached(u: &UsageDisplay) -> crate::account::CachedQuota {
         is_valid_for_cli: u.is_valid_for_cli,
         reset_credits: u.reset_credits,
         spark: u.spark.clone(),
+        luna_reserve: u.luna_reserve.clone(),
         updated_at: Utc::now(),
     }
 }
@@ -4023,6 +4026,7 @@ async fn get_quota_by_id(
                 is_valid_for_cli: usage.is_valid_for_cli,
                 reset_credits: usage.reset_credits,
                 spark: usage.spark.clone(),
+                luna_reserve: usage.luna_reserve.clone(),
                 updated_at: Utc::now(),
             });
             // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
@@ -4050,6 +4054,7 @@ async fn get_quota_by_id(
                 is_valid_for_cli: usage.is_valid_for_cli,
                 reset_credits: usage.reset_credits,
                 spark: usage.spark.clone(),
+                luna_reserve: usage.luna_reserve.clone(),
                 updated_at: Utc::now(),
             });
             // quota 拉到了 = token 没过期，清掉历史 stale 失效标记
@@ -6470,6 +6475,7 @@ mod tests {
             is_valid_for_cli: true,
             reset_credits: None,
             spark: None,
+            luna_reserve: None,
             updated_at: now - chrono::Duration::minutes(5),
         });
 
@@ -6501,6 +6507,7 @@ mod tests {
             is_valid_for_cli: true,
             reset_credits: None,
             spark: None,
+            luna_reserve: None,
             updated_at: now - chrono::Duration::minutes(5),
         });
         account.window_priming.five_hour_enabled = true;
@@ -6602,6 +6609,7 @@ mod tests {
             is_valid_for_cli: true,
             reset_credits: None,
             spark: None,
+            luna_reserve: None,
             updated_at: now - chrono::Duration::minutes(5),
         });
 
@@ -6639,6 +6647,7 @@ mod tests {
             is_valid_for_cli: true,
             reset_credits: None,
             spark: None,
+            luna_reserve: None,
             updated_at: now,
         });
 
@@ -6661,6 +6670,7 @@ mod tests {
             is_valid_for_cli: true,
             reset_credits: None,
             spark: None,
+            luna_reserve: None,
             updated_at: now,
         });
 
@@ -6804,6 +6814,7 @@ mod tests {
             is_valid_for_cli: true,
             reset_credits: None,
             spark: None,
+            luna_reserve: None,
             updated_at: now,
         };
 

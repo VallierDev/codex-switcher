@@ -647,6 +647,9 @@ pub struct CachedQuota {
     /// Spark 独立限额窗口（仅有 Spark 的号；老数据/free=None）
     #[serde(default)]
     pub spark: Option<crate::usage::SparkWindows>,
+    /// Luna Reserve 独立限额（老数据无此字段）。
+    #[serde(default)]
+    pub luna_reserve: Option<crate::usage::LunaReserveWindow>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -766,7 +769,9 @@ impl AccountStore {
         if store.ensure_current_antigravity_account() {
             let _ = store.save();
         }
-        if crate::relay_catalog::ensure_currents(&mut store) { let _ = store.save(); }
+        if crate::relay_catalog::ensure_currents(&mut store) {
+            let _ = store.save();
+        }
 
         store
     }

@@ -2299,6 +2299,39 @@ fn request_is_spark_model(body: &[u8]) -> bool {
             .any(|w| w == SPARK_MODEL_ID)
 }
 
+fn current_has_luna_reserve_for_request(state: &ProxyState, body: &[u8]) -> bool {
+    let Some(model) = request_model(body) else {
+        return false;
+    };
+    let Ok(store) = state.store.lock() else {
+        return false;
+    };
+    let Some(current_id) = store.current.as_deref() else {
+        return false;
+    };
+    store
+        .accounts
+        .get(current_id)
+        .and_then(|account| account.cached_quota.as_ref())
+        .and_then(|quota| quota.luna_reserve.as_ref())
+        .is_some_and(|reserve| reserve.is_available_for(&model))
+}
+
+fn current_has_luna_reserve(state: &ProxyState) -> bool {
+    let Ok(store) = state.store.lock() else {
+        return false;
+    };
+    let Some(current_id) = store.current.as_deref() else {
+        return false;
+    };
+    store
+        .accounts
+        .get(current_id)
+        .and_then(|account| account.cached_quota.as_ref())
+        .and_then(|quota| quota.luna_reserve.as_ref())
+        .is_some_and(|reserve| reserve.is_available_for("gpt-5.6-luna"))
+}
+
 /// 429 冷却时长（秒）：撞限额后多久内不再选中该号。10min 足以打断「5min 额度刷新
 /// 把 cached 重置 → 立刻又选中 → 又 429」的来回切号；真没额度的号 10min 后再试也无妨。
 const QUOTA_COOLDOWN_SECS: i64 = 600;
@@ -3645,6 +3678,14 @@ async fn handle_request(
                 .body(full_body(resp_bytes))
                 .unwrap_or_else(|_| error_response(StatusCode::TOO_MANY_REQUESTS, "429")));
         }
+        if current_has_luna_reserve_for_request(&state, &body_bytes) {
+            println!("[Proxy] Luna Reserve 可用，429 不切号，仅关闭本次请求");
+            return Ok(Response::builder()
+                .status(429)
+                .header("content-type", "application/json")
+                .body(full_body(resp_bytes))
+                .unwrap_or_else(|_| error_response(StatusCode::TOO_MANY_REQUESTS, "429")));
+        }
         let body_lower = String::from_utf8_lossy(&resp_bytes).to_lowercase();
         let is_capacity = body_lower.contains("server_is_overloaded")
             || body_lower.contains("slow_down")
@@ -3892,7 +3933,9 @@ async fn handle_request(
         // 后台检查预防性切号（保持原行为）
         let state_clone = state.clone();
         tokio::spawn(async move {
-            if should_preemptive_switch(&state_clone) {
+            if should_preemptive_switch(&state_clone)
+                && !current_has_luna_reserve_for_request(&state_clone, &body_bytes)
+            {
                 if state_clone
                     .switching
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -3918,7 +3961,9 @@ async fn handle_request(
     // 后台检查预防性切号
     let state_clone = state.clone();
     tokio::spawn(async move {
-        if should_preemptive_switch(&state_clone) {
+        if should_preemptive_switch(&state_clone)
+            && !current_has_luna_reserve_for_request(&state_clone, &body_bytes)
+        {
             if state_clone
                 .switching
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -5601,6 +5646,10 @@ async fn bootstrap_loop_task(
                             }
                             match classify_sse_error(&tail_buf) {
                                 SseErrorClass::PerAccountLimit => {
+                                    if current_has_luna_reserve_for_request(&state, &body) {
+                                        println!("[Proxy] mid-stream Luna Reserve 可用，不切号，结束本次流让 codex 重试");
+                                        return;
+                                    }
                                     println!("[Proxy] mid-stream 检测到 per-account 限额，截断流不转发原文，codex 会自动 retry");
                                     mark_current_quota_depleted(&state);
                                     return; // tx drop → client 看到 stream 意外结束 → codex retry
@@ -5634,6 +5683,10 @@ async fn bootstrap_loop_task(
                 }
             }
             SseBootstrap::RateLimitInStream => {
+                if current_has_luna_reserve_for_request(&state, &body) {
+                    println!("[Proxy] SSE Luna Reserve 可用，不切号，结束本次流让 codex 重试");
+                    return;
+                }
                 println!("[Proxy] SSE 流前缀检测到限额事件（response.failed），无损切号重发");
                 mark_current_quota_depleted(&state);
                 attempts += 1;
@@ -6187,6 +6240,7 @@ async fn handle_websocket(
                                                 is_valid_for_cli: usage.is_valid_for_cli,
                                                 reset_credits: usage.reset_credits,
                                                 spark: usage.spark.clone(),
+                                                luna_reserve: usage.luna_reserve.clone(),
                                                 updated_at: chrono::Utc::now(),
                                             });
                                             let _ = store.save();
@@ -6978,6 +7032,9 @@ async fn bridge_websockets<S1, S2>(
     let ws_is_spark = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ws_is_spark_w = ws_is_spark.clone();
     let ws_is_spark_r = ws_is_spark.clone();
+    let ws_is_luna_reserve = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ws_is_luna_reserve_w = ws_is_luna_reserve.clone();
+    let ws_is_luna_reserve_r = ws_is_luna_reserve.clone();
 
     // 诊断：每边的帧计数，用于定位"bridge 立刻退出"（Broken pipe 重连噪声）。
     let c2u_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -6993,6 +7050,9 @@ async fn bridge_websockets<S1, S2>(
                 if let tungstenite::Message::Text(ref text) = message {
                     if request_is_spark_model(text.as_bytes()) {
                         ws_is_spark_w.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if current_has_luna_reserve_for_request(&state, text.as_bytes()) {
+                        ws_is_luna_reserve_w.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     if let Some(session_key) = crate::session_affinity::extract_session_key(
                         text.as_bytes(),
@@ -7038,6 +7098,11 @@ async fn bridge_websockets<S1, S2>(
                             && request_is_spark_model(t.as_bytes())
                         {
                             ws_is_spark_w.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if !ws_is_luna_reserve_w.load(std::sync::atomic::Ordering::Relaxed)
+                            && current_has_luna_reserve_for_request(&state, t.as_bytes())
+                        {
+                            ws_is_luna_reserve_w.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         if ws_session_key_w
                             .lock()
@@ -7152,6 +7217,10 @@ async fn bridge_websockets<S1, S2>(
                             println!(
                                 "[Proxy] WebSocket Spark 模型 429（Pro 子限额耗尽），不切号，仅关此 Spark WS"
                             );
+                        } else if ws_is_luna_reserve_r.load(std::sync::atomic::Ordering::Relaxed)
+                            && current_has_luna_reserve(&state_clone)
+                        {
+                            println!("[Proxy] WebSocket Luna Reserve 可用，不切号，仅关闭此 WS");
                         } else {
                             println!("[Proxy] WebSocket 单号限额，静默切号 + 关 WS");
                             mark_current_quota_depleted(&state_clone);

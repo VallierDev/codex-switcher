@@ -16,6 +16,7 @@ export interface CachedQuota {
     is_valid_for_cli?: boolean;
     reset_credits?: number | null;
     spark?: SparkWindows | null;
+    luna_reserve?: LunaReserveWindow | null;
     updated_at: string;
 }
 
@@ -26,6 +27,15 @@ export interface SparkWindows {
     weekly_left: number;
     weekly_reset: string;
     weekly_reset_at?: number;
+}
+
+export interface LunaReserveWindow {
+    normal_model_slug: string;
+    allowed: boolean;
+    limit_reached: boolean;
+    used_percent: number;
+    reset_after_seconds?: number | null;
+    reset_at?: number | null;
 }
 
 export interface AppSettings {

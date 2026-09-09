@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { Account, RelayUsageCache } from './useAccounts';
+import type { Account, LunaReserveWindow, RelayUsageCache } from './useAccounts';
 
 export interface UsageDisplay {
     plan_type: string;
@@ -16,6 +16,7 @@ export interface UsageDisplay {
     has_credits: boolean;
     reset_credits?: number | null;
     spark?: SparkWindows | null;
+    luna_reserve?: LunaReserveWindow | null;
 }
 
 export interface SparkWindows {

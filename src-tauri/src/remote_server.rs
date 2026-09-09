@@ -961,6 +961,7 @@ async fn handle_upsert(state: &ApiState, req: Request<Incoming>) -> Response<Res
                             is_valid_for_cli: usage.is_valid_for_cli,
                             reset_credits: usage.reset_credits,
                             spark: usage.spark.clone(),
+                            luna_reserve: usage.luna_reserve.clone(),
                             updated_at: chrono::Utc::now(),
                         });
                         acc.is_banned = false;
@@ -1168,6 +1169,7 @@ async fn handle_refresh_account(state: &ApiState, id: &str) -> Response<Response
                         is_valid_for_cli: usage.is_valid_for_cli,
                         reset_credits: usage.reset_credits,
                         spark: usage.spark.clone(),
+                        luna_reserve: usage.luna_reserve.clone(),
                         updated_at: chrono::Utc::now(),
                     });
                     acc.is_banned = false;

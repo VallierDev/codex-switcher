@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge, UserPlus } from 'lucide-react';
-import { Account, AppSettings, RelayUsageCache, SparkWindows, effectiveKind } from '../hooks/useAccounts';
+import { Account, AppSettings, LunaReserveWindow, RelayUsageCache, SparkWindows, effectiveKind } from '../hooks/useAccounts';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { AntigravityQuota, type AntigravityModelQuota } from './AntigravityQuota';
@@ -152,6 +152,7 @@ interface UsageData {
     is_valid_for_cli: boolean;
     reset_credits?: number | null;
     spark?: SparkWindows | null;
+    luna_reserve?: LunaReserveWindow | null;
 }
 
 type FilterType = 'all' | 'sub' | 'google' | 'plus' | 'pro' | 'team' | 'free' | 'relay' | 'coding_plan' | 'third_party';
@@ -402,6 +403,7 @@ export function AccountList({
                     is_valid_for_cli: isValid,
                     reset_credits: acc.cached_quota.reset_credits,
                     spark: acc.cached_quota.spark,
+                    luna_reserve: acc.cached_quota.luna_reserve,
                 };
                 if (!isValid) initialInvalids.add(acc.id);
             }
@@ -1047,6 +1049,14 @@ export function AccountList({
                                                     <QuotaItem label="Spark 5H" percentage={usage.spark.five_hour_left} reset={usage.spark.five_hour_reset} resetAt={usage.spark.five_hour_reset_at} />
                                                     <QuotaItem label="Spark 周" percentage={usage.spark.weekly_left} reset={usage.spark.weekly_reset} resetAt={usage.spark.weekly_reset_at} />
                                                 </>
+                                            )}
+                                            {usage.luna_reserve?.allowed && !usage.luna_reserve.limit_reached && (
+                                                <QuotaItem
+                                                    label="Luna Reserve"
+                                                    percentage={Math.max(0, 100 - usage.luna_reserve.used_percent)}
+                                                    reset=""
+                                                    resetAt={usage.luna_reserve.reset_at ?? undefined}
+                                                />
                                             )}
                                         </div>
                                     ) : <span className="quota-empty">未获取数据</span>}

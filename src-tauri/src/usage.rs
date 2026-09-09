@@ -39,6 +39,26 @@ pub struct SparkWindows {
     pub weekly_reset_at: Option<i64>,
 }
 
+/// OpenAI 临时 Luna Reserve 独立额度窗口。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LunaReserveWindow {
+    pub normal_model_slug: String,
+    pub allowed: bool,
+    pub limit_reached: bool,
+    pub used_percent: i32,
+    pub reset_after_seconds: Option<i64>,
+    pub reset_at: Option<i64>,
+}
+
+impl LunaReserveWindow {
+    pub fn is_available_for(&self, model: &str) -> bool {
+        self.normal_model_slug.eq_ignore_ascii_case(model)
+            && self.allowed
+            && !self.limit_reached
+            && self.used_percent < 100
+    }
+}
+
 /// 前端展示的用量数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageDisplay {
@@ -77,6 +97,9 @@ pub struct UsageDisplay {
     /// Spark 独立限额窗口（仅 Pro 等有 Spark 的号；free=None）
     #[serde(default)]
     pub spark: Option<SparkWindows>,
+    /// Luna Reserve 独立限额（通常对应 gpt-5.6-luna）。
+    #[serde(default)]
+    pub luna_reserve: Option<LunaReserveWindow>,
     /// Token 是否对 CLI 有效 (api.openai.com)
     pub is_valid_for_cli: bool,
 }
@@ -409,6 +432,42 @@ impl UsageFetcher {
                 }
             });
 
+        let luna_reserve = json
+            .get("additional_rate_limits")
+            .and_then(|a| a.as_array())
+            .and_then(|arr| {
+                arr.iter().find(|e| {
+                    e.get("limit_name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| n.eq_ignore_ascii_case("gpt-reserve"))
+                        .unwrap_or(false)
+                })
+            })
+            .and_then(|e| {
+                let rl = e.get("rate_limit")?;
+                let (used, _reset, _label, reset_at, _) =
+                    Self::parse_window(rl.get("primary_window"), "Luna Reserve");
+                Some(LunaReserveWindow {
+                    normal_model_slug: e
+                        .get("normal_model_slug")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("gpt-5.6-luna")
+                        .to_string(),
+                    allowed: rl.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false),
+                    limit_reached: rl
+                        .get("limit_reached")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                    used_percent: used,
+                    reset_after_seconds: rl
+                        .get("primary_window")
+                        .and_then(|w| w.get("reset_after_seconds"))
+                        .and_then(Self::parse_number)
+                        .map(|v| v as i64),
+                    reset_at,
+                })
+            });
+
         Ok(UsageDisplay {
             plan_type,
             five_hour_used: p_used,
@@ -427,6 +486,7 @@ impl UsageFetcher {
             has_credits: has_credits || unlimited,
             reset_credits,
             spark,
+            luna_reserve,
             is_valid_for_cli: true,
         })
     }
@@ -1796,6 +1856,30 @@ mod tests {
     fn glm_quota_skips_when_code_not_200() {
         let body = json!({"code": 401, "message": "unauthorized"});
         assert!(parse_glm_quota(body).is_none());
+    }
+
+    #[test]
+    fn luna_reserve_is_parsed_as_an_independent_model_window() {
+        let body = json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {"used_percent": 100, "limit_window_seconds": 18000},
+                "secondary_window": {"used_percent": 67, "limit_window_seconds": 604800}
+            },
+            "additional_rate_limits": [{
+                "limit_name": "gpt-reserve",
+                "normal_model_slug": "gpt-5.6-luna",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {"used_percent": 3, "reset_after_seconds": 604631}
+                }
+            }]
+        });
+        let usage = UsageFetcher::parse_usage_response(&body).unwrap();
+        let reserve = usage.luna_reserve.unwrap();
+        assert!(reserve.is_available_for("gpt-5.6-luna"));
+        assert!(!reserve.is_available_for("gpt-5.5"));
     }
 
     #[test]

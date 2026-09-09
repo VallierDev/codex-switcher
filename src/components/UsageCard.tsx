@@ -71,6 +71,22 @@ export function UsageCard({ usage, loading, error, onRefresh }: UsageCardProps) 
                 </>
             )}
 
+            {usage.luna_reserve?.allowed && !usage.luna_reserve.limit_reached && (
+                <>
+                    <div className="usage-row">
+                        <span className="usage-label">Luna Reserve</span>
+                        <span className="usage-reset">{usage.luna_reserve.reset_at ? new Date(usage.luna_reserve.reset_at * 1000).toLocaleString() : ''}</span>
+                        <span className="usage-percent">{Math.max(0, 100 - usage.luna_reserve.used_percent)}%</span>
+                    </div>
+                    <div className="meter-bar">
+                        <div
+                            className={`meter-fill ${getColorClass(100 - usage.luna_reserve.used_percent)}`}
+                            style={{ width: `${Math.max(0, 100 - usage.luna_reserve.used_percent)}%` }}
+                        />
+                    </div>
+                </>
+            )}
+
             {/* 额度 */}
             {usage.has_credits && usage.credits_balance !== null && (
                 <div className="usage-credits">
