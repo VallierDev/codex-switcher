@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Zap } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { getVersion } from '@tauri-apps/api/app';
 import { listen } from '@tauri-apps/api/event';
 import { save } from '@tauri-apps/plugin-dialog';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
@@ -62,6 +63,13 @@ function App() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [showRelayModal, setShowRelayModal] = useState(false);
   const [schedulerError, setSchedulerError] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => setAppVersion(null));
+  }, []);
 
   // 冲突确认弹窗状态
   const [showConflictModal, setShowConflictModal] = useState(false);
@@ -301,7 +309,7 @@ function App() {
           <div className="app-logo">
             <Zap size={18} />
           </div>
-          <h1>Codex Switcher <span className="app-version">v0.7.11</span></h1>
+          <h1>Codex Switcher <span className="app-version">{appVersion ? `v${appVersion}` : 'v—'}</span></h1>
           <div className={`proxy-indicator ${proxyRunning ? 'on' : 'off'}`} title={proxyRunning ? '代理运行中' : '代理未启动'}>
             <span className="proxy-dot" />
             {proxyRunning ? 'Proxy ON' : 'Proxy OFF'}
