@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { OAuthLink } from './OAuthLink';
 import { listen, emit } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
@@ -81,6 +82,21 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
     const [showPasteInput, setShowPasteInput] = useState(false);
     const [callbackInput, setCallbackInput] = useState('');
     const [submittingCallback, setSubmittingCallback] = useState(false);
+    const [authLink, setAuthLink] = useState<{ url: string; provider: 'openai' | 'google' } | null>(null);
+    const [copyingLink, setCopyingLink] = useState(false);
+    const [linkCopyError, setLinkCopyError] = useState<string | null>(null);
+    const linkGeneration = useRef(0);
+
+    useEffect(() => {
+        if (!isOpen) {
+            linkGeneration.current++;
+            setAuthLink(null);
+            setCopyingLink(false);
+            setLinkCopyError(null);
+            setLoading(false);
+        }
+        return () => { linkGeneration.current++; };
+    }, [isOpen]);
     // 批量导入
     const [bulkBusy, setBulkBusy] = useState(false);
     const [bulkResult, setBulkResult] = useState<BulkImportResult | null>(null);
@@ -280,30 +296,47 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
         }
     };
 
-    // 复制授权链接（不开默认浏览器，让用户自己选要用哪个浏览器粘贴）
-    const handleCopyOAuthLink = async () => {
-        setLoading(true);
-        setError(null);
-        setOauthStatus('正在生成授权链接...');
-
+    const copyPreparedLink = async (url: string, generation: number) => {
+        setCopyingLink(true);
+        setLinkCopyError(null);
         try {
-            const url = await startOAuthLogin(false);
-            // 走后端 pbcopy 而不是 navigator.clipboard：webview 跨 await 后 user-gesture 失效会触发 NotAllowedError
-            try {
-                await invoke('copy_to_clipboard', { text: url });
+            await invoke('copy_to_clipboard', { text: url });
+            if (generation === linkGeneration.current) {
                 setOauthStatus('授权链接已复制，请粘贴到目标浏览器完成授权，回调会自动回到本应用...');
-            } catch (copyErr) {
-                // 复制失败也别卡住流程：把 URL 显示出来让用户手动复制
-                setCallbackInput(url);
-                setShowPasteInput(false);
-                setOauthStatus(`复制到剪贴板失败（${String(copyErr)}），请手动复制：\n${url}`);
             }
         } catch (err) {
-            setError(String(err));
-            setOauthStatus('');
-            setLoading(false);
+            if (generation === linkGeneration.current) {
+                setLinkCopyError(String(err));
+                setOauthStatus('自动复制失败。请在下方选择完整链接手动复制，或重试复制。');
+            }
+        } finally {
+            if (generation === linkGeneration.current) setCopyingLink(false);
         }
     };
+
+    const prepareOAuthLink = async (provider: 'openai' | 'google') => {
+        const generation = ++linkGeneration.current;
+        setLoading(true);
+        setError(null);
+        setAuthLink(null);
+        setLinkCopyError(null);
+        setOauthStatus('正在生成授权链接...');
+        try {
+            const url = provider === 'openai'
+                ? await startOAuthLogin(false)
+                : await invoke<string>('start_antigravity_oauth_login', { openBrowser: false });
+            if (generation !== linkGeneration.current) return;
+            setAuthLink({ url, provider });
+            await copyPreparedLink(url, generation);
+        } catch (err) {
+            if (generation === linkGeneration.current) {
+                setError(String(err));
+                setOauthStatus('');
+                setLoading(false);
+            }
+        }
+    };
+    const handleCopyOAuthLink = () => prepareOAuthLink('openai');
 
     const handleAntigravityLogin = async () => {
         setLoading(true);
@@ -319,26 +352,13 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
         }
     };
 
-    const handleCopyAntigravityOAuthLink = async () => {
-        setLoading(true);
-        setError(null);
-        setOauthStatus('正在生成 Google 授权链接...');
-        try {
-            const url = await invoke<string>('start_antigravity_oauth_login', { openBrowser: false });
-            try {
-                await invoke('copy_to_clipboard', { text: url });
-                setOauthStatus('Google 授权链接已复制，请粘贴到目标浏览器完成授权...');
-            } catch (copyError) {
-                setOauthStatus(`复制到剪贴板失败（${String(copyError)}），请手动复制：\n${url}`);
-            }
-        } catch (err) {
-            setError(String(err));
-            setOauthStatus('');
-            setLoading(false);
-        }
-    };
+    const handleCopyAntigravityOAuthLink = () => prepareOAuthLink('google');
 
     const handleClose = () => {
+        linkGeneration.current++;
+        setAuthLink(null);
+        setLinkCopyError(null);
+        setCopyingLink(false);
         // OAuth 进行中也允许关闭：后端 oauth_server 下次 start 时会 abort 旧任务，无需显式取消
         setName('');
         setNotes('');
@@ -802,7 +822,7 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                                 onClick={handleAntigravityLogin}
                                 disabled={loading}
                             >
-                                {loading ? '处理中...' : '连接 Google 账号'}
+                                {authLink ? '等待浏览器授权…' : loading ? '处理中...' : '连接 Google 账号'}
                             </button>
                             <button
                                 className="btn btn-ghost btn-full"
@@ -818,6 +838,8 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                                 <button className="btn btn-ghost btn-full" style={{ marginTop: '12px' }} onClick={handleClose}>取消</button>
                             )}
                             {oauthStatus && <div className="oauth-status">{oauthStatus}</div>}
+                            {authLink?.provider === 'google' && <OAuthLink url={authLink.url} error={linkCopyError}
+                                copying={copyingLink} onCopy={() => void copyPreparedLink(authLink.url, linkGeneration.current)} />}
                             {error && <div className="error-message" style={{ marginTop: '16px' }}>{error}</div>}
                         </div>
                     ) : activeTab === 'official' ? (
@@ -876,7 +898,7 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                                 onClick={handleOpenAILogin}
                                 disabled={loading}
                             >
-                                {loading && oauthStatus ? '处理中...' : '立即登录 OpenAI'}
+                                {authLink ? '等待浏览器授权…' : loading && oauthStatus ? '处理中...' : '立即登录 OpenAI'}
                             </button>
 
                             <button
@@ -901,6 +923,8 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
                             )}
 
                             {oauthStatus && <div className="oauth-status">{oauthStatus}</div>}
+                            {authLink?.provider === 'openai' && <OAuthLink url={authLink.url} error={linkCopyError}
+                                copying={copyingLink} onCopy={() => void copyPreparedLink(authLink.url, linkGeneration.current)} />}
                             {error && <div className="error-message" style={{ marginTop: '16px' }}>{error}</div>}
 
                             <div style={{ marginTop: '16px', fontSize: '12px', color: 'var(--text-tertiary)', textAlign: 'center' }}>
