@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Copy, Check, Save } from 'lucide-react';
 import './Proxy.css';
+import { isMacOS } from '../platform';
 
 interface ProxyStatus {
     enabled: boolean;
@@ -412,7 +413,8 @@ export function Proxy() {
                     <label className="toggle">
                         <input
                             type="checkbox"
-                            checked={settings?.notify_on_switch ?? false}
+                            checked={isMacOS && (settings?.notify_on_switch ?? false)}
+                            disabled={!isMacOS}
                             onChange={async e => {
                                 if (!settings) return;
                                 const updated = { ...settings, notify_on_switch: e.target.checked };

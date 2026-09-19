@@ -20,6 +20,7 @@ import CachePanel from './components/CachePanel';
 import { ConfirmModal } from './components/ConfirmModal';
 import { RelayImportConfirm } from './components/RelayImportConfirm';
 import './App.css';
+import { isMacOS } from './platform';
 
 type PageType = 'dashboard' | 'accounts' | 'proxy' | 'routes' | 'stats' | 'cache' | 'skills' | 'settings';
 
@@ -187,7 +188,7 @@ function App() {
   // 执行真正的切换逻辑
   const performSwitch = async (id: string) => {
     await switchTo(id);
-    if (settings.auto_reload_ide) {
+    if (isMacOS && settings.auto_reload_ide) {
       setTimeout(async () => {
         await reloadIdeWindows(false);
       }, 300);
@@ -425,7 +426,7 @@ function App() {
             onForceOverwriteDisk={async () => {
               try {
                 await invoke<string>('force_overwrite_disk_with_current');
-                if (settings.auto_reload_ide) {
+                if (isMacOS && settings.auto_reload_ide) {
                   await reloadIdeWindows(false);
                 }
                 checkSyncStatus();

@@ -2267,7 +2267,7 @@ fn mark_current_banned(state: &ProxyState) {
                 println!("[Proxy] 账号 {} 已标记为封号", name);
                 let _ = state.app_handle.emit("proxy-account-banned", &name);
                 // macOS 系统通知（可配置）
-                if store.settings.notify_on_switch {
+                if cfg!(target_os = "macos") && store.settings.notify_on_switch {
                     let notify_name = name.clone();
                     std::thread::spawn(move || {
                         let _ = std::process::Command::new("osascript")
@@ -2581,7 +2581,7 @@ fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(
     }
 
     // macOS 系统通知（可配置）
-    if notify_enabled {
+    if cfg!(target_os = "macos") && notify_enabled {
         let from = from_name.unwrap_or_else(|| "无".to_string());
         let notify_msg = format!("{} → {}", from, to_name);
         std::thread::spawn(move || {

@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Palette, Server, Monitor, Wrench, Save, Github, Radio, Smartphone, Search, X } from 'lucide-react';
 import { Account, effectiveKind } from '../hooks/useAccounts';
 import './Settings.css';
+import { isMacOS } from '../platform';
 
 interface AppSettings {
     auto_reload_ide: boolean;
@@ -460,19 +461,20 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
                 <div className="setting-item">
                     <div className="setting-info">
                         <span className="setting-label">自动重载 IDE</span>
-                        <span className="setting-desc">切换账号后自动重载 IDE 以应用新的 Token</span>
+                        <span className="setting-desc">{isMacOS ? '切换账号后自动重载 IDE 以应用新的 Token' : 'IDE 自动重载仅支持 macOS，请手动重载 IDE'}</span>
                     </div>
                     <label className="toggle">
                         <input
                             type="checkbox"
-                            checked={settings.auto_reload_ide}
+                            checked={isMacOS && settings.auto_reload_ide}
+                            disabled={!isMacOS}
                             onChange={e => updateField('auto_reload_ide', e.target.checked)}
                         />
                         <span className="toggle-slider"></span>
                     </label>
                 </div>
 
-                {settings.auto_reload_ide && (
+                {isMacOS && settings.auto_reload_ide && (
                     <>
                         <div className="setting-item sub-item">
                             <div className="setting-info">
@@ -772,7 +774,8 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
                     <button
                         className="action-button warning"
                         onClick={handleRepair}
-                        disabled={repairing}
+                        disabled={!isMacOS || repairing}
+                        title={!isMacOS ? '隔离属性修复仅适用于 macOS' : undefined}
                     >
                         {repairing ? '修复中...' : '立即修复'}
                     </button>

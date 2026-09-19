@@ -4087,6 +4087,9 @@ async fn fix_codex_quarantine(
 /// 重载 IDE 窗口
 #[tauri::command]
 async fn reload_ide_windows(use_window_reload: bool) -> Result<Vec<String>, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("IDE 自动重载仅支持 macOS，请手动重载 IDE".into());
+    }
     let ides = ide_control::detect_running_ides();
     let mut reloaded = Vec::new();
 
