@@ -98,7 +98,10 @@ fn toggle_popup(app: &AppHandle, position: tauri::PhysicalPosition<f64>) {
             return;
         }
         // 重新定位并显示
-        let _ = position_popup(&win, position);
+        if let Err(error) = position_popup(&win, position) {
+            eprintln!("[Tray] Position failed: {}", error);
+            return;
+        }
         let _ = win.show();
         let _ = win.set_focus();
         return;
@@ -131,7 +134,10 @@ fn toggle_popup(app: &AppHandle, position: tauri::PhysicalPosition<f64>) {
                 }
             });
 
-            let _ = position_popup(&win, position);
+            if let Err(error) = position_popup(&win, position) {
+                eprintln!("[Tray] Position failed: {}", error);
+                return;
+            }
             let _ = win.show();
             let _ = win.set_focus();
         }
@@ -139,21 +145,36 @@ fn toggle_popup(app: &AppHandle, position: tauri::PhysicalPosition<f64>) {
     }
 }
 
-/// 将 popup 窗口定位到托盘图标附近（macOS 顶部菜单栏下方）
+/// Use the clicked monitor's physical work area, including its taskbar and DPI.
 fn position_popup(
     win: &tauri::WebviewWindow,
     tray_pos: tauri::PhysicalPosition<f64>,
 ) -> Result<(), String> {
-    let popup_width = 380.0;
-
-    let scale = win.scale_factor().unwrap_or(1.0);
-
-    let x = (tray_pos.x - popup_width * scale / 2.0).max(0.0) as i32;
-    let y = (tray_pos.y + 4.0) as i32; // 留一点间距给菜单栏
-
-    let _ = win.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
-        x, y,
-    )));
+    let monitor = match win
+        .monitor_from_point(tray_pos.x, tray_pos.y)
+        .map_err(|e| e.to_string())?
+    {
+        Some(monitor) => monitor,
+        None => match win.current_monitor().map_err(|e| e.to_string())? {
+            Some(monitor) => monitor,
+            None => win
+                .primary_monitor()
+                .map_err(|e| e.to_string())?
+                .ok_or("No monitor available for tray popup")?,
+        },
+    };
+    let area = monitor.work_area();
+    let rect = crate::tray_position::place(
+        (tray_pos.x, tray_pos.y),
+        (area.position.x, area.position.y),
+        (area.size.width, area.size.height),
+        monitor.scale_factor(),
+    )
+    .ok_or("Invalid tray monitor work area")?;
+    win.set_position(tauri::PhysicalPosition::new(rect.x, rect.y))
+        .map_err(|e| e.to_string())?;
+    win.set_size(tauri::PhysicalSize::new(rect.width, rect.height))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

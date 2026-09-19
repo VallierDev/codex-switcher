@@ -34,6 +34,7 @@ mod sse_watchdog;
 mod switch_log;
 mod token_tracker;
 mod tray;
+mod tray_position;
 mod usage;
 
 use account::{Account, AccountStore};

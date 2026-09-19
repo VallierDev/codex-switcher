@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tray-events",
+  "description": "Event subscription for the local tray popup; no filesystem access",
+  "windows": ["tray-popup"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 // Rust 端 on_window_event(Focused(false)) 负责隐藏弹窗
 import './TrayPopup.css';
 
@@ -161,7 +160,6 @@ export function TrayPopup() {
 
     const handleOpenDashboard = async () => {
         await invoke('show_main_window_cmd');
-        getCurrentWebviewWindow().hide();
     };
 
     const q = data?.account?.cached_quota;

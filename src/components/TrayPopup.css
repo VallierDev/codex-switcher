@@ -19,7 +19,8 @@ body.is-tray-popup,
     padding: 16px 18px;
     font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
     color: #e8e0f0;
-    overflow: hidden;
+    overflow-x: hidden;
+    overflow-y: auto;
     user-select: none;
     display: flex;
     flex-direction: column;
@@ -276,6 +277,7 @@ body.is-tray-popup,
 
 /* ===== 按钮栏 ===== */
 .tp-actions {
+    flex-shrink: 0;
     display: flex;
     gap: 6px;
     margin-top: auto;
