@@ -268,9 +268,16 @@ fn parse_callback_input(input: &str) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
+#[cfg(windows)]
+#[tauri::command]
+pub async fn copy_to_clipboard(text: String) -> Result<(), String> {
+    crate::windows_clipboard::write_text(&text).await
+}
+
 /// macOS 端剪贴板写入：webview 的 `navigator.clipboard.writeText` 在跨过 await
 /// 后会丢失 user-gesture，触发 NotAllowedError；改走 pbcopy 通过 Tauri IPC 写入，
 /// 不依赖 user gesture，也避开 webview 权限提示。
+#[cfg(not(windows))]
 #[tauri::command]
 pub async fn copy_to_clipboard(text: String) -> Result<(), String> {
     use std::io::Write;
