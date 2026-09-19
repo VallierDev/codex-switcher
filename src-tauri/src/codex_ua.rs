@@ -46,24 +46,40 @@ fn codex_version() -> String {
         .clone()
 }
 
+#[cfg(windows)]
+fn windows_version_command() -> Option<Command> {
+    use std::os::windows::process::CommandExt;
+    let root = std::env::var_os("SystemRoot")?;
+    let mut command = Command::new(std::path::PathBuf::from(root).join("System32/cmd.exe"));
+    // Fixed arguments only; cmd resolves both npm's codex.cmd and native codex.exe.
+    command.args(["/D", "/V:OFF", "/C", "codex", "--version"]);
+    command.creation_flags(0x08000000);
+    Some(command)
+}
+
 fn detect_codex_version() -> Option<String> {
-    // GUI（.app）进程 PATH 很窄，手动补常见安装目录后再找 codex。
-    let mut path = std::env::var("PATH").unwrap_or_default();
-    for extra in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
-        path.push(':');
-        path.push_str(extra);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        for sub in [".local/bin", ".bun/bin", ".npm-global/bin", ".volta/bin"] {
+    #[cfg(windows)]
+    let out = windows_version_command()?.output().ok()?;
+    #[cfg(not(windows))]
+    let out = {
+        // GUI（.app）进程 PATH 很窄，手动补常见安装目录后再找 codex。
+        let mut path = std::env::var("PATH").unwrap_or_default();
+        for extra in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
             path.push(':');
-            path.push_str(&format!("{home}/{sub}"));
+            path.push_str(extra);
         }
-    }
-    let out = Command::new("codex")
-        .arg("--version")
-        .env("PATH", path)
-        .output()
-        .ok()?;
+        if let Ok(home) = std::env::var("HOME") {
+            for sub in [".local/bin", ".bun/bin", ".npm-global/bin", ".volta/bin"] {
+                path.push(':');
+                path.push_str(&format!("{home}/{sub}"));
+            }
+        }
+        Command::new("codex")
+            .arg("--version")
+            .env("PATH", path)
+            .output()
+            .ok()?
+    };
     if !out.status.success() {
         return None;
     }
@@ -156,5 +172,20 @@ fn sanitize_header(s: String) -> String {
         s.chars()
             .map(|c| if (' '..='~').contains(&c) { c } else { '_' })
             .collect()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    #[test]
+    fn version_probe_preserves_windows_path_and_uses_fixed_batch_arguments() {
+        let command = super::windows_version_command().unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
+        assert_eq!(args, ["/D", "/V:OFF", "/C", "codex", "--version"]);
+        assert_eq!(command.get_envs().count(), 0);
+        assert!(command.get_program().to_string_lossy().ends_with("cmd.exe"));
     }
 }

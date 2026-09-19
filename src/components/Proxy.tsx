@@ -1,3 +1,4 @@
+import { codexLaunchCommand, isWindows } from '../utils/codexCommand';
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -265,19 +266,19 @@ export function Proxy() {
                 <div className="setting-item">
                     <div className="setting-info">
                         <span className="setting-label">手动启动</span>
-                        <span className="setting-desc">复制命令到终端运行</span>
+                        <span className="setting-desc">{isWindows ? '复制命令到 PowerShell 运行' : '复制命令到终端运行'}</span>
                     </div>
                     <button
                         className="copy-command-button"
                         onClick={() => {
                             navigator.clipboard.writeText(
-                                `OPENAI_BASE_URL=${status?.base_url ?? `http://localhost:${port}/v1`} codex`
+                                codexLaunchCommand(status?.base_url ?? `http://localhost:${port}/v1`)
                             );
                             setCopied(true);
                             setTimeout(() => setCopied(false), 2000);
                         }}
                     >
-                        <code>OPENAI_BASE_URL={status?.base_url ?? `http://localhost:${port}/v1`} codex</code>
+                        <code>{codexLaunchCommand(status?.base_url ?? `http://localhost:${port}/v1`)}</code>
                         {copied ? <Check size={12} /> : <Copy size={12} />}
                     </button>
                 </div>
@@ -292,13 +293,13 @@ export function Proxy() {
                             className="copy-command-button"
                             onClick={() => {
                                 navigator.clipboard.writeText(
-                                    `OPENAI_BASE_URL=${status.lan_base_url} codex`
+                                    codexLaunchCommand(status.lan_base_url!)
                                 );
                                 setCopied(true);
                                 setTimeout(() => setCopied(false), 2000);
                             }}
                         >
-                            <code>OPENAI_BASE_URL={status.lan_base_url} codex</code>
+                            <code>{codexLaunchCommand(status.lan_base_url)}</code>
                             {copied ? <Check size={12} /> : <Copy size={12} />}
                         </button>
                     </div>
