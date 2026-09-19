@@ -371,7 +371,7 @@ export function AddAccountModal({ isOpen, onClose, onAdd, onSuccess }: AddAccoun
         try {
             const files = await Promise.all(paths.map(async (p) => {
                 const bytes = await readFile(p);
-                const filename = p.split('/').pop() || p;
+                const filename = p.split(/[\\/]/).pop() || p;
                 return { filename, content_b64: bytesToBase64(bytes) };
             }));
             const r = await invoke<BulkImportResult>('bulk_import_accounts', { files });
