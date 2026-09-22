@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "npm run check:i18n",
     "build": "tsc && vite build",
+    "check:i18n": "node scripts/check-i18n.mjs && node --test scripts/i18n-runtime.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

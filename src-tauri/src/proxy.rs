@@ -2352,8 +2352,10 @@ fn mark_current_banned(state: &ProxyState) {
                         let _ = std::process::Command::new("osascript")
                             .arg("-e")
                             .arg(format!(
-                                "display notification \"{}\" with title \"Codex Switcher\" subtitle \"检测到封号\"",
-                                notify_name
+                                "display notification \"{}\" with title \"{}\" subtitle \"{}\"",
+                                notify_name,
+                                crate::i18n::APP_NAME,
+                                crate::i18n::notification_account_banned_subtitle()
                             ))
                             .output();
                     });
@@ -2667,8 +2669,10 @@ fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(
             let _ = std::process::Command::new("osascript")
                 .arg("-e")
                 .arg(format!(
-                    "display notification \"{}\" with title \"Codex Switcher\" subtitle \"自动切号\"",
-                    notify_msg
+                    "display notification \"{}\" with title \"{}\" subtitle \"{}\"",
+                    notify_msg,
+                    crate::i18n::APP_NAME,
+                    crate::i18n::notification_auto_switch_subtitle()
                 ))
                 .output();
         });
@@ -2677,7 +2681,7 @@ fn do_switch(state: &ProxyState, new_id: &str, reason: SwitchReason) -> Result<(
     // 注入 WebSocket 消息标记（可配置，实验性）
     if inject_enabled {
         PENDING_INJECT_MSG.lock().ok().map(|mut msg| {
-            *msg = Some(format!("⚡ [Codex Switcher] 已切换到 {}", to_name));
+            *msg = Some(crate::i18n::injected_switch_message(&to_name));
         });
     }
 

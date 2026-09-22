@@ -8,7 +8,7 @@ fn context(program: &str) -> Result<Value, String> {
         "codex_referral_consumer" | "codex_referral_workspace" => {
             Ok(json!({"program_id": program, "entrypoint": "persistent"}))
         }
-        _ => Err("不支持的邀请活动类型".into()),
+        _ => Err(crate::i18n::referral_unsupported_program().into()),
     }
 }
 
@@ -36,41 +36,40 @@ fn request(
 
 async fn response(req: reqwest::RequestBuilder, sending: bool) -> Result<Value, String> {
     let uncertain = if sending {
-        "；发送结果未确认，请先查询邀请记录，勿直接重发"
+        crate::i18n::referral_uncertain_send_suffix()
     } else {
         ""
     };
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("邀请接口网络错误：{e}{uncertain}"))?;
+        .map_err(|e| crate::i18n::referral_network_error(&e, uncertain))?;
     let status = resp.status();
-    let data = resp.json::<Value>().await.map_err(|_| {
-        format!(
-            "邀请接口返回 HTTP {} 非 JSON 响应，可能需要官方桌面版登录会话；无法确认活动资格{}",
-            status.as_u16(),
-            uncertain
-        )
-    })?;
+    let data = resp
+        .json::<Value>()
+        .await
+        .map_err(|_| crate::i18n::referral_non_json_response(status.as_u16(), uncertain))?;
     if !status.is_success() {
         let detail = data.get("detail").unwrap_or(&data);
         let message = detail
             .as_str()
             .or_else(|| detail.get("message").and_then(Value::as_str))
-            .unwrap_or("请求被上游拒绝");
+            .unwrap_or(crate::i18n::referral_upstream_rejected());
         let failed = detail
             .get("failed_emails")
             .or_else(|| data.get("failed_emails"));
         return Err(format!(
-            "HTTP {}：{}{}{}",
+            "HTTP {}: {}{}{}",
             status.as_u16(),
             message,
-            failed.map(|v| format!("；邮箱：{v}")).unwrap_or_default(),
+            failed
+                .map(crate::i18n::referral_failed_emails)
+                .unwrap_or_default(),
             uncertain
         ));
     }
     if !data.is_object() {
-        return Err(format!("邀请接口响应格式无法识别{uncertain}"));
+        return Err(crate::i18n::referral_unrecognized_response(uncertain));
     }
     Ok(data)
 }
@@ -104,7 +103,7 @@ pub async fn tracking(
     }
     let data = response(req, false).await?;
     if !data["items"].is_array() {
-        return Err("邀请记录响应缺少 items，无法确认记录".into());
+        return Err(crate::i18n::referral_missing_items().into());
     }
     Ok(data)
 }
@@ -117,7 +116,7 @@ fn send_body(
 ) -> Result<Value, String> {
     let mut body = context(program)?;
     if offer["should_show"] != true {
-        return Err("当前账号没有可发送的邀请活动，请刷新资格".into());
+        return Err(crate::i18n::referral_no_available_campaign().into());
     }
     // Detect an offer change between review and submission, including grant amounts.
     for key in ["offer_id", "grants", "requires_explicit_confirmation"] {

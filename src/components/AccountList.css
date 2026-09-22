@@ -121,6 +121,14 @@
     flex: 1;
 }
 
+.toolbar-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-left: auto;
+    flex: 0 0 auto;
+}
+
 /* 紧凑 filter 按钮（label·count 内联，省 toolbar 宽度） */
 .filter-btn-compact {
     gap: 4px;
@@ -185,7 +193,6 @@
 .toolbar-icon-btn {
     width: 30px;
     height: 30px;
-    margin-left: 6px;
     padding: 0;
     display: inline-flex;
     align-items: center;

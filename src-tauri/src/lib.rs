@@ -9,6 +9,7 @@ pub mod chat_inbound;
 mod codex_sessions;
 mod codex_ua;
 mod deep_link;
+mod i18n;
 mod ide_control;
 pub mod kimi_quota;
 pub mod mailbox;
@@ -6358,6 +6359,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_accounts,
+            i18n::set_app_locale,
+            i18n::get_system_locale,
             get_current_account_id,
             import_current_account,
             switch_account,
