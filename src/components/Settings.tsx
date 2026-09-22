@@ -5,6 +5,7 @@ import { Account, effectiveKind } from '../hooks/useAccounts';
 import { formatPlanLabel } from '../utils/planLabel';
 import './Settings.css';
 import { isMacOS } from '../platform';
+import { appLocales, getActiveLocale, SOURCE_LOCALE_CODE } from '../i18n';
 
 interface AppSettings {
     auto_reload_ide: boolean;
@@ -861,6 +862,42 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
                         <Github size={14} /> GitHub
                     </a>
                 </div>
+                {getActiveLocale().code !== SOURCE_LOCALE_CODE && (
+                    <div className="setting-item translation-credits">
+                        <div className="setting-info">
+                            <span className="setting-label">翻译</span>
+                            <span className="setting-desc">感谢帮助应用支持更多语言的贡献者</span>
+                        </div>
+                        <div className="translation-credit-list">
+                            {appLocales
+                                .filter(locale => locale.translation && locale.contributors?.length)
+                                .map(locale => (
+                                    <div className="translation-credit" key={locale.code}>
+                                        <span className="translation-credit-language" lang={locale.code}>
+                                            <span aria-hidden="true">{locale.flag}</span>
+                                            {locale.nativeName}
+                                        </span>
+                                        {locale.contributors?.map(contributor => contributor.url ? (
+                                            <a
+                                                className="translation-contributor"
+                                                href={contributor.url}
+                                                key={contributor.name}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                            >
+                                                <Github size={13} aria-hidden="true" />
+                                                {contributor.name}
+                                            </a>
+                                        ) : (
+                                            <span className="translation-contributor" key={contributor.name}>
+                                                {contributor.name}
+                                            </span>
+                                        ))}
+                                    </div>
+                                ))}
+                        </div>
+                    </div>
+                )}
             </div>
         </div >
     );

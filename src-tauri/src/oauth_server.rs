@@ -154,9 +154,7 @@ async fn handle_callback(listener: TcpListener, app_handle: AppHandle, expected_
 
         if let Some(code) = extract_oauth_code_from_request(&request, &expected_state) {
             // 发送成功 HTML 并通知前端
-            let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
-                <html><body><h1>授权成功</h1><p>已成功连接 OpenAI，你可以关闭此窗口并回到应用。</p>\
-                <script>setTimeout(() => window.close(), 3000)</script></body></html>";
+            let response = crate::i18n::oauth_success_html();
             let _ = socket.write_all(response.as_bytes()).await;
 
             if let Err(e) = app_handle.emit("oauth-callback-received", code) {
@@ -165,7 +163,7 @@ async fn handle_callback(listener: TcpListener, app_handle: AppHandle, expected_
             return;
         }
 
-        let response = "HTTP/1.1 400 Bad Request\r\n\r\n授权失败: State 校验不通过或参数缺失";
+        let response = crate::i18n::oauth_failure_response();
         let _ = socket.write_all(response.as_bytes()).await;
     }
 }

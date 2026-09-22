@@ -358,6 +358,58 @@
     transform: translateY(-1px);
 }
 
+.translation-credit-list {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+}
+
+.translation-credit {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.translation-credit-language,
+.translation-contributor {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+}
+
+.translation-credit-language {
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+.translation-contributor {
+    color: var(--primary-color);
+    text-decoration: none;
+}
+
+a.translation-contributor:hover {
+    text-decoration: underline;
+}
+
+@media (max-width: 720px) {
+    .translation-credits {
+        align-items: flex-start;
+        gap: 12px;
+    }
+
+    .translation-credit-list {
+        align-items: flex-start;
+    }
+
+    .translation-credit {
+        justify-content: flex-start;
+    }
+}
+
 /* ===== 手机锚 (Session Anchor) ===== */
 .anchor-actions {
     display: flex;

@@ -36,17 +36,7 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
     // Windows 右键需要真正挂载 native menu；仅监听 TrayIconEvent 会把右键
     // 也当成 popup 点击，系统不会自动生成完整托盘菜单。
-    let show_main = MenuItem::with_id(app, "tray-show-main", "打开主窗口", true, None::<&str>)?;
-    let next_account = MenuItem::with_id(
-        app,
-        "tray-next-account",
-        "切换到下一个账号",
-        true,
-        None::<&str>,
-    )?;
-    let separator = PredefinedMenuItem::separator(app)?;
-    let quit = PredefinedMenuItem::quit(app, Some("退出"))?;
-    let menu = Menu::with_items(app, &[&show_main, &next_account, &separator, &quit])?;
+    let menu = build_native_menu(app)?;
 
     let _tray = TrayIconBuilder::with_id("main")
         .icon(icon)
@@ -87,6 +77,33 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn build_native_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let show_main = MenuItem::with_id(
+        app,
+        "tray-show-main",
+        crate::i18n::tray_show_main(),
+        true,
+        None::<&str>,
+    )?;
+    let next_account = MenuItem::with_id(
+        app,
+        "tray-next-account",
+        crate::i18n::tray_next_account(),
+        true,
+        None::<&str>,
+    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit = PredefinedMenuItem::quit(app, Some(crate::i18n::tray_quit()))?;
+    Menu::with_items(app, &[&show_main, &next_account, &separator, &quit])
+}
+
+pub fn update_tray_native_menu(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(tray) = app.tray_by_id("main") {
+        tray.set_menu(Some(build_native_menu(app)?))?;
+    }
+    Ok(())
+}
+
 /// 显示/隐藏 tray popup 窗口
 fn toggle_popup(app: &AppHandle, position: tauri::PhysicalPosition<f64>) {
     let label = "tray-popup";
@@ -114,7 +131,7 @@ fn toggle_popup(app: &AppHandle, position: tauri::PhysicalPosition<f64>) {
     let url = tauri::WebviewUrl::App("index.html".into());
 
     match WebviewWindowBuilder::new(app, label, url)
-        .title("Codex Switcher")
+        .title(crate::i18n::APP_NAME)
         .inner_size(popup_width, popup_height)
         .resizable(false)
         .decorations(false)
@@ -215,17 +232,21 @@ pub fn update_tray_menu(app: &AppHandle) {
         };
         if let Some(current_id) = &store.current {
             if let Some(acc) = store.accounts.get(current_id) {
-                let quota = acc
-                    .cached_quota
+                acc.cached_quota
                     .as_ref()
-                    .map(|q| format!(" | 5H: {:.0}%  周: {:.0}%", q.five_hour_left, q.weekly_left))
-                    .unwrap_or_default();
-                format!("Codex Switcher - {}{}", acc.name, quota)
+                    .map(|q| {
+                        crate::i18n::tray_tooltip_account(
+                            &acc.name,
+                            q.five_hour_left,
+                            q.weekly_left,
+                        )
+                    })
+                    .unwrap_or_else(|| format!("{} - {}", crate::i18n::APP_NAME, acc.name))
             } else {
-                "Codex Switcher".to_string()
+                crate::i18n::tray_tooltip_default()
             }
         } else {
-            "Codex Switcher - 未登录".to_string()
+            crate::i18n::tray_tooltip_logged_out()
         }
         // store guard 在 block 结束（这一行）时 drop，set_tooltip 在外面跑
     };

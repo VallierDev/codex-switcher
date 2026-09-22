@@ -19,6 +19,7 @@ import { SessionRoutes } from './components/SessionRoutes';
 import CachePanel from './components/CachePanel';
 import { ConfirmModal } from './components/ConfirmModal';
 import { RelayImportConfirm } from './components/RelayImportConfirm';
+import { LanguagePicker } from './components/LanguagePicker';
 import './App.css';
 import { isMacOS } from './platform';
 
@@ -370,6 +371,7 @@ function App() {
         </nav>
 
         <div className="header-actions">
+          <LanguagePicker />
           <button className="btn btn-primary" onClick={() => setShowAddModal(true)}>
             + 登录账号
           </button>

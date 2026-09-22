@@ -156,6 +156,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   padding: 16px 24px;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-color);
@@ -165,6 +166,7 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex: 0 0 auto;
 }
 
 .app-logo {
@@ -184,6 +186,7 @@ body {
   font-size: 18px;
   font-weight: 700;
   color: var(--text-primary);
+  white-space: nowrap;
 }
 
 .app-version {
@@ -234,12 +237,80 @@ body {
 
 .header-actions {
   display: flex;
+  align-items: center;
   gap: 8px;
+  flex: 0 0 auto;
+}
+
+.language-picker {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.language-picker-trigger {
+  width: 34px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--input-bg);
+  cursor: pointer;
+  font-size: 17px;
+  line-height: 1;
+  list-style: none;
+}
+
+.language-picker-trigger:hover,
+.language-picker.open .language-picker-trigger {
+  background: var(--hover-bg);
+  border-color: var(--primary-color);
+}
+
+.language-picker-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 100;
+  width: 178px;
+  padding: 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--card-bg);
+  box-shadow: 0 8px 24px rgba(31, 35, 40, 0.16);
+  max-height: min(360px, calc(100vh - 96px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.language-picker-menu button {
+  width: 100%;
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: 22px 1fr 14px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.language-picker-menu button:hover,
+.language-picker-menu button.selected {
+  background: var(--hover-bg);
 }
 
 /* 导航菜单 */
 .header-nav {
   display: flex;
+  flex: 0 1 auto;
   gap: 4px;
   background: var(--section-bg);
   padding: 4px;
@@ -268,6 +339,70 @@ body {
 .nav-item.active {
   color: var(--primary-color);
   background: var(--badge-bg);
+}
+
+@media (max-width: 1400px) {
+  html[lang^='ru'] .app-header {
+    padding-inline: 16px;
+  }
+
+  html[lang^='ru'] .nav-item {
+    padding-inline: 9px;
+    font-size: 12px;
+  }
+
+  html[lang^='ru'] .header-actions .btn {
+    padding-inline: 10px;
+  }
+}
+
+@media (max-width: 1280px) {
+  html[lang^='ru'] .app-header {
+    gap: 8px;
+    padding-inline: 12px;
+  }
+
+  html[lang^='ru'] .header-left {
+    gap: 8px;
+  }
+
+  html[lang^='ru'] .header-left h1 {
+    font-size: 16px;
+  }
+
+  html[lang^='ru'] .app-version {
+    display: none;
+  }
+
+  html[lang^='ru'] .proxy-indicator {
+    padding-inline: 8px;
+  }
+
+  html[lang^='ru'] .nav-item {
+    padding-inline: 7px;
+    font-size: 11px;
+  }
+
+  html[lang^='ru'] .header-actions {
+    gap: 6px;
+  }
+
+  html[lang^='ru'] .header-actions .btn {
+    padding-inline: 8px;
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 1100px) {
+  .app-header {
+    flex-wrap: wrap;
+  }
+
+  .header-nav {
+    order: 3;
+    width: 100%;
+    justify-content: center;
+  }
 }
 
 
