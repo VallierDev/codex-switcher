@@ -22,3 +22,16 @@ test('both app reload paths and the toolbar gate saved settings by platform', ()
   assert.ok(list.includes('disabled={!isMacOS}'));
   assert.ok(list.includes('aria-pressed={isMacOS && autoReload}'));
 });
+
+test('repeated launches reuse the main window before account state and services start', () => {
+  const manifest = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+  assert.match(manifest, /tauri-plugin-single-instance\s*=\s*\{[^}]*features\s*=\s*\["deep-link"\]/);
+  const source = fs.readFileSync('src-tauri/src/lib.rs', 'utf8');
+  const run = source.slice(source.indexOf('pub fn run()'));
+  assert.ok(run.indexOf('.plugin(tauri_plugin_single_instance::init(') < run.indexOf('.plugin(tauri_plugin_opener::init())'));
+  assert.match(run, /tauri_plugin_single_instance::init\(\|app, _args, _cwd\|\s*\{\s*crate::tray::show_main_window_from_cmd\(app\);\s*\}/);
+  assert.ok(run.indexOf('app.manage(AppState::new());') > run.indexOf('.setup(|app|'));
+  assert.ok(!run.slice(0, run.indexOf('.setup(|app|')).includes('AppState::new()'));
+  assert.ok(run.includes('app.deep_link().on_open_url'));
+  assert.ok(run.includes('api.prevent_close();'));
+});

@@ -4,6 +4,7 @@ version = "0.7.21"
 description = "Codex 多账号智能切换 + 本地代理 + 用量统计"
 authors = ["xiaojian"]
 edition = "2021"
+rust-version = "1.90"
 default-run = "codex-switcher"
 
 [lib]
@@ -11,14 +12,15 @@ name = "codex_switcher_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.7.1", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri = { version = "2.12.1", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }

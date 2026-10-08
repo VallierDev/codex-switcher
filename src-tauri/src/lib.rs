@@ -6143,12 +6143,16 @@ pub fn run() {
     }));
 
     tauri::Builder::default()
+        // Reject repeated launches before loading account state or starting services.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            crate::tray::show_main_window_from_cmd(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_deep_link::init())
-        .manage(AppState::new())
         .setup(|app| {
+            app.manage(AppState::new());
             // ── Deep link 监听：codexswitch:// + ccswitch:// ──
             // 收到 URL 后解析，把结果 emit 到前端"deep-link://import-pending"事件，
             // 由前端弹确认框，用户点"导入"才会调 add_relay_account 落库。

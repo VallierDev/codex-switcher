@@ -890,23 +890,25 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
                                             <span aria-hidden="true">{locale.flag}</span>
                                             {locale.nativeName}
                                         </span>
-                                        {locale.contributors?.map(contributor => contributor.url ? (
-                                            <a
-                                                className="translation-contributor"
-                                                translate="no"
-                                                href={contributor.url}
-                                                key={contributor.name}
-                                                target="_blank"
-                                                rel="noopener noreferrer"
-                                            >
-                                                <Github size={13} aria-hidden="true" />
-                                                {contributor.name}
-                                            </a>
-                                        ) : (
-                                            <span className="translation-contributor" key={contributor.name} translate="no">
-                                                {contributor.name}
-                                            </span>
-                                        ))}
+                                        <div className="translation-credit-authors">
+                                            {locale.contributors?.map(contributor => contributor.url ? (
+                                                <a
+                                                    className="translation-contributor"
+                                                    translate="no"
+                                                    href={contributor.url}
+                                                    key={contributor.name}
+                                                    target="_blank"
+                                                    rel="noopener noreferrer"
+                                                >
+                                                    <Github size={13} aria-hidden="true" />
+                                                    {contributor.name}
+                                                </a>
+                                            ) : (
+                                                <span className="translation-contributor" key={contributor.name} translate="no">
+                                                    {contributor.name}
+                                                </span>
+                                            ))}
+                                        </div>
                                     </div>
                                 ))}
                         </div>
