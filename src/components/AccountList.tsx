@@ -236,7 +236,6 @@ export function AccountList({
     } | null>(null);
     const [savingPrime, setSavingPrime] = useState(false);
     const [primeError, setPrimeError] = useState<string | null>(null);
-
     const autoReload = settings.auto_reload_ide;
     const setAutoReload = (val: boolean) => onUpdateSettings({ ...settings, auto_reload_ide: val });
 
@@ -278,6 +277,24 @@ export function AccountList({
                 } catch (err) {
                     throw new Error(`本地已保存，但同步 Server 失败：${String(err)}`);
                 }
+            }
+            onRefreshComplete?.();
+            setPrimeEditor(null);
+        } catch (err) {
+            setPrimeError(String(err));
+        } finally {
+            setSavingPrime(false);
+        }
+    };
+
+    const retryWindowPriming = async () => {
+        if (!primeEditor || savingPrime) return;
+        setSavingPrime(true);
+        setPrimeError(null);
+        try {
+            await invoke('retry_account_window_priming', { id: primeEditor.id });
+            if (settings.remote_mode === 'client' || settings.remote_mode === 'solo') {
+                await invoke('remote_push_account', { id: primeEditor.id });
             }
             onRefreshComplete?.();
             setPrimeEditor(null);
@@ -1310,18 +1327,30 @@ export function AccountList({
                                 </label>
                             )}
                             <p className="account-expiry-help">系统默认自动管理全部订阅号，并以 /wham/usage 返回的 primary_window 实际时长判断 5H 或 7D，不绑定套餐名称。首次遇到无法确认是否激活的 100% 窗口时只发一次极小请求；之后按固定 reset_at 到点触发。这里可以单独关闭该账号，client/solo 模式由 Server 单端执行。</p>
-                            {(primeEditor.lastAttempt || primeEditor.lastSuccess || primeEditor.lastError) && (
-                                <div className="window-prime-status">
-                                    {primeEditor.lastAttempt && <span>最近尝试：{new Date(primeEditor.lastAttempt).toLocaleString()}</span>}
-                                    {primeEditor.lastSuccess && <span className="ok">最近成功：{new Date(primeEditor.lastSuccess).toLocaleString()}</span>}
-                                    {primeEditor.lastError && <span className="err">最近结果：{primeEditor.lastError}</span>}
-                                </div>
-                            )}
+                            {(() => {
+                                const live = accounts.find(a => a.id === primeEditor.id)?.window_priming;
+                                const attempt = live?.last_attempt_at ?? primeEditor.lastAttempt;
+                                const success = live?.last_success_at ?? primeEditor.lastSuccess;
+                                const error = live ? live.last_error : primeEditor.lastError;
+                                const pending = !!live?.bootstrap_request_id && live.bootstrap_request_id !== live.last_bootstrap_request_id;
+                                return <div className="window-prime-status">
+                                    {attempt && <span>最近尝试：{new Date(attempt).toLocaleString()}</span>}
+                                    {success && <span className="ok">最近成功：{new Date(success).toLocaleString()}</span>}
+                                    {error && <span className="err">最近结果：{error}</span>}
+                                    {pending && <span>请求已入队，等待调度器执行</span>}
+                                </div>;
+                            })()}
                             {primeError && <p className="account-expiry-error">{primeError}</p>}
                         </div>
                         <div className="account-expiry-modal-actions">
                             <span></span>
                             <div className="account-expiry-modal-actions-right">
+                                {(primeEditor.fiveHour || primeEditor.weekly) && (
+                                    <button className="secondary-btn" onClick={retryWindowPriming} disabled={savingPrime}
+                                        title="明确申请对这个账号再次发送一次极小的模型请求；不会切换当前账号">
+                                        手动重试一次
+                                    </button>
+                                )}
                                 <button className="secondary-btn" onClick={() => setPrimeEditor(null)} disabled={savingPrime}>取消</button>
                                 <button className="primary-btn" onClick={saveWindowPriming} disabled={savingPrime}>
                                     {savingPrime ? '保存中…' : '保存'}

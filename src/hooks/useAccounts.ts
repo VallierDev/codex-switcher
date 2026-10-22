@@ -69,6 +69,8 @@ export interface KeepaliveState {
 
 export interface WindowPrimingState {
     configured?: boolean;
+    bootstrap_request_id?: string | null;
+    last_bootstrap_request_id?: string | null;
     five_hour_enabled: boolean;
     weekly_enabled: boolean;
     last_five_hour_reset_at?: number | null;

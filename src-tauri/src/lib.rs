@@ -613,6 +613,33 @@ fn set_account_window_priming(
     Ok(())
 }
 
+/// Explicitly queue one new Window Priming attempt for a single account.
+#[tauri::command]
+fn retry_account_window_priming(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<(), String> {
+    {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        let account = store.accounts.get_mut(&id).ok_or("账号不存在")?;
+        if !account.is_chatgpt_oauth() || !account.window_priming.enabled() {
+            return Err("请先启用此 ChatGPT 账号的周期保鲜".to_string());
+        }
+        let prime = &mut account.window_priming;
+        if prime.bootstrap_request_id.is_some()
+            && prime.bootstrap_request_id != prime.last_bootstrap_request_id
+        {
+            return Err("已有待处理的周期保鲜请求，请勿重复触发".to_string());
+        }
+        // Only the periodic worker may dispatch this ID once.
+        prime.bootstrap_request_id = Some(uuid::Uuid::new_v4().to_string());
+        store.save()?;
+    }
+    let _ = app.emit("accounts-updated", ());
+    Ok(())
+}
+
 /// 更新 Relay usage 专用网页登录凭证（MiMo Cookie、StepFun Oasis-Token 等控制台配额接口使用）。
 #[tauri::command]
 fn update_relay_usage_cookie(
@@ -2301,6 +2328,24 @@ fn reserve_window_prime_attempt(account: &mut Account, due: &WindowPrimeDue) -> 
     true
 }
 
+/// A completed model response does not prove that a rolling quota window was
+/// started. Each requested window must get a new future reset timestamp.
+fn window_prime_quota_verified(
+    due: &WindowPrimeDue,
+    new_five_hour_reset_at: Option<i64>,
+    new_weekly_reset_at: Option<i64>,
+    now_ts: i64,
+) -> bool {
+    let has_window = due.five_hour_reset_at.is_some() || due.weekly_reset_at.is_some();
+    has_window
+        && due.five_hour_reset_at.is_none_or(|old| {
+            new_five_hour_reset_at.is_some_and(|new| new > old && new > now_ts)
+        })
+        && due.weekly_reset_at.is_none_or(|old| {
+            new_weekly_reset_at.is_some_and(|new| new > old && new > now_ts)
+        })
+}
+
 /// Google discovery is independent of OpenAI quota polling. Only the credential
 /// authority fetches Google; Client mode mirrors its cached model IDs via /quotas.
 fn start_antigravity_catalog_refresh(
@@ -2843,6 +2888,10 @@ pub fn start_quota_refresh(
             };
 
             for target in &targets {
+                if target.prime_due.any() {
+                }
+            }
+            for target in &targets {
                 let id = &target.id;
                 let name = &target.name;
                 println!("[QuotaRefresh] 刷新 {} ...", name);
@@ -2965,39 +3014,76 @@ pub fn start_quota_refresh(
                                     .await
                                     {
                                         Ok(result) if result.ok => {
-                                            println!("[WindowPrime] ✅ {} 周期保鲜成功", name);
+                                            // response.completed proves inference, not that the
+                                            // rolling quota window actually started. Check
+                                            // reset_at separately before reporting success.
+                                            let bootstrap_only = target.prime_due.five_hour_reset_at.is_none()
+                                                && target.prime_due.weekly_reset_at.is_none();
+                                            let mut verification_error: Option<String> = None;
+                                            let mut quota_verified = false;
+                                            for poll in 0..2 {
+                                                tokio::time::sleep(tokio::time::Duration::from_millis(
+                                                    if poll == 0 { 1_000 } else { 1_500 },
+                                                ))
+                                                .await;
+                                                match usage::UsageFetcher::fetch_usage_direct(
+                                                    access_token.clone(),
+                                                    aid.clone(),
+                                                    rt.clone(),
+                                                    false,
+                                                    Some(id.to_string()),
+                                                )
+                                                .await
+                                                {
+                                                    Ok((fresh_usage, _)) => {
+                                                        let refreshed = cached_quota_from_usage(&fresh_usage);
+                                                        quota_verified = window_prime_quota_verified(
+                                                            &target.prime_due,
+                                                            semantic_window_reset_at(&refreshed, false),
+                                                            semantic_window_reset_at(&refreshed, true),
+                                                            chrono::Utc::now().timestamp(),
+                                                        );
+                                                        usage = fresh_usage;
+                                                        if quota_verified {
+                                                            break;
+                                                        }
+                                                        verification_error = Some(
+                                                            "Codex responded, but quota reset_at has not advanced; window activation is unverified".to_string(),
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        verification_error = Some(format!(
+                                                            "Codex responded, but quota verification failed: {e}"
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            // Manual bootstrap proves a model turn only; without
+                                            // prior reset_at it cannot prove quota activation.
+                                            if bootstrap_only && verification_error.is_none() {
+                                                verification_error = Some(
+                                                    "Codex responded, but no previous quota reset_at exists to verify window activation".to_string(),
+                                                );
+                                            }
+                                            let verified_success = quota_verified;
                                             if let Ok(mut s) = store.lock() {
                                                 if let Some(acc) = s.accounts.get_mut(id) {
                                                     record_window_prime_result(
                                                         acc,
                                                         &target.prime_due,
                                                         true,
-                                                        true,
-                                                        None,
+                                                        verified_success,
+                                                        verification_error.clone(),
                                                     );
                                                     let _ = s.save();
                                                 }
                                             }
-
-                                            // 开窗后立刻重拉一次，把新产生的 reset_at 写回 UI。
-                                            tokio::time::sleep(tokio::time::Duration::from_millis(
-                                                300,
-                                            ))
-                                            .await;
-                                            match usage::UsageFetcher::fetch_usage_direct(
-                                                access_token.clone(),
-                                                aid.clone(),
-                                                rt.clone(),
-                                                false,
-                                                Some(id.to_string()),
-                                            )
-                                            .await
-                                            {
-                                                Ok((fresh_usage, _)) => usage = fresh_usage,
-                                                Err(e) => println!(
-                                                    "[WindowPrime] {} 周期保鲜成功，但重拉额度失败: {}",
-                                                    name, e
-                                                ),
+                                            if quota_verified {
+                                                println!("[WindowPrime] {} model response completed and quota reset_at advanced", name);
+                                            } else if bootstrap_only {
+                                                println!("[WindowPrime] {} manual model request completed; no quota-window baseline for verification", name);
+                                            } else {
+                                                println!("[WindowPrime] {} response completed but window unverified: {:?}", name, verification_error);
                                             }
                                         }
                                         Ok(result) => {
@@ -3832,6 +3918,12 @@ async fn consume_reset_credit(
     usage::consume_reset_credit(&access_token, account_id.as_deref()).await
 }
 
+/// An isolated CODEX_HOME must not pin a retired model. Let the installed
+/// authenticated CLI select its current account-compatible model.
+fn codex_terminal_default_config() -> &'static str {
+    "model_reasoning_effort = \"low\"\napproval_policy = \"never\"\nsandbox_mode = \"read-only\"\n"
+}
+
 /// 用指定账号在「隔离 CODEX_HOME + 直连 OpenAI」下打开一个交互式 codex 终端。
 ///
 /// 用途：referral 兑现需要"真 codex CLI 的 turn"——手搓 API 不算数。这里给该号
@@ -3886,7 +3978,7 @@ fn open_codex_terminal(state: State<AppState>, id: String) -> Result<String, Str
     )
     .map_err(|e| format!("写 auth.json 失败: {}", e))?;
     // 默认 openai provider（直连 chatgpt.com），不设 model_provider = 不走 switcher proxy
-    let config = "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"low\"\napproval_policy = \"never\"\nsandbox_mode = \"read-only\"\n";
+    let config = codex_terminal_default_config();
     std::fs::write(home.join("config.toml"), config)
         .map_err(|e| format!("写 config.toml 失败: {}", e))?;
 
@@ -6494,6 +6586,7 @@ pub fn run() {
             delete_account,
             update_account,
             set_account_window_priming,
+            retry_account_window_priming,
             update_relay_usage_cookie,
             set_account_inactive_refresh_enabled,
             set_session_anchor,
@@ -6674,6 +6767,15 @@ mod tests {
     }
 
     #[test]
+    fn codex_terminal_config_leaves_model_to_installed_cli() {
+        let config = codex_terminal_default_config();
+        assert!(!config.lines().any(|line| {
+            line.split_once('=').is_some_and(|(key, _)| key.trim() == "model")
+        }));
+        assert!(config.contains("sandbox_mode = \"read-only\""));
+    }
+
+    #[test]
     fn quota_refresh_never_allows_local_token_refresh() {
         assert!(!allow_local_refresh_for_quota(true));
         assert!(!allow_local_refresh_for_quota(false));
@@ -6754,6 +6856,26 @@ mod tests {
 
         account.window_priming.weekly_enabled = false;
         assert!(!window_prime_due(&account, now.timestamp()).any());
+    }
+
+    #[test]
+    fn window_prime_requires_new_future_reset_for_every_due_window() {
+        let due = WindowPrimeDue {
+            five_hour_reset_at: Some(100),
+            weekly_reset_at: Some(120),
+            bootstrap_request_id: None,
+        };
+        assert!(window_prime_quota_verified(&due, Some(500), Some(800), 250));
+        assert!(!window_prime_quota_verified(&due, Some(100), Some(800), 250));
+        assert!(!window_prime_quota_verified(&due, Some(500), Some(120), 250));
+        assert!(!window_prime_quota_verified(&due, Some(200), Some(800), 250));
+        assert!(!window_prime_quota_verified(&due, Some(500), None, 250));
+        let bootstrap = WindowPrimeDue {
+            five_hour_reset_at: None,
+            weekly_reset_at: None,
+            bootstrap_request_id: Some("manual".into()),
+        };
+        assert!(!window_prime_quota_verified(&bootstrap, Some(500), Some(800), 250));
     }
 
     #[test]

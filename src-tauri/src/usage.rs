@@ -1900,9 +1900,9 @@ pub async fn consume_reset_credit(
     })
 }
 
-/// 默认唤醒模型（实测 ChatGPT 账号 codex responses 接口当前接受 gpt-5.5；
-/// gpt-5-codex / gpt-5.3-codex 等已被该端点拒绝）。
-pub const DEFAULT_WAKEUP_MODEL: &str = "gpt-5.5";
+/// Default wakeup model for a minimal window-prime request.
+/// Keep this compatible with the ChatGPT-authenticated Codex Responses endpoint.
+pub const DEFAULT_WAKEUP_MODEL: &str = "gpt-6-luna";
 
 /// 唤醒结果，回传给前端
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1982,16 +1982,18 @@ pub async fn send_wakeup(
         .await
         .map_err(|e| format!("网络请求失败: {}", e))?;
     let status = resp.status();
-    let raw = resp.text().await.unwrap_or_default();
+    // A failed or truncated SSE read must not be treated as a completed prime.
+    let raw = resp.text().await.map_err(|e| format!("Codex response read failed: {e}"))?;
 
     if status.is_success() {
+        let completed = wakeup_stream_completed(&raw);
         Ok(WakeupResult {
-            ok: true,
+            ok: completed,
             status_code: status.as_u16(),
             model: model.to_string(),
             prompt: prompt.to_string(),
-            reply: parse_wakeup_reply(&raw),
-            error: None,
+            reply: if completed { parse_wakeup_reply(&raw) } else { String::new() },
+            error: (!completed).then(|| "Codex returned HTTP success without a completed model response".to_string()),
         })
     } else {
         Ok(WakeupResult {
@@ -2003,6 +2005,26 @@ pub async fn send_wakeup(
             error: Some(parse_wakeup_error(&raw, status.as_u16())),
         })
     }
+}
+
+/// The HTTP status alone does not mean that the streamed inference succeeded.
+fn wakeup_stream_completed(sse: &str) -> bool {
+    let mut completed = false;
+    for line in sse.lines() {
+        let Some(payload) = line.trim_start().strip_prefix("data:") else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(payload.trim()) else { continue };
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.completed") => {
+                completed = value.get("response")
+                    .and_then(|r| r.get("status"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status == "completed");
+            }
+            Some("response.failed" | "response.incomplete" | "error") => return false,
+            _ => {}
+        }
+    }
+    completed
 }
 
 /// 从 SSE 流里抠出 assistant 回复：优先拼 `response.output_text.delta` 的增量，
@@ -2107,6 +2129,21 @@ mod tests {
             .or_else(|| body.get("isValid").and_then(|v| v.as_bool()))
             .unwrap_or(true);
         Ok((remaining, unit, is_active))
+    }
+
+    #[test]
+    fn wakeup_uses_current_lightweight_model() {
+        assert_eq!(DEFAULT_WAKEUP_MODEL, "gpt-6-luna");
+    }
+
+    #[test]
+    fn window_prime_requires_completed_response() {
+        assert!(wakeup_stream_completed("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n"));
+        assert!(!wakeup_stream_completed("data: {\"type\":\"response.created\"}\n"));
+        assert!(!wakeup_stream_completed("data: {\"type\":\"response.failed\"}\n"));
+        assert!(!wakeup_stream_completed("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"failed\"}}\n"));
+        assert!(!wakeup_stream_completed("data: {\"type\":\"response.completed\"}\n"));
+        assert!(!wakeup_stream_completed("data: {\"type\":\"response.completed\",\"response\":{}}\n"));
     }
 
     #[test]
