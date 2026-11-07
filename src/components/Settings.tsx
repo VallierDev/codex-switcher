@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Palette, Server, Monitor, Wrench, Save, Github, Radio, Smartphone, Search, X } from 'lucide-react';
+import { Palette, Server, Monitor, Wrench, Save, Github, Radio, Smartphone, Search, X, RefreshCw } from 'lucide-react';
 import { Account, effectiveKind } from '../hooks/useAccounts';
 import { formatPlanLabel } from '../utils/planLabel';
 import './Settings.css';
@@ -42,6 +42,11 @@ interface RemoteHealth {
     mode: string;
     version: string;
     account_count: number;
+}
+
+interface AutostartStatus {
+    supported: boolean;
+    enabled: boolean;
 }
 
 const IDE_OPTIONS = [
@@ -95,6 +100,9 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
     const [showAnchorPicker, setShowAnchorPicker] = useState(false);
     const [anchorSearch, setAnchorSearch] = useState('');
     const [anchorBusy, setAnchorBusy] = useState(false);
+    const [autostart, setAutostart] = useState<AutostartStatus | null>(null);
+    const [autostartBusy, setAutostartBusy] = useState(true);
+    const [autostartError, setAutostartError] = useState('');
 
     // 手机锚只对 ChatGPT 订阅号有效：Codex.app `/codex/remote/control/*`
     // 必须用 chatgpt_account_id 鉴权；Relay / OpenAI API key 没有这个 claim。
@@ -117,7 +125,32 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
 
     useEffect(() => {
         loadSettings();
+        void loadAutostart();
     }, []);
+
+    const loadAutostart = async () => {
+        setAutostartBusy(true);
+        setAutostartError('');
+        try {
+            setAutostart(await invoke<AutostartStatus>('get_autostart_status'));
+        } catch (error) {
+            setAutostartError(String(error));
+        } finally {
+            setAutostartBusy(false);
+        }
+    };
+
+    const toggleAutostart = async (enabled: boolean) => {
+        setAutostartBusy(true);
+        setAutostartError('');
+        try {
+            setAutostart(await invoke<AutostartStatus>('set_autostart_enabled', { enabled }));
+        } catch (error) {
+            setAutostartError(String(error));
+        } finally {
+            setAutostartBusy(false);
+        }
+    };
 
     const loadSettings = async () => {
         try {
@@ -315,6 +348,21 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
             <div className="settings-section">
                 <h3><Server size={16} /> 后台服务</h3>
 
+                {(autostart?.supported || autostartError) && <div className="setting-item">
+                    <div className="setting-info">
+                        <span className="setting-label">自动启动</span>
+                        <span className="setting-desc">登录 Linux 图形会话后在后台启动，不打开主窗口；可从托盘或应用菜单打开。立即生效，仅影响本机；关闭此选项不会停止当前程序。</span>
+                        {autostartError && <span className="setting-desc" role="alert">{autostartError}</span>}
+                    </div>
+                    {autostartError && <button className="action-button" title="重试" aria-label="重试" disabled={autostartBusy} onClick={() => void loadAutostart()}><RefreshCw size={14} /></button>}
+                    <label className="toggle">
+                        <input type="checkbox" aria-label="自动启动" checked={autostart?.enabled ?? false}
+                            disabled={autostartBusy || !autostart || !!autostartError}
+                            onChange={event => void toggleAutostart(event.target.checked)} />
+                        <span className="toggle-slider"></span>
+                    </label>
+                </div>}
+
                 <div className="setting-item">
                     <div className="setting-info">
                         <span className="setting-label">后台保活与同步</span>
@@ -332,11 +380,6 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
                             onChange={e => updateField('background_refresh', e.target.checked)}
                         />
                         <span className="toggle-slider"></span>
-                        <span className={`toggle-text ${settings.background_refresh && settings.remote_mode !== 'client' ? 'on' : ''}`}>
-                            {settings.remote_mode === 'client'
-                                ? 'Server 负责'
-                                : settings.background_refresh ? '已开启' : '已关闭'}
-                        </span>
                     </label>
                 </div>
 
@@ -907,23 +950,25 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
                                             <span aria-hidden="true">{locale.flag}</span>
                                             {locale.nativeName}
                                         </span>
-                                        {locale.contributors?.map(contributor => contributor.url ? (
-                                            <a
-                                                className="translation-contributor"
-                                                translate="no"
-                                                href={contributor.url}
-                                                key={contributor.name}
-                                                target="_blank"
-                                                rel="noopener noreferrer"
-                                            >
-                                                <Github size={13} aria-hidden="true" />
-                                                {contributor.name}
-                                            </a>
-                                        ) : (
-                                            <span className="translation-contributor" key={contributor.name} translate="no">
-                                                {contributor.name}
-                                            </span>
-                                        ))}
+                                        <div className="translation-credit-authors">
+                                            {locale.contributors?.map(contributor => contributor.url ? (
+                                                <a
+                                                    className="translation-contributor"
+                                                    translate="no"
+                                                    href={contributor.url}
+                                                    key={contributor.name}
+                                                    target="_blank"
+                                                    rel="noopener noreferrer"
+                                                >
+                                                    <Github size={13} aria-hidden="true" />
+                                                    {contributor.name}
+                                                </a>
+                                            ) : (
+                                                <span className="translation-contributor" key={contributor.name} translate="no">
+                                                    {contributor.name}
+                                                </span>
+                                            ))}
+                                        </div>
                                     </div>
                                 ))}
                         </div>

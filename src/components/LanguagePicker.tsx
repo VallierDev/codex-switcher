@@ -1,4 +1,4 @@
-import { Check } from 'lucide-react';
+import { Check, Globe } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import {
   AUTO_LOCALE,
@@ -55,7 +55,8 @@ export function LanguagePicker() {
       {open && <div className="language-picker-menu" role="menu">
         <button type="button" role="menuitem" onClick={() => setLocalePreference(AUTO_LOCALE)}
           className={preference === AUTO_LOCALE ? 'selected' : ''}>
-          <span>跟随系统</span>
+          <span className="language-picker-icon" aria-hidden="true"><Globe size={18} /></span>
+          <span className="language-picker-label">跟随系统</span>
           {preference === AUTO_LOCALE && <Check size={14} aria-hidden="true" />}
         </button>
         {appLocales.map(locale => {
@@ -70,8 +71,8 @@ export function LanguagePicker() {
               role="menuitem"
               onClick={() => setLocalePreference(locale.code)}
             >
-              <span aria-hidden="true">{locale.flag}</span>
-              <span lang={locale.code} translate="no">{locale.nativeName}</span>
+              <span className="language-picker-icon" aria-hidden="true">{locale.flag}</span>
+              <span className="language-picker-label" lang={locale.code} translate="no">{locale.nativeName}</span>
               {isSelected && <Check size={14} aria-hidden="true" />}
             </button>
           );
