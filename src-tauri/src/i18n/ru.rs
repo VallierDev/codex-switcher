@@ -66,7 +66,7 @@ impl BackendLocale for RussianLocale {
     }
 
     fn referral_upstream_rejected(&self) -> &'static str {
-        "Запрос отклонён upstream"
+        "Сервис отклонил запрос"
     }
 
     fn referral_failed_emails(&self, emails: &serde_json::Value) -> String {
