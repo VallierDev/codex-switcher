@@ -1115,6 +1115,7 @@
 }
 
 .window-prime-option input {
+    flex-shrink: 0;
     width: 18px;
     height: 18px;
     accent-color: #38bdf8;
@@ -1123,6 +1124,7 @@
 .window-prime-option span {
     display: flex;
     flex-direction: column;
+    min-width: 0;
     gap: 3px;
 }
 
