@@ -4,6 +4,7 @@
 
 pub mod account;
 mod anchor_recovery;
+mod auto_reset_credits;
 mod antigravity;
 mod bulk_import;
 pub mod chat_inbound;
@@ -18,6 +19,7 @@ pub mod oauth;
 mod oauth_server;
 pub mod otp_login;
 mod provider_quirks;
+mod priority_sync;
 mod proxy;
 mod quota_snapshot;
 mod referrals;
@@ -209,6 +211,29 @@ fn get_current_account_id(state: State<AppState>) -> Result<Option<String>, Stri
 
 /// 获取全局设置
 #[tauri::command]
+async fn set_priority_account(
+    state: State<'_, AppState>, app: tauri::AppHandle,
+    id: Option<String>, expected_revision: u64,
+) -> Result<(), String> {
+    let request = priority_sync::PriorityRequest { account_id: id, expected_revision };
+    if let Some((base, secret)) = priority_sync::remote(&app).await? {
+        match remote_client::set_priority(&base, &secret, &request).await {
+            Ok(incoming) => priority_sync::apply_remote(&app, incoming, &base, &secret).await?,
+            Err(error) => {
+                if let Ok(incoming) = remote_client::get_priority(&base, &secret).await {
+                    let _ = priority_sync::apply_remote(&app, incoming, &base, &secret).await;
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        priority_sync::update(&mut *state.store.lock().map_err(|e| e.to_string())?, request)?;
+        priority_sync::notify(&app);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn get_settings(state: State<AppState>) -> Result<account::AppSettings, String> {
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     if relay_catalog::ensure_currents(&mut store) {
@@ -329,6 +354,9 @@ fn update_settings(
         settings.current_antigravity_account_id =
             store.settings.current_antigravity_account_id.clone();
         settings.current_relay_accounts = store.settings.current_relay_accounts.clone();
+        // Priority is changed only by its versioned command, never a stale form.
+        settings.priority_account_id = store.settings.priority_account_id.clone();
+        settings.priority_revision = store.settings.priority_revision;
         let prev = (
             store.settings.background_refresh,
             store.settings.proxy_enabled,
@@ -1777,6 +1805,9 @@ async fn solo_try_align_current(
     };
     let (local_cur, mode, proxy_enabled, exists_locally) = {
         let s = store.lock().map_err(|e| e.to_string())?;
+        if priority_subscription_account(&s).is_some() {
+            return Ok(());
+        }
         (
             s.current.clone(),
             s.settings.remote_mode.clone(),
@@ -1852,7 +1883,8 @@ pub async fn do_one_fast_auth_sync(store: &std::sync::Arc<std::sync::Mutex<Accou
     };
 
     // 1) 先看 Server 的 current 是不是跟本机 store.current 一致，不一致 → 优先对齐到 Server
-    let target_cid = if should_follow_server_current(&mode, client_owns_current, has_session_anchor)
+    let priority_active = store.lock().map(|s| priority_subscription_account(&s).is_some()).unwrap_or(false);
+    let target_cid = if !priority_active && should_follow_server_current(&mode, client_owns_current, has_session_anchor)
     {
         match remote_client::get_current(&base, &secret).await {
             Ok(cur) => match cur.current {
@@ -2019,6 +2051,9 @@ fn switch_to_ready_plus_if_needed(
             Err(_) => return,
         };
         let current_id = s.current.clone();
+        if priority_subscription_account(&s).is_some() {
+            return;
+        }
         let target = s
             .accounts
             .values()
@@ -2623,7 +2658,7 @@ pub fn start_quota_refresh(
                                     &remote_mode,
                                     client_owns_current,
                                     has_session_anchor,
-                                ) {
+                                ) && store.lock().map(|s| priority_subscription_account(&s).is_none()).unwrap_or(false) {
                                     if let Ok(cur) =
                                         crate::remote_client::get_current(&base, &secret).await
                                     {
@@ -3156,6 +3191,17 @@ pub fn start_quota_refresh(
     })
 }
 
+/// Explicit priority only spends subscription quota, never a credit-only balance.
+pub(crate) fn priority_subscription_account(store: &AccountStore) -> Option<&account::Account> {
+    let account = store.accounts.get(store.settings.priority_account_id.as_deref()?)?;
+    let quota = account.cached_quota.as_ref()?;
+    (account.is_chatgpt_oauth()
+        && !account.is_banned && !account.is_token_invalid && !account.is_logged_out
+        && !quota.desktop_gate.as_ref().is_some_and(usage::DesktopUsageGate::workspace_blocked)
+        && quota.has_rate_limit_quota())
+        .then_some(account)
+}
+
 pub fn score_candidate_accounts(store: &AccountStore) -> Vec<(String, String, f64)> {
     rank_candidate_accounts(store, false)
 }
@@ -3256,7 +3302,9 @@ fn rank_candidate_accounts(store: &AccountStore, include_current: bool) -> Vec<(
     // A score penalty alone could lose to the full-Plus bonus or future scoring changes.
     let anchor_tier = |id: &str| store.settings.protect_session_anchor
         && store.accounts.get(id).is_some_and(|a| a.is_session_anchor);
-    scored.sort_by(|a, b| anchor_tier(&a.0).cmp(&anchor_tier(&b.0))
+    let priority = priority_subscription_account(store).map(|account| account.id.as_str());
+    scored.sort_by(|a, b| (priority != Some(a.0.as_str())).cmp(&(priority != Some(b.0.as_str())))
+        .then_with(|| anchor_tier(&a.0).cmp(&anchor_tier(&b.0)))
         .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
         .then_with(|| a.0.cmp(&b.0)));
     scored
@@ -3264,7 +3312,8 @@ fn rank_candidate_accounts(store: &AccountStore, include_current: bool) -> Vec<(
 
 /// Affinity and credit preference must admit the anchor when no other eligible account remains.
 pub(crate) fn should_defer_session_anchor(store: &AccountStore, id: &str) -> bool {
-    store.settings.protect_session_anchor
+    !priority_subscription_account(store).is_some_and(|account| account.id == id)
+        && store.settings.protect_session_anchor
         && store.accounts.get(id).is_some_and(|a| a.is_session_anchor)
         && rank_candidate_accounts(store, true).iter()
             .any(|(candidate, _, _)| store.accounts.get(candidate).is_some_and(|a| !a.is_session_anchor))
@@ -3827,6 +3876,7 @@ async fn consume_reset_credit(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<usage::ResetCreditResult, String> {
+    let _guard = auto_reset_credits::redemption_guard(&id).await;
     let (access_token, account_id) =
         resolve_account_access_token(&state, &id, "RELAY_ACCOUNT:中转站账号不支持主动重置").await?;
     usage::consume_reset_credit(&access_token, account_id.as_deref()).await
@@ -6355,6 +6405,8 @@ pub fn run() {
             println!("[QuotaRefresh] 常驻循环启动中（setup 阶段）");
             start_antigravity_catalog_refresh(state.store.clone(), app.handle().clone());
             kimi_quota::start_refresh(state.store.clone(), app.handle().clone());
+            auto_reset_credits::start(app.handle().clone());
+            priority_sync::start(app.handle().clone());
 
             // 启动时立刻跑一次同步，把 store/disk 不一致 + 落后的 RT 立即对齐
             let store_for_init = state.store.clone();
@@ -6533,6 +6585,7 @@ pub fn run() {
             reload_ide_windows,
             get_settings,
             update_settings,
+            set_priority_account,
             get_proxy_status,
             get_turn_state_status,
             kill_codex_processes,
@@ -7099,7 +7152,7 @@ mod tests {
     }
 
     #[test]
-    fn full_plus_is_selected_before_a_higher_quota_pro_account() {
+    fn manual_priority_overrides_full_plus_until_subscription_depleted() {
         let now = Utc::now();
         let mut store = AccountStore::default();
         store.current = Some("current".to_string());
@@ -7127,10 +7180,12 @@ mod tests {
 
         let mut plus = test_account("plus", "plus-account", "rt-plus");
         plus.id = "plus".to_string();
+        plus.kind = account::AccountKind::ChatgptOauth;
         plus.cached_quota = Some(quota("plus"));
 
         let mut pro = test_account("pro", "pro-account", "rt-pro");
         pro.id = "pro".to_string();
+        pro.kind = account::AccountKind::ChatgptOauth;
         pro.cached_quota = Some(quota("pro"));
 
         store.accounts.insert(plus.id.clone(), plus);
@@ -7141,6 +7196,41 @@ mod tests {
             candidates.first().map(|candidate| candidate.0.as_str()),
             Some("plus")
         );
+
+        store.settings.priority_account_id = Some("pro".into());
+        assert_eq!(score_candidate_accounts(&store)[0].0, "pro");
+        store.accounts.get_mut("pro").unwrap().is_banned = true;
+        assert!(priority_subscription_account(&store).is_none());
+        assert_eq!(score_candidate_accounts(&store)[0].0, "plus");
+        let pro = store.accounts.get_mut("pro").unwrap();
+        pro.is_banned = false;
+        let quota = pro.cached_quota.as_mut().unwrap();
+        quota.five_hour_left = 0.0;
+        quota.has_credits = true;
+        quota.credits_balance = Some(10.0);
+        assert!(priority_subscription_account(&store).is_none());
+        assert_eq!(score_candidate_accounts(&store)[0].0, "plus");
+        store.accounts.get_mut("pro").unwrap().cached_quota.as_mut().unwrap().five_hour_left = 1.0;
+        assert_eq!(score_candidate_accounts(&store)[0].0, "pro");
+        store.settings.priority_account_id = None;
+        assert_eq!(score_candidate_accounts(&store)[0].0, "plus");
+    }
+
+    #[test]
+    fn manual_priority_can_select_protected_anchor_and_handles_missing_accounts() {
+        let mut store = anchor_priority_fixture();
+        store.settings.priority_account_id = Some("anchor".into());
+        assert_eq!(score_candidate_accounts(&store)[0].0, "anchor");
+        assert!(!should_defer_session_anchor(&store, "anchor"));
+        store.accounts.get_mut("anchor").unwrap().is_token_invalid = true;
+        assert!(priority_subscription_account(&store).is_none());
+        assert_eq!(score_candidate_accounts(&store)[0].0, "worker");
+        store.settings.priority_account_id = Some("deleted".into());
+        assert!(priority_subscription_account(&store).is_none());
+        assert_eq!(score_candidate_accounts(&store)[0].0, "worker");
+        let mut old_settings = serde_json::to_value(account::AppSettings::default()).unwrap();
+        old_settings.as_object_mut().unwrap().remove("priority_account_id");
+        assert!(serde_json::from_value::<account::AppSettings>(old_settings).unwrap().priority_account_id.is_none());
     }
 
     #[test]

@@ -44,6 +44,9 @@ export interface LunaReserveWindow {
 }
 
 export interface AppSettings {
+    auto_redeem_expiring_credits?: boolean;
+    priority_account_id?: string | null;
+    priority_revision?: number;
     protect_session_anchor?: boolean;
     auto_reload_ide: boolean;
     primary_ide: string;

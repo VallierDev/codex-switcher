@@ -153,6 +153,32 @@ async fn route(
     }
 
     // 路由
+    if path == "/routing/priority" {
+        if method == Method::GET {
+            return match state.store.lock() {
+                Ok(store) => json_resp(StatusCode::OK, json!(crate::priority_sync::snapshot(&store))),
+                Err(_) => err_resp("Store lock unavailable".into()),
+            };
+        }
+        if method == Method::POST {
+            let request = match req.collect().await.ok()
+                .and_then(|body| serde_json::from_slice::<crate::priority_sync::PriorityRequest>(&body.to_bytes()).ok()) {
+                    Some(request) => request,
+                    None => return json_resp(StatusCode::BAD_REQUEST, json!({"error":"Invalid priority request"})),
+                };
+            let result = match state.store.lock() {
+                Ok(mut store) => crate::priority_sync::update(&mut store, request),
+                Err(_) => Err("Store lock unavailable".into()),
+            };
+            return match result {
+                Ok(priority) => {
+                    crate::priority_sync::notify(&state.app_handle);
+                    json_resp(StatusCode::OK, json!(priority))
+                }
+                Err(error) => json_resp(StatusCode::CONFLICT, json!({"error":error})),
+            };
+        }
+    }
     if path == "/quotas" && method == Method::GET {
         return handle_list_quota(&state);
     }
@@ -580,8 +606,8 @@ pub(crate) async fn refresh_antigravity_quota_local(
 /// reused 源**。供 client 手机锚保活调用:client 拉到锚 token 发现快过期时打这个端点,
 /// 让 Server 就地把锚账号的 token 刷新,再由 client 拉回本机写盘。
 ///
-/// reused 错误 = 瞬时并发(此刻 store 已被赢家刷成最新)——不当失败,直接回读 store 里
-/// 当前(大概率已新鲜)的 auth_json 返回。
+/// 刷新失败（包括 reused）必须报错，不能把 store 中的旧 token 当作刷新结果。
+/// 单刷新者内部已处理可恢复的 RT 轮换竞态；返回成功时还需核实 JWT 未过期。
 async fn handle_refresh_token(state: &ApiState, id: &str) -> Response<ResponseBody> {
     let is_openai_account = state
         .store
@@ -597,30 +623,41 @@ async fn handle_refresh_token(state: &ApiState, id: &str) -> Response<ResponseBo
     }
 
     let refresh_res = crate::oauth::refresh_access_token_locked_fresh(&state.store, id).await;
-    if let Err(ref e) = refresh_res {
-        // reused 之外的真失败才报错;reused 时 store 已是最新,继续回读返回
-        if !crate::scheduler::is_reused_error(e) {
-            return json_resp(
-                StatusCode::BAD_REQUEST,
-                json!({"error": format!("refresh failed: {}", e)}),
-            );
-        }
+    if refresh_res.is_ok() {
+        schedule_save(state.store.clone());
     }
-    // 成功(_locked_fresh 已写回 store)或 reused(赢家已写回)——都回读 store 最新 auth_json
-    schedule_save(state.store.clone());
     match state.store.lock() {
-        Ok(s) => match s.accounts.get(id) {
-            Some(a) => json_resp(
-                StatusCode::OK,
-                json!({
-                    "auth_json": a.auth_json,
-                    "refresh_token": a.refresh_token,
-                }),
-            ),
-            None => json_resp(StatusCode::NOT_FOUND, json!({"error": "account not found"})),
-        },
+        Ok(s) => refreshed_token_response(refresh_res.map(|_| ()), s.accounts.get(id)),
         Err(e) => err_resp(format!("锁获取失败: {}", e)),
     }
+}
+
+fn refreshed_token_response(
+    result: Result<(), String>,
+    account: Option<&Account>,
+) -> Response<ResponseBody> {
+    if let Err(error) = result {
+        return json_resp(
+            StatusCode::BAD_REQUEST,
+            json!({"error": format!("refresh failed: {}", error)}),
+        );
+    }
+    let Some(account) = account else {
+        return json_resp(StatusCode::NOT_FOUND, json!({"error": "account not found"}));
+    };
+    if !crate::account::access_token_ttl_secs(&account.auth_json)
+        .map(|ttl| ttl > 0)
+        .unwrap_or(false)
+    {
+        return json_resp(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "refresh failed: missing, invalid or expired access token"}),
+        );
+    }
+    json_resp(
+        StatusCode::OK,
+        json!({"auth_json": account.auth_json, "refresh_token": account.refresh_token}),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1597,6 +1634,81 @@ fn resp_with_body(status: StatusCode, body: Vec<u8>) -> Response<ResponseBody> {
         .header("Content-Type", "application/json")
         .body(Full::new(Bytes::from(body)))
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+}
+
+#[cfg(test)]
+mod refresh_token_tests {
+    use super::*;
+    use base64::Engine;
+
+    fn account_with_ttl(ttl: i64) -> Account {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            json!({"exp": chrono::Utc::now().timestamp() + ttl}).to_string(),
+        );
+        let mut store = AccountStore::default();
+        let mut account = store.add_account("refresh-test".into(), json!({}), None);
+        account.auth_json = json!({"tokens": {"access_token": format!("e30.{}.sig", payload)}});
+        account.refresh_token = Some("test-refresh-token".into());
+        account
+    }
+
+    async fn body(response: Response<ResponseBody>) -> Value {
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reused_failure_never_returns_cached_credentials() {
+        // Even a still-valid cached token cannot prove that refresh succeeded.
+        for ttl in [-3600, 3600] {
+            let account = account_with_ttl(ttl);
+            let response = refreshed_token_response(
+                Err("refresh_token_reused".into()), Some(&account),
+            );
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = body(response).await;
+            assert!(value["error"].as_str().unwrap().contains("refresh_token_reused"));
+            assert!(value.get("auth_json").is_none());
+            assert!(value.get("refresh_token").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn other_refresh_failures_remain_errors() {
+        let account = account_with_ttl(3600);
+        let response = refreshed_token_response(Err("invalid_grant".into()), Some(&account));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body(response).await.get("auth_json").is_none());
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_requires_unexpired_jwt() {
+        for ttl in [-3600, 0] {
+            let account = account_with_ttl(ttl);
+            let response = refreshed_token_response(Ok(()), Some(&account));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(body(response).await.get("auth_json").is_none());
+        }
+        let mut account = account_with_ttl(3600);
+        account.auth_json = json!({"tokens": {"access_token": "malformed", "expires_at": "2099-01-01T00:00:00Z"}});
+        assert_eq!(refreshed_token_response(Ok(()), Some(&account)).status(), StatusCode::BAD_REQUEST);
+        account.auth_json = json!({});
+        assert_eq!(refreshed_token_response(Ok(()), Some(&account)).status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_returns_valid_credentials() {
+        let account = account_with_ttl(3600);
+        let response = refreshed_token_response(Ok(()), Some(&account));
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body(response).await;
+        assert_eq!(value["auth_json"], account.auth_json);
+        assert_eq!(value["refresh_token"], "test-refresh-token");
+    }
+
+    #[test]
+    fn missing_account_returns_not_found() {
+        assert_eq!(refreshed_token_response(Ok(()), None).status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[cfg(test)]

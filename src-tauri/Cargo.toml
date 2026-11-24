@@ -1,6 +1,6 @@
 [package]
 name = "codex-switcher"
-version = "0.7.21"
+version = "0.7.23"
 description = "Codex 多账号智能切换 + 本地代理 + 用量统计"
 authors = ["xiaojian"]
 edition = "2021"
@@ -12,6 +12,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[features]
+# Required when building a production binary directly with cargo instead of the Tauri CLI.
+custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }

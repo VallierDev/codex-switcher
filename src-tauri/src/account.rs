@@ -12,6 +12,14 @@ use serde_json::Value;
 /// 应用全局设置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
+    /// 应用运行时，自动兑现十分钟内到期的重置券。
+    #[serde(default)]
+    pub auto_redeem_expiring_credits: bool,
+    /// 手工指定优先消耗套餐额度的订阅账号；耗尽/失效时回退默认选号。
+    #[serde(default)]
+    pub priority_account_id: Option<String>,
+    #[serde(default)]
+    pub priority_revision: u64,
     /// 是否在切换账号后自动重载 IDE
     #[serde(default)]
     pub auto_reload_ide: bool,
@@ -266,6 +274,9 @@ fn default_remote_server_bind() -> String {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            auto_redeem_expiring_credits: false,
+            priority_account_id: None,
+            priority_revision: 0,
             auto_reload_ide: false,
             primary_ide: default_primary_ide(),
             use_pkill_restart: false,

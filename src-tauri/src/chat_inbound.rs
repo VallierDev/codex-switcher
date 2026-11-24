@@ -13,7 +13,7 @@
 use serde_json::{json, Value};
 
 /// 有图时默认使用的视觉模型。
-pub const DEFAULT_VISION_MODEL: &str = "gpt-5.6-luna";
+pub const DEFAULT_VISION_MODEL: &str = "gpt-6-luna";
 /// 可通过环境变量覆盖视觉模型，便于运行时切换而无需重新编译。
 pub const VISION_MODEL_ENV: &str = "CODEX_SWITCHER_VISION_MODEL";
 
@@ -63,7 +63,7 @@ fn content_parts(content: &Value) -> (String, Vec<String>) {
 
 /// 把 OpenAI chat/completions 请求体翻成 Codex responses 请求体。
 /// `fallback_model` 在请求未带 model 时使用（默认应传 gpt-5.3-codex-spark）。
-/// 若请求含图片，自动把 model 改成传入的视觉模型（Spark 无视觉）。
+/// 请求含图片时，仅为 Spark 或非 GPT 别名选择视觉兜底；保留明确指定的 GPT 模型。
 pub fn chat_to_responses(chat: &Value, fallback_model: &str) -> Value {
     chat_to_responses_with_vision_model(chat, fallback_model, DEFAULT_VISION_MODEL)
 }
@@ -160,8 +160,10 @@ pub fn chat_to_responses_with_vision_model(
     if model.to_lowercase().contains("spark") {
         model = "gpt-5.3-codex-spark".to_string();
     }
-    // 有图 → 强制视觉模型（Spark/glm-4.5v 在 codex 端都不支持图片）
-    if has_image {
+    // GPT 请求已由调用方选定视觉模型，不能再覆盖成旧的默认值。
+    // Spark 和 glm 等兼容别名仍沿用视觉兜底。
+    let native_gpt_vision = model.starts_with("gpt-") && !model.contains("spark");
+    if has_image && !native_gpt_vision {
         model = vision_model.to_string();
     }
 
@@ -422,6 +424,38 @@ pub fn chat_completion_to_sse(chat: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn images_preserve_requested_native_gpt_model() {
+        for model in ["gpt-6-luna", "gpt-6.1-sol"] {
+            let chat = json!({
+                "model": model,
+                "messages": [{"role":"user","content":[
+                    {"type":"text","text":"Describe the image."},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+                ]}]
+            });
+            let r = chat_to_responses_with_vision_model(
+                &chat,
+                "gpt-5.3-codex-spark",
+                "gpt-5.6-luna",
+            );
+            assert_eq!(r["model"], model, "must not downgrade an explicit GPT model");
+            assert_eq!(r["input"][0]["content"][1]["type"], "input_image");
+        }
+    }
+
+    #[test]
+    fn spark_images_use_current_default_vision_model() {
+        let chat = json!({
+            "model": "spark-bridge",
+            "messages": [{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+            ]}]
+        });
+        let r = chat_to_responses(&chat, "gpt-5.3-codex-spark");
+        assert_eq!(r["model"], "gpt-6-luna");
+    }
 
     #[test]
     fn translates_system_user_and_tools() {

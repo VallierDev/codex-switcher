@@ -9,6 +9,7 @@ import { appLocales, getActiveLocale, SOURCE_LOCALE_CODE } from '../i18n';
 import { AnchorRecoveryPanel } from './AnchorRecoveryPanel';
 
 interface AppSettings {
+    auto_redeem_expiring_credits: boolean;
     protect_session_anchor: boolean;
     auto_reload_ide: boolean;
     primary_ide: string;
@@ -59,6 +60,7 @@ interface SettingsProps {
 
 export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = {}) {
     const [settings, setSettings] = useState<AppSettings>({
+        auto_redeem_expiring_credits: false,
         protect_session_anchor: true,
         auto_reload_ide: false,
         primary_ide: 'Windsurf',
@@ -681,7 +683,7 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
                         <div className="setting-item sub-item">
                             <div className="setting-info">
                                 <span className="setting-label">自动拉取 Server Skills</span>
-                                <span className="setting-desc">启动时及每 5 分钟同步到当前用户目录；自动过滤平台依赖，保留本机 Skills 和修改。</span>
+                                <span className="setting-desc">启动时及每 5 分钟拉取全部 Skills，保留本机 Skills 和修改。</span>
                             </div>
                             <label className="toggle">
                                 <input type="checkbox" checked={settings.skills_auto_pull} onChange={e => updateField('skills_auto_pull', e.target.checked)} />
@@ -738,6 +740,18 @@ export function Settings({ accounts = [], onSetSessionAnchor }: SettingsProps = 
                         </span>
                     </div>
                 )}
+            </div>
+
+            <div className="settings-section">
+                <h3>重置券自动使用</h3>
+                <div className="setting-item">
+                    <div className="setting-info">
+                        <span className="setting-label">到期前 10 分钟自动重置</span>
+                        <span className="setting-desc">检查所有订阅账号，只使用即将到期的重置券。额度未耗尽时保留券并继续检查；软件须保持运行，实际消耗哪张券由服务端决定。</span>
+                    </div>
+                    <label className="toggle"><input type="checkbox" checked={settings.auto_redeem_expiring_credits ?? false}
+                        onChange={event => updateField('auto_redeem_expiring_credits', event.target.checked)} /><span className="toggle-slider" /></label>
+                </div>
             </div>
 
             {onSetSessionAnchor && (

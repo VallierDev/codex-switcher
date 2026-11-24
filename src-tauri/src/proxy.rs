@@ -286,6 +286,8 @@ impl Default for ProxyStats {
 struct ProxyState {
     store: Arc<Mutex<AccountStore>>,
     client: Client,
+    // Isolate ChatGPT HTTP (including large image uploads) from the HTTP/2 pool.
+    chatgpt_http_client: Client,
     /// Native Antigravity keeps one HTTP/1.1 connection pool per Google identity.
     antigravity_clients: Mutex<std::collections::HashMap<String, Client>>,
     app_handle: tauri::AppHandle,
@@ -485,10 +487,15 @@ pub fn start(
         let client = Client::builder()
             .build()
             .expect("[Proxy] 构建 reqwest Client 失败");
+        let chatgpt_http_client = Client::builder()
+            .http1_only()
+            .build()
+            .expect("[Proxy] 构建 ChatGPT HTTP/1.1 Client 失败");
 
         let state = Arc::new(ProxyState {
             store,
             client,
+            chatgpt_http_client,
             antigravity_clients: Mutex::new(std::collections::HashMap::new()),
             app_handle,
             switching: AtomicBool::new(false),
@@ -653,6 +660,7 @@ async fn resolve_token_with_affinity(
     prefer_subscription: bool,
 ) -> Result<(String, bool, Option<String>, bool), String> {
     let Some(sk) = session_key else {
+        if prefer_subscription { activate_priority_subscription(state); }
         if prefer_subscription { switch_credits_to_subscription(state); }
         let (tok, is_cgpt) = get_current_token(state).await?;
         let cur = state.store.lock().ok().and_then(|s| {
@@ -716,6 +724,7 @@ async fn resolve_token_with_affinity(
         return Ok((token, is_chatgpt, Some(account_id), true));
     }
 
+    if prefer_subscription { activate_priority_subscription(state); }
     if prefer_subscription { switch_credits_to_subscription(state); }
 
     // 1) 先看绑定的号是否健康（不依赖 quota，因为 cached_quota 可能滞后；只看 banned/logged_out/token_invalid）
@@ -730,7 +739,14 @@ async fn resolve_token_with_affinity(
             .map(|a| a.is_relay())
             .unwrap_or(false);
         let allow_in = store.settings.relay_auto_switch_in;
+        let priority = crate::priority_subscription_account(&store)
+            .filter(|_| prefer_subscription)
+            .filter(|account| !is_in_cooldown(state, &account.id))
+            .map(|account| account.id.as_str());
         let bid = state.session_affinity.lookup(sk, |id| {
+            if priority.is_some_and(|priority| priority != id) {
+                return false;
+            }
             store
                 .accounts
                 .get(id)
@@ -1757,7 +1773,12 @@ async fn handle_models_with_antigravity(
         reqwest::header::ACCEPT_ENCODING,
         reqwest::header::HeaderValue::from_static("identity"),
     );
-    let response = match state.client.get(url).headers(headers).send().await {
+    let client = if is_chatgpt {
+        &state.chatgpt_http_client
+    } else {
+        &state.client
+    };
+    let response = match client.get(url).headers(headers).send().await {
         Ok(response) => response,
         Err(error) => {
             return error_response(
@@ -2246,6 +2267,19 @@ enum PickResult {
     Exhausted { earliest_reset: Option<i64> },
 }
 
+fn activate_priority_subscription(state: &ProxyState) {
+    let target = state.store.lock().ok().and_then(|store| {
+        let account = crate::priority_subscription_account(&store)?;
+        (store.current.as_deref() != Some(account.id.as_str())
+            && !is_in_cooldown(state, &account.id)).then(|| account.id.clone())
+    });
+    let Some(target) = target else { return; };
+    let Some(_guard) = SwitchGuard::try_acquire(&state.switching) else { return; };
+    if let Err(error) = do_switch(state, &target, SwitchReason::QuotaThreshold) {
+        eprintln!("[Proxy] Priority account switch failed: {}", error);
+    }
+}
+
 fn switch_credits_to_subscription(state: &ProxyState) -> bool {
     let target = state.store.lock().ok().and_then(|store| {
         let id = store.current.as_deref()?;
@@ -2513,6 +2547,11 @@ fn should_preemptive_switch(state: &ProxyState) -> bool {
     if account.is_banned || account.is_token_invalid || account.is_logged_out {
         println!("[Proxy] 发现当前账号被封禁/失效/登出，触发预防性切号");
         return true;
+    }
+
+    // A manual priority spends the last subscription quota instead of switching early.
+    if crate::priority_subscription_account(&store).is_some_and(|a| a.id == *current_id) {
+        return false;
     }
 
     let quota = match account.cached_quota.as_ref() {
@@ -3207,7 +3246,7 @@ async fn handle_chat_inbound(
     // 用户明确指定的账号，两者都保持原样透回。
     let mut quota_switch_left = quota_switch_budget(pick);
     loop {
-        let resp = match forward_with_token(
+        let resp = match forward_chat_inbound_with_token(
             &state,
             &hyper::Method::POST,
             &format!("{}/responses", CHATGPT_ORIGIN),
@@ -3223,7 +3262,24 @@ async fn handle_chat_inbound(
             }
         };
         let status = resp.status();
-        let raw = resp.text().await.unwrap_or_default();
+        let body_started = std::time::Instant::now();
+        let raw = match resp.text().await {
+            Ok(raw) => {
+                println!(
+                    "[ChatInboundTransport] phase=body_complete elapsed_ms={} bytes={}",
+                    body_started.elapsed().as_millis(), raw.len()
+                );
+                raw
+            }
+            Err(error) => {
+                let message = format!("读取上游响应体失败: {}", error);
+                eprintln!(
+                    "[ChatInboundTransport] phase=body_error elapsed_ms={} detail={:?}",
+                    body_started.elapsed().as_millis(), error.without_url()
+                );
+                return error_response(StatusCode::BAD_GATEWAY, &message);
+            }
+        };
         if status.as_u16() == 401 && refresh_left > 0 {
             refresh_left -= 1;
             match silent_refresh_current(&state).await {
@@ -4559,6 +4615,15 @@ async fn try_remote_switch_and_retry(
 }
 
 /// 把 Server 的 current 采纳到本机 store：拉 token、写 auth.json、更新 store.current
+fn remote_auto_switch_allowed(store: &AccountStore, id: &str) -> bool {
+    store.accounts.get(id).is_some_and(|account| {
+        store.settings.allow_auto_switch_to_free
+            || !account.cached_quota.as_ref().is_some_and(|quota| {
+                matches!(quota.plan_type.trim().to_ascii_lowercase().as_str(), "free" | "unknown")
+            })
+    })
+}
+
 async fn adopt_remote_current(
     state: &ProxyState,
     base: &str,
@@ -4587,6 +4652,11 @@ async fn adopt_remote_current(
     // 保住手机 bridge 走的 anchor 镜像。proxy 路由走 store.current 的 token，跟 disk 解耦。
     let auth_to_write = {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        // Server CAS replies may return its existing Free current, bypassing
+        // candidate scoring. Apply this client's policy before adopting it.
+        if !remote_auto_switch_allowed(&store, new_id) {
+            return Err("Remote account is excluded by local auto-switch policy".into());
+        }
         store.sync_account_from_auth_json(new_id, t.auth_json.clone());
         let auth = store
             .accounts
@@ -4985,6 +5055,9 @@ fn build_upstream_headers(
             || lower == CHATGPT_ACCOUNT_ID_HEADER
             || lower == "host"
             || lower == "connection"
+            || lower == "content-length"
+            || lower == "transfer-encoding"
+            || lower == "trailer"
         {
             continue;
         }
@@ -5065,13 +5138,9 @@ async fn forward_to_server_parts(
         )
     };
 
-    let api_base = if !fallback.trim().is_empty() {
-        fallback.trim().to_string()
-    } else {
-        crate::remote_client::resolve_base_url(&primary, &fallback)
-            .await
-            .map_err(|e| format!("Server 不可达: {}", e))?
-    };
+    let api_base = crate::remote_client::resolve_forward_base_url(&primary, &fallback)
+        .await
+        .map_err(|e| format!("Server 不可达: {}", e))?;
     let proxy_base = derive_server_proxy_url(&api_base, proxy_port)
         .ok_or_else(|| format!("无法从 {} 构造 Server proxy URL", api_base))?;
     let upstream_url = format!("{}{}", proxy_base, path_and_query);
@@ -5098,11 +5167,7 @@ async fn forward_to_server_parts(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
     // Server 永远是 LAN/ZeroTier 私有 IP，必须绕开系统代理（防 Clash 截走）。
     // state.client 是共享 client、走系统代理用于打 ChatGPT/Relay 上游，这里另起一个。
-    let no_proxy_client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("构建 no_proxy client 失败: {}", e))?;
+    let no_proxy_client = server_forward_client()?;
     no_proxy_client
         .request(reqwest_method, &upstream_url)
         .headers(fwd_headers)
@@ -5110,6 +5175,16 @@ async fn forward_to_server_parts(
         .send()
         .await
         .map_err(|e| format!("转发到 Server 失败: {e:?}"))
+}
+
+fn server_forward_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .no_proxy()
+        // SSE has no total duration limit. Each successful read resets the idle timer.
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| format!("构建 no_proxy client 失败: {}", e))
 }
 
 /// 写 `~/.codex/auth.json` 但**尊重手机锚约束**：anchor 设置了且 account_id != anchor
@@ -5420,14 +5495,47 @@ async fn forward_with_token(
     body: &Bytes,
     token: &str,
 ) -> Result<reqwest::Response, String> {
+    let is_chatgpt = url::Url::parse(upstream_url)
+        .ok()
+        .is_some_and(|url| url.host_str() == Some(CHATGPT_HOST));
+    let (client, route) = if is_chatgpt {
+        (&state.chatgpt_http_client, "chatgpt_http1")
+    } else {
+        (&state.client, "shared")
+    };
+    forward_with_client(state, client, route, method, upstream_url, base_headers, body, token).await
+}
+
+async fn forward_chat_inbound_with_token(
+    state: &ProxyState,
+    method: &hyper::Method,
+    upstream_url: &str,
+    base_headers: &reqwest::header::HeaderMap,
+    body: &Bytes,
+    token: &str,
+) -> Result<reqwest::Response, String> {
+    forward_with_client(state, &state.chatgpt_http_client, "chat_http1", method, upstream_url, base_headers, body, token).await
+}
+
+async fn forward_with_client(
+    state: &ProxyState,
+    client: &Client,
+    route: &str,
+    method: &hyper::Method,
+    upstream_url: &str,
+    base_headers: &reqwest::header::HeaderMap,
+    body: &Bytes,
+    token: &str,
+) -> Result<reqwest::Response, String> {
     let mut headers = base_headers.clone();
     let chatgpt_account_id = chatgpt_account_id_for_token(state, token);
     bind_reqwest_upstream_identity(&mut headers, token, chatgpt_account_id.as_deref());
 
     println!("[Proxy] → upstream: {} {}", method, upstream_url);
-
-    state
-        .client
+    let request_id = uuid::Uuid::new_v4();
+    let started = std::time::Instant::now();
+    println!("[ProxyTransport] id={} phase=send route={} body_bytes={}", request_id, route, body.len());
+    let result = client
         .request(
             reqwest::Method::from_bytes(method.as_str().as_bytes())
                 .unwrap_or(reqwest::Method::POST),
@@ -5436,8 +5544,18 @@ async fn forward_with_token(
         .headers(headers)
         .body(body.to_vec())
         .send()
-        .await
-        .map_err(|e| format!("转发请求失败: {}", e))
+        .await;
+    match result {
+        Ok(response) => {
+            println!("[ProxyTransport] id={} phase=headers route={} elapsed_ms={} status={} version={:?}", request_id, route, started.elapsed().as_millis(), response.status().as_u16(), response.version());
+            Ok(response)
+        }
+        Err(error) => {
+            let message = format!("转发请求失败: {}", error);
+            eprintln!("[ProxyTransport] id={} phase=send_error route={} elapsed_ms={} connect={} timeout={} detail={:?}", request_id, route, started.elapsed().as_millis(), error.is_connect(), error.is_timeout(), error.without_url());
+            Err(message)
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -6663,6 +6781,7 @@ async fn handle_websocket(
     let reserve_requested = routing_hint_model(req.headers()).as_deref().is_some_and(|model| {
         model.eq_ignore_ascii_case("gpt-reserve") || model.eq_ignore_ascii_case("gpt-5.6-luna")
     });
+    if !reserve_requested { activate_priority_subscription(&state); }
     if !(reserve_requested && current_has_luna_reserve(&state)) {
         switch_credits_to_subscription(&state);
     }
@@ -9199,6 +9318,131 @@ fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn assert_rewritten_request_headers_roundtrip(original_len: usize, body: Bytes) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |req: Request<Incoming>| {
+                let tx = tx.clone();
+                async move {
+                    let declared = req.headers().get("content-length")
+                        .and_then(|v| v.to_str().ok()).unwrap().parse::<usize>().unwrap();
+                    let received = req.into_body().collect().await.unwrap().to_bytes();
+                    tx.lock().unwrap().take().unwrap().send((declared, received)).unwrap();
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                }
+            });
+            let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), service).await;
+        });
+        let mut inbound = hyper::HeaderMap::new();
+        inbound.insert("content-length", original_len.to_string().parse().unwrap());
+        inbound.insert("content-type", "application/json".parse().unwrap());
+        let headers = build_upstream_headers(&inbound, &addr.to_string());
+        let response = Client::builder().no_proxy().http1_only()
+            .timeout(std::time::Duration::from_secs(2)).build().unwrap()
+            .post(format!("http://{addr}/responses")).headers(headers).body(body.clone())
+            .send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(b"ok"));
+        let (declared, received) = rx.await.unwrap();
+        assert_eq!(declared, body.len());
+        assert_eq!(received, body, "rewritten JSON must arrive without truncation or padding");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rewritten_request_headers_recompute_shortened_pi_body_length() {
+        let original = Bytes::from_static(br#"{"model":"gpt-6-luna","max_output_tokens":256,"input":"hello"}"#);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-pi-agent-sdk", "1".parse().unwrap());
+        let rewritten = normalize_chatgpt_responses_body(&original, "/v1/responses", &headers);
+        assert!(rewritten.len() < original.len());
+        assert_rewritten_request_headers_roundtrip(original.len(), rewritten).await;
+    }
+
+    #[tokio::test]
+    async fn rewritten_request_headers_recompute_grown_body_length() {
+        assert_rewritten_request_headers_roundtrip(
+            br#"{"model":"x"}"#.len(),
+            Bytes::from_static(br#"{"model":"gpt-6-luna","input":"keep the complete request"}"#),
+        ).await;
+    }
+
+    #[test]
+    fn remote_stale_current_cannot_bypass_free_account_opt_out() {
+        let mut store = AccountStore::default();
+        let account = store.add_account("remote".into(), serde_json::json!({"tokens":{"access_token":"eyJ.test"}}), None);
+        let id = account.id.clone();
+        store.accounts.get_mut(&id).unwrap().cached_quota = Some(serde_json::from_value(serde_json::json!({
+            "five_hour_left":100.0,"weekly_left":100.0,"five_hour_reset":"later","weekly_reset":"later",
+            "plan_type":"free","updated_at":Utc::now()
+        })).unwrap());
+        assert!(!remote_auto_switch_allowed(&store, &id));
+        store.settings.allow_auto_switch_to_free = true;
+        assert!(remote_auto_switch_allowed(&store, &id));
+        store.settings.allow_auto_switch_to_free = false;
+        store.accounts.get_mut(&id).unwrap().cached_quota.as_mut().unwrap().plan_type = "pro".into();
+        assert!(remote_auto_switch_allowed(&store, &id));
+        assert!(!remote_auto_switch_allowed(&store, "missing"));
+    }
+
+    // Real sockets and wall time catch the original reqwest total-timeout bug.
+    // Run explicitly: cargo test server_forward_stream -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "190 second streaming acceptance test"]
+    async fn server_forward_stream_survives_three_minutes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let sender = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            for _ in 0..19 {
+                socket.write_all(b"9\r\ndata: x\n\n\r\n").await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+            socket.write_all(b"e\r\ndata: [DONE]\n\n\r\n0\r\n\r\n").await.unwrap();
+        });
+        let started = std::time::Instant::now();
+        let response = server_forward_client().unwrap()
+            .post(format!("http://{address}/v1/responses"))
+            .send().await.unwrap();
+        let body = response.text().await.unwrap();
+        assert!(started.elapsed().as_secs() >= 190);
+        assert_eq!(body.matches("data: x").count(), 19);
+        assert!(body.ends_with("data: [DONE]\n\n"));
+        sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "180 second idle timeout acceptance test"]
+    async fn server_forward_stream_times_out_when_idle() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let sender = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n9\r\ndata: x\n\n\r\n").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(200)).await;
+        });
+        let mut response = server_forward_client().unwrap()
+            .post(format!("http://{address}/v1/responses"))
+            .send().await.unwrap();
+        assert!(response.chunk().await.unwrap().is_some());
+        let started = std::time::Instant::now();
+        let err = response.chunk().await.unwrap_err();
+        assert!(err.is_timeout(), "{err:?}");
+        assert!((179..190).contains(&started.elapsed().as_secs()));
+        sender.abort();
+    }
 
     #[test]
     fn websocket_identity_is_bound_to_handshake_token_even_after_current_changes() {

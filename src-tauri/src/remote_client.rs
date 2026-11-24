@@ -179,6 +179,22 @@ pub async fn resolve_base_url(primary: &str, fallback: &str) -> Result<String, S
     }
 }
 
+/// Forward inference through the primary (LAN) whenever it is healthy.
+/// Do not reuse the token API's fastest-address cache: a cached ZeroTier result
+/// must not prevent recovery to LAN. Probes are bounded to two seconds and do
+/// not replay the inference POST, whose outcome may be unknown after a failure.
+pub async fn resolve_forward_base_url(primary: &str, fallback: &str) -> Result<String, String> {
+    let p = trim_url(primary.trim());
+    let f = trim_url(fallback.trim());
+    if !p.is_empty() && probe(&p).await {
+        return Ok(p);
+    }
+    if !f.is_empty() && f != p && probe(&f).await {
+        return Ok(f);
+    }
+    Err(format!("Server 不可达（primary={}, fallback={}）", p, f))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteHealth {
     pub mode: String,
@@ -403,6 +419,40 @@ fn tokenless_google_accounts(mut accounts: Vec<Account>) -> Vec<Account> {
 mod google_mirror_tests {
     use super::*;
 
+    async fn mock_forward_health(status: u16) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                socket.read(&mut request).await.unwrap();
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn forward_address_prefers_primary_and_recovers_from_fallback() {
+        let (primary, primary_task) = mock_forward_health(200).await;
+        let (fallback, fallback_task) = mock_forward_health(200).await;
+        let (unhealthy, unhealthy_task) = mock_forward_health(503).await;
+        // This path must not inherit a cached fallback from token API routing.
+        set_cached_url(&fallback);
+        assert_eq!(resolve_forward_base_url(&primary, &fallback).await.unwrap(), primary);
+        assert_eq!(resolve_forward_base_url(&unhealthy, &fallback).await.unwrap(), fallback);
+        assert_eq!(resolve_forward_base_url(&primary, &fallback).await.unwrap(), primary);
+        assert_eq!(resolve_forward_base_url("", &fallback).await.unwrap(), fallback);
+        assert!(resolve_forward_base_url(&unhealthy, "").await.is_err());
+        primary_task.abort();
+        fallback_task.abort();
+        unhealthy_task.abort();
+        invalidate_cached_url();
+    }
+
     #[test]
     fn incoming_mirrors_cannot_carry_tokens_or_codex_accounts() {
         let mut store = crate::account::AccountStore::default();
@@ -619,6 +669,23 @@ pub struct RemoteSwitchOutcome {
     pub reason: Option<String>,
     #[serde(default)]
     pub earliest_reset_at: Option<i64>,
+}
+
+pub async fn get_priority(base_url: &str, secret: &str) -> Result<crate::priority_sync::PriorityState, String> {
+    client()?.get(format!("{}/routing/priority", trim_url(base_url)))
+        .header(AUTH_HEADER, secret).send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?
+        .json().await.map_err(|_| "Server does not support shared priority; update Server first".into())
+}
+
+pub async fn set_priority(base_url: &str, secret: &str, request: &crate::priority_sync::PriorityRequest) -> Result<crate::priority_sync::PriorityState, String> {
+    let response = client()?.post(format!("{}/routing/priority", trim_url(base_url)))
+        .header(AUTH_HEADER, secret).json(request).send().await.map_err(|e| e.to_string())?;
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        return Err("Priority changed on another machine; refresh accounts and retry".into());
+    }
+    response.error_for_status().map_err(|e| e.to_string())?
+        .json().await.map_err(|_| "Server does not support shared priority; update Server first".into())
 }
 
 pub async fn get_current(base_url: &str, secret: &str) -> Result<RemoteCurrent, String> {

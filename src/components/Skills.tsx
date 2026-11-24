@@ -230,6 +230,24 @@ export function Skills() {
         }
     };
 
+    const handlePullFromServer = async () => {
+        if (syncingServer) return;
+        setSyncingServer(true);
+        try {
+            const r = await invoke<{ updated: string[]; unchanged: string[]; skipped: Record<string, string>; conflicts: string[]; retired: string[] }>('remote_pull_skills');
+            await loadInstalled();
+            const parts = [`拉取更新 ${r.updated.length}`, `未变 ${r.unchanged.length}`];
+            if (Object.keys(r.skipped).length) parts.push(`跳过 ${Object.keys(r.skipped).length}`);
+            if (r.conflicts.length) parts.push(`本机冲突 ${r.conflicts.length}`);
+            if (r.retired.length) parts.push(`归档 ${r.retired.length}`);
+            showMsg(r.conflicts.length ? 'error' : 'success', parts.join('，'));
+        } catch (e) {
+            showMsg('error', `从 Server 拉取失败: ${e}`);
+        } finally {
+            setSyncingServer(false);
+        }
+    };
+
     const filtered = installed.filter(s =>
         s.name.toLowerCase().includes(search.toLowerCase()) ||
         s.description.toLowerCase().includes(search.toLowerCase())
@@ -273,6 +291,7 @@ export function Skills() {
                     <>
                         <button className="btn btn-sm btn-ghost" onClick={handleSyncAll}>全量同步</button>
                         {remoteMode === 'client' && (
+                            <>
                             <button
                                 className="btn btn-sm btn-ghost"
                                 onClick={handleSyncToServer}
@@ -281,6 +300,15 @@ export function Skills() {
                             >
                                 {syncingServer ? '同步中...' : '同步到 Server'}
                             </button>
+                            <button
+                                className="btn btn-sm btn-ghost"
+                                onClick={handlePullFromServer}
+                                disabled={syncingServer}
+                                title="从 Server 拉取全部 skill，保留本机修改"
+                            >
+                                {syncingServer ? '同步中...' : '从 Server 拉取'}
+                            </button>
+                            </>
                         )}
                     </>
                 )}

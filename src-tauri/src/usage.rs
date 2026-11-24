@@ -1807,6 +1807,14 @@ pub async fn consume_reset_credit(
     account_id: Option<&str>,
 ) -> Result<ResetCreditResult, String> {
     let redeem_request_id = uuid::Uuid::new_v4().to_string();
+    consume_reset_credit_with_request_id(access_token, account_id, &redeem_request_id).await
+}
+
+pub(crate) async fn consume_reset_credit_with_request_id(
+    access_token: &str,
+    account_id: Option<&str>,
+    redeem_request_id: &str,
+) -> Result<ResetCreditResult, String> {
     let body = serde_json::json!({ "redeem_request_id": redeem_request_id });
 
     let client = usage_client();
@@ -1900,9 +1908,9 @@ pub async fn consume_reset_credit(
     })
 }
 
-/// 默认唤醒模型（实测 ChatGPT 账号 codex responses 接口当前接受 gpt-5.5；
-/// gpt-5-codex / gpt-5.3-codex 等已被该端点拒绝）。
-pub const DEFAULT_WAKEUP_MODEL: &str = "gpt-5.5";
+/// 周期保鲜和手动唤醒共用的轻量模型。
+/// GPT-5.5 已退出 ChatGPT 登录的 Codex，最小唤醒请求使用 GPT-6 Luna。
+pub const DEFAULT_WAKEUP_MODEL: &str = "gpt-6-luna";
 
 /// 唤醒结果，回传给前端
 #[derive(Debug, Clone, Serialize, Deserialize)]

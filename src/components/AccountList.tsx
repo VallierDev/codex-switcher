@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge, UserPlus } from 'lucide-react';
+import { Zap, RefreshCw, ArrowLeftRight, Trash2, Clock, UploadCloud, Plus, Gauge, UserPlus, LockKeyhole } from 'lucide-react';
 import { Account, AppSettings, LunaReserveWindow, RelayUsageCache, SparkWindows, effectiveKind } from '../hooks/useAccounts';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -68,6 +68,11 @@ function fmtExpiry(ts?: number | null): string {
 function daysLeft(ts?: number | null): number | null {
     if (!ts || ts <= 0) return null;
     return Math.max(0, Math.floor((ts - Math.floor(Date.now() / 1000)) / 86400));
+}
+
+function ResetCreditCountdown({ expiresAt }: { expiresAt?: number | null }) {
+    const countdown = useShortCountdown(expiresAt ?? undefined);
+    return <span className="rc-days">{countdown === '--' ? '已过期' : countdown ? `剩 ${countdown}` : ''}</span>;
 }
 
 type AccountExpiryInfo = {
@@ -216,6 +221,7 @@ export function AccountList({
     const [resetModal, setResetModal] = useState<{ id: string; name: string; credits: number | null } | null>(null);
     const resetQueryVersion = useRef(0);
     const [resetting, setResetting] = useState(false);
+    const [savingPriority, setSavingPriority] = useState(false);
     const [resetList, setResetList] = useState<ResetCreditItem[] | null>(null);
     const [resetListLoading, setResetListLoading] = useState(false);
     const [resetListError, setResetListError] = useState<string | null>(null);
@@ -239,6 +245,22 @@ export function AccountList({
 
     const autoReload = settings.auto_reload_ide;
     const setAutoReload = (val: boolean) => onUpdateSettings({ ...settings, auto_reload_ide: val });
+
+    const togglePriority = async (id: string) => {
+        if (savingPriority) return;
+        setSavingPriority(true);
+        try {
+            await invoke('set_priority_account', {
+                id: settings.priority_account_id === id ? null : id,
+                expectedRevision: settings.priority_revision ?? 0,
+            });
+            await onRefreshComplete?.();
+        } catch (error) {
+            setPushToast({ type: 'error', text: String(error) });
+        } finally {
+            setSavingPriority(false);
+        }
+    };
 
     const saveAccountExpiry = async () => {
         if (!expiryEditor || savingExpiry) return;
@@ -1047,6 +1069,7 @@ export function AccountList({
                                         })()}
                                         {copiedId === acc.id && <span className="badge copy-success">已复制</span>}
                                         {isCurrent && !isModelRelay && <span className="badge current">当前</span>}
+                                        {settings.priority_account_id === acc.id && <span className="badge current">优先使用</span>}
                                         {relayCurrent.isCurrent && <span className="badge current" title={`当前模型：${relayCurrent.active.join('、')}`}>{relayCurrent.label}</span>}
                                         {isAntigravityCurrent && <span className="badge current">Google 当前</span>}
                                         {kind === 'antigravity_oauth' && (() => {
@@ -1171,6 +1194,16 @@ export function AccountList({
                                     )}
                                 </div>
                                 <div className="col-actions">
+                                    {kind === 'chatgpt_oauth' && (
+                                        <button
+                                            className={`action-btn${settings.priority_account_id === acc.id ? ' priority-active' : ''}`}
+                                            onClick={() => togglePriority(acc.id)}
+                                            disabled={savingPriority}
+                                            aria-pressed={settings.priority_account_id === acc.id}
+                                            aria-label={settings.priority_account_id === acc.id ? '取消优先使用' : '优先使用'}
+                                            title={settings.priority_account_id === acc.id ? '取消优先使用' : '优先消耗此账号的套餐额度，耗尽或失效后恢复默认顺序'}
+                                        ><LockKeyhole size={14} /></button>
+                                    )}
                                     <button className="action-btn refresh" onClick={() => handleRefreshOne(acc.id)} disabled={isRefreshing} title={kind === 'antigravity_oauth' ? '刷新模型额度' : '刷新'}><RefreshCw size={14} className={isRefreshing ? 'spinning' : ''} /></button>
                                     {settings.remote_mode === 'client' && effectiveKind(acc) !== 'antigravity_oauth' && (
                                         <button
@@ -1359,7 +1392,7 @@ export function AccountList({
                                                 <li key={c.id} className={`reset-credit-row ${urgency}`}>
                                                     <span className="rc-mark">{i === 0 ? '▸' : ''}</span>
                                                     <span className="rc-expiry">{fmtExpiry(c.expires_at)}</span>
-                                                    <span className="rc-days">{dl == null ? '' : `剩 ${dl} 天`}</span>
+                                                    <ResetCreditCountdown expiresAt={c.expires_at} />
                                                     <span className="rc-source">{c.source}</span>
                                                     {i === 0 && <span className="rc-badge">将被消耗</span>}
                                                 </li>

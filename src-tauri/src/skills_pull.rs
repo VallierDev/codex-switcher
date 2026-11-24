@@ -1,4 +1,6 @@
-//! Portable, one-way Server → Client Skills mirrors. Local skills are never owned implicitly.
+//! One-way Server → Client Skills mirrors. Sync all content, including embedded
+//! credentials and platform-specific instructions; execution requirements are
+//! resolved when a skill is used. Local skills are never owned implicitly.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,13 +57,6 @@ pub struct Report {
     pub conflicts: Vec<String>,
     pub retired: Vec<String>,
 }
-#[derive(Default, Deserialize)]
-struct Compatibility {
-    #[serde(default)]
-    platforms: Vec<String>,
-    #[serde(default)]
-    requires: Vec<String>,
-}
 fn safe_relative(s: &str) -> bool {
     !s.is_empty()
         && !s.contains('\\')
@@ -103,12 +98,6 @@ fn walk(
                 return Err("export size limit exceeded".into());
             }
             let data = fs::read(&p).map_err(|e| e.to_string())?;
-            if let Ok(text) = std::str::from_utf8(&data) {
-                let secret = regex::Regex::new(r#"(?im)(-----BEGIN (?:OPENSSH |RSA |EC )?PRIVATE KEY-----|(?:password|passwd|secret|api_key|access_token)\s*[:=]\s*[\"'][^\"'\s${}<>]{4,}[\"'])"#).unwrap();
-                if secret.is_match(text) {
-                    return Err("contains embedded credentials; use environment credentials".into());
-                }
-            }
             *total += size;
             #[cfg(unix)]
             let executable = {
@@ -146,9 +135,16 @@ fn discover(root: &Path, current: &Path, result: &mut Vec<PathBuf>) -> Result<()
     }
     for entry in fs::read_dir(current).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
-        if entry.file_type().map_err(|e| e.to_string())?.is_dir()
-            && !excluded(&entry.file_name().to_string_lossy())
-        {
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        if excluded(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        // An installed skill may itself be a link to a plugin directory.
+        // Export its contents under its local name, but walk() still rejects
+        // links inside that skill rather than following arbitrary files.
+        if ty.is_symlink() && entry.path().join("SKILL.md").is_file() {
+            result.push(entry.path());
+        } else if ty.is_dir() {
             discover(root, &entry.path(), result)?;
         }
     }
@@ -195,20 +191,6 @@ fn adapt(
 ) -> Result<BTreeMap<String, File>, String> {
     let mut result = BTreeMap::new();
     let home = home.to_string_lossy();
-    if let Some(meta) = files.get("compatibility.json") {
-        let meta: Compatibility =
-            serde_json::from_slice(&STANDARD.decode(&meta.data).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
-        if !meta.platforms.is_empty() && !meta.platforms.iter().any(|p| p == platform) {
-            return Err(format!("unsupported platform: {platform}"));
-        }
-        for dep in meta.requires {
-            if executable_path(&dep).is_none() {
-                return Err(format!("missing command: {dep}"));
-            }
-        }
-    }
-    let mac = regex::Regex::new(r"(?i)\b(?:osascript|launchctl|pbcopy|pbpaste)\b|/Applications/|security\s+(?:find|add|delete)-|macos\s+keychain").unwrap();
     let brew = regex::Regex::new(r"/opt/homebrew/bin/([A-Za-z0-9_.-]+)").unwrap();
     for (name, file) in files {
         if !safe_relative(name) {
@@ -216,23 +198,13 @@ fn adapt(
         }
         let mut data = STANDARD.decode(&file.data).map_err(|e| e.to_string())?;
         if let Ok(text) = std::str::from_utf8(&data) {
-            if platform != "macos" && mac.is_match(text) {
-                return Err("requires macOS commands or applications".into());
-            }
             let mut text = text.replace(source_home, &home);
             if platform == "linux" {
                 for capture in brew.captures_iter(&text.clone()) {
                     let command = &capture[1];
-                    let path = executable_path(command)
-                        .ok_or_else(|| format!("missing command: {command}"))?;
-                    text = text.replace(&capture[0], &path.to_string_lossy());
-                }
-                if text.contains("/opt/homebrew/") || text.contains("/Library/Application Support/")
-                {
-                    return Err("requires macOS installation paths".into());
-                }
-                if text.contains("/Users/") {
-                    return Err("contains another machine's macOS path".into());
+                    if let Some(path) = executable_path(command) {
+                        text = text.replace(&capture[0], &path.to_string_lossy());
+                    }
                 }
             }
             data = text.into_bytes();
@@ -333,58 +305,6 @@ pub fn apply(
             Err(e) => {
                 report.skipped.insert(skill.name, e);
             }
-        }
-    }
-    // Do not invent project paths. Also exclude dependants of skills filtered above.
-    let paths = regex::Regex::new(&format!(
-        r#"{}[^\s\"'`<>\)\],;]+"#,
-        regex::escape(&home.to_string_lossy())
-    ))
-    .unwrap();
-    loop {
-        let mut rejected = vec![];
-        for (name, files) in &prepared {
-            'files: for file in files.values() {
-                let bytes = STANDARD.decode(&file.data).map_err(|e| e.to_string())?;
-                if let Ok(text) = std::str::from_utf8(&bytes) {
-                    for matched in paths.find_iter(text) {
-                        let p = Path::new(matched.as_str().trim_end_matches('.'));
-                        let aliases = [
-                            home.join(".codex-switcher/skills"),
-                            home.join(".codex/skills"),
-                            home.join(".claude/skills"),
-                        ];
-                        let skill_rel = aliases.iter().find_map(|a| p.strip_prefix(a).ok());
-                        let exists = if let Some(rel) = skill_rel {
-                            prepared.iter().any(|(n, fs)| {
-                                rel.strip_prefix(n).ok().is_some_and(|f| {
-                                    f.as_os_str().is_empty()
-                                        || fs.contains_key(&f.to_string_lossy().replace('\\', "/"))
-                                })
-                            })
-                        } else {
-                            p.exists()
-                        };
-                        if !exists
-                            && (skill_rel.is_some()
-                                || matched.as_str().contains("/Documents/projects/"))
-                        {
-                            rejected.push((
-                                name.clone(),
-                                format!("missing local dependency: {}", p.display()),
-                            ));
-                            break 'files;
-                        }
-                    }
-                }
-            }
-        }
-        if rejected.is_empty() {
-            break;
-        }
-        for (name, reason) in rejected {
-            prepared.remove(&name);
-            report.skipped.insert(name, reason);
         }
     }
     let backup = state
@@ -537,19 +457,11 @@ mod tests {
         );
     }
     #[test]
-    fn mac_and_missing_project_excluded() {
+    fn mac_and_missing_project_still_sync() {
         let f = Fixture::new();
-        assert!(f
-            .apply(f.bundle("Run osascript"))
-            .unwrap()
-            .skipped
-            .contains_key("shared"));
-        assert!(f
-            .apply(f.bundle("Run /Users/author/Documents/projects/absent/main.py"))
-            .unwrap()
-            .skipped
-            .contains_key("shared"));
-        assert!(!f.root().join("shared").exists());
+        assert_eq!(f.apply(f.bundle("Run osascript")).unwrap().updated, ["shared"]);
+        assert_eq!(f.apply(f.bundle("Run /Users/author/Documents/projects/absent/main.py")).unwrap().updated, ["shared"]);
+        assert!(fs::read_to_string(f.root().join("shared/SKILL.md")).unwrap().contains(&f.0.to_string_lossy().to_string()));
     }
     #[test]
     fn custom_local_and_builtin_skills_preserved() {
@@ -598,13 +510,13 @@ mod tests {
         .is_err());
     }
     #[test]
-    fn platform_metadata_and_transitive_dependencies() {
+    fn platform_metadata_and_transitive_dependencies_do_not_block_sync() {
         let f = Fixture::new();
         let mut b = f.bundle("portable");
         b.skills[0].files.insert(
             "compatibility.json".into(),
             File {
-                data: STANDARD.encode(r#"{"platforms":["macos"]}"#),
+                data: STANDARD.encode(r#"{"platforms":["macos"],"requires":["missing-skill-tool-123"]}"#),
                 executable: false,
             },
         );
@@ -619,18 +531,49 @@ mod tests {
             )]),
         });
         let r = f.apply(b).unwrap();
-        assert_eq!(r.skipped.len(), 2);
-        assert!(r.updated.is_empty());
+        assert!(r.skipped.is_empty());
+        assert_eq!(r.updated.len(), 2);
     }
     #[test]
-    fn exports_self_contained_skills_without_credentials() {
+    fn exports_and_applies_skills_with_embedded_credentials() {
         let f = Fixture::new();
         fs::create_dir_all(f.root().join("safe")).unwrap();
         fs::write(f.root().join("safe/SKILL.md"), "hello").unwrap();
         fs::create_dir_all(f.root().join("secret")).unwrap();
         fs::write(f.root().join("secret/SKILL.md"), "password = 'test-value'").unwrap();
         let b = export(&f.root(), &f.0).unwrap();
-        assert_eq!(b.skills.len(), 1);
-        assert!(b.skipped.contains_key("secret"));
+        assert_eq!(b.skills.len(), 2);
+        assert!(b.skipped.is_empty());
+        let client = Fixture::new();
+        assert_eq!(client.apply(b).unwrap().updated.len(), 2);
+        assert_eq!(fs::read_to_string(client.root().join("secret/SKILL.md")).unwrap(), "password = 'test-value'");
+        let b = export(&f.root(), &f.0).unwrap();
+        assert_eq!(client.apply(b).unwrap().unchanged.len(), 2);
+    }
+
+    #[test]
+    fn unavailable_brew_commands_and_foreign_paths_are_preserved() {
+        let f = Fixture::new();
+        let content = "Run /opt/homebrew/bin/missing-skill-tool-123; reference /Users/other/Library/Application Support/tool";
+        assert_eq!(f.apply(f.bundle(content)).unwrap().updated, ["shared"]);
+        assert_eq!(fs::read_to_string(f.root().join("shared/SKILL.md")).unwrap(), content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_skill_roots_export_but_internal_links_do_not() {
+        use std::os::unix::fs::symlink;
+        let f = Fixture::new();
+        let plugin = f.0.join("plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("SKILL.md"), "plugin skill").unwrap();
+        fs::create_dir_all(f.root()).unwrap();
+        symlink(&plugin, f.root().join("linked")).unwrap();
+        let b = export(&f.root(), &f.0).unwrap();
+        assert_eq!(b.skills[0].name, "linked");
+        symlink(f.0.join("outside"), plugin.join("internal-link")).unwrap();
+        let b = export(&f.root(), &f.0).unwrap();
+        assert!(b.skills.is_empty());
+        assert!(b.skipped.contains_key("linked"));
     }
 }

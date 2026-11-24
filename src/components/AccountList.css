@@ -460,8 +460,13 @@
 }
 
 /* 主动重置弹窗：列出所有重置次数及到期时间 */
+.action-btn.priority-active {
+    color: #fbbf24;
+    border-color: #fbbf24;
+}
+
 .reset-credit-modal {
-    max-width: 480px;
+    max-width: 600px;
 }
 
 .reset-credit-list {
@@ -475,6 +480,7 @@
 
 .reset-credit-row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     padding: 8px 10px;
@@ -504,7 +510,7 @@
 }
 
 .reset-credit-row .rc-days {
-    min-width: 52px;
+    flex-shrink: 0;
     color: #94a3b8;
     font-size: 12px;
 }
