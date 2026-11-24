@@ -306,7 +306,7 @@ export function Stats() {
                                 <span className={item.heuristic_usable ? 'turn-state-good' : 'turn-state-warn'}>
                                     {turnStateLabel(item.classification)} ({item.length})
                                 </span>
-                                <span>{item.time_status}</span>
+                                <span>{turnStateTimeLabel(item.time_status)}</span>
                                 <span>{item.source === 'websocket_handshake' ? 'WS 握手' : 'HTTP 响应'}</span>
                             </div>
                         ))}
@@ -585,6 +585,17 @@ function turnStateLabel(classification: string): string {
         case 'malformed': return '格式错误';
         case 'unknown_envelope': return '未知封装';
         default: return '其他长度';
+    }
+}
+
+function turnStateTimeLabel(status: string): string {
+    switch (status) {
+        case 'unparsed': return '时间未解析';
+        case 'invalid_timestamp': return '时间戳无效';
+        case 'future': return '时间在未来';
+        case 'expired_or_near_expiry': return '已过期或即将过期';
+        case 'current': return '时间有效';
+        default: return status;
     }
 }
 

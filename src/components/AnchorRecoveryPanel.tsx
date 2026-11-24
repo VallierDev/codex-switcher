@@ -63,7 +63,7 @@ export function AnchorRecoveryPanel({ accounts }: { accounts: Account[] }) {
                 {reason && <> · <code>{reason}</code></>}
             </p>
             {reason?.includes('workspace_') && <p className="setting-desc">工作区额度或使用上限已阻止访问，仅切换代理出口不能恢复发送。</p>}
-            {error && <p role="alert" translate="no">{error}</p>}
+            {error && <p role="alert">{error}</p>}
             {recovered && <p role="status">手机锚已迁移。请重新登录或重载 Codex Desktop；手机端可能需要重新连接。这不代表已验证 Desktop 恢复发送。</p>}
         </div>
         <button type="button" className="action-button" onClick={check} disabled={busy}>检查手机锚</button>

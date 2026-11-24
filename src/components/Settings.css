@@ -144,6 +144,7 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+    column-gap: 16px;
     padding: 16px 20px;
     background: var(--card-bg);
     border: 1px solid var(--border-color);
@@ -173,6 +174,7 @@
 .setting-info {
     display: flex;
     flex-direction: column;
+    min-width: 0;
     gap: 4px;
 }
 
@@ -192,6 +194,7 @@
     position: relative;
     display: inline-flex;
     align-items: center;
+    flex-shrink: 0;
     gap: 8px;
     cursor: pointer;
 }
@@ -228,17 +231,6 @@
 
 .toggle input:checked+.toggle-slider::after {
     transform: translateX(20px);
-}
-
-.toggle-text {
-    font-size: 0.85rem;
-    color: var(--text-muted);
-    transition: color 0.2s ease;
-}
-
-.toggle-text.on {
-    color: var(--primary-color);
-    font-weight: 500;
 }
 
 /* ===== Number Input ===== */
@@ -359,16 +351,20 @@
 }
 
 .translation-credit-list {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 8px;
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    align-items: center;
+    gap: 8px 12px;
 }
 
 .translation-credit {
+    display: contents;
+}
+
+.translation-credit-authors {
     display: flex;
     align-items: center;
-    justify-content: flex-end;
+    justify-content: flex-start;
     gap: 12px;
     flex-wrap: wrap;
 }
@@ -405,9 +401,6 @@ a.translation-contributor:hover {
         align-items: flex-start;
     }
 
-    .translation-credit {
-        justify-content: flex-start;
-    }
 }
 
 /* ===== 手机锚 (Session Anchor) ===== */
