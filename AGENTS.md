@@ -33,6 +33,21 @@ multiple ChatGPT / Relay accounts. Routing rules from
   ZeroTier). Big changes go through `tar -czf + scp` after replacing
   /Applications/Codex Switcher.app locally.
 
+## GitHub synchronization
+
+- This repository's canonical remote is `origin`; check the remote URL and
+  fetch `origin/main` before starting a substantial change.
+- After every code or documentation modification, fetch `origin/main` again
+  and compare it with the current branch (`git status`, `git log`, and the
+  relevant diff). Report if GitHub has commits that are not present locally.
+- Never discard uncommitted local work or force-reset the branch to GitHub.
+  If both sides changed, preserve the local work and resolve/rebase only with
+  an explicit, reviewable operation.
+- Before declaring the task complete, verify the working tree and branch
+  relationship with GitHub. If the user asked to synchronize/publish, commit
+  the intended changes and push to `origin/main`; otherwise, leave publishing
+  to the user and clearly report the local/remote state.
+
 ## When NOT to use glance
 
 This project deals with proxying chat completion APIs — don't ask glance
